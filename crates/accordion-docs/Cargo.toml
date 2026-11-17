@@ -1,0 +1,31 @@
+[package]
+name = "accordion-docs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+accordion-core = { git = "https://github.com/accordion-suite/accordion-core", version = "0.1.0" }
+accordion-module = { git = "https://github.com/accordion-suite/accordion-core", version = "0.1.0" }
+accordion-types = { git = "https://github.com/accordion-suite/accordion-core", version = "0.1.0" }
+axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.23.1"
+# The tree scraper parses HTML into.
+ego-tree = "0.11.1"
+# Reads documents' HTML as browsers do, including HTML other programs wrote.
+scraper = { version = "0.29.0", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.53.3", features = ["io-util", "sync", "time"] }
+tracing = "0.1.44"
+yrs = "0.28.1"
+
+[dev-dependencies]
+futures-util = "0.3.34"
+http-body-util = "0.1.5"
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }
+tokio-tungstenite = "0.29.0"
+tower = { version = "0.5.3", features = ["util"] }
