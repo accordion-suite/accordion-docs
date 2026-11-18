@@ -36,6 +36,7 @@ struct Server {
     _stop: watch::Sender<bool>,
     router: Router,
     storage: Storage,
+    thumbnails: Thumbnails,
     alex: Person,
     sam: Person,
 }
@@ -52,8 +53,8 @@ async fn start() -> Server {
     let storage = Storage::open(db.clone(), identity.clone(), &dir.path().join("storage"))
         .await
         .unwrap();
-    // Docs never makes thumbnails, reads text with programs, or
-    // transcribes, so these point nowhere.
+    // Docs' thumbnails are made without programs, and it never reads text
+    // with programs or transcribes, so these point nowhere.
     let thumbnails = Thumbnails::open(
         db.clone(),
         storage.clone(),
@@ -79,7 +80,7 @@ async fn start() -> Server {
         identity: identity.clone(),
         storage: storage.clone(),
         events: Events::open(db.clone()).await.unwrap(),
-        thumbnails,
+        thumbnails: thumbnails.clone(),
         texts,
         transcripts: Transcripts::canned(db.clone(), storage.clone(), dir.path(), |_| None)
             .await
@@ -94,6 +95,7 @@ async fn start() -> Server {
         alex: person(&identity, "alex", "Alex Kim", Role::Owner).await,
         sam: person(&identity, "sam", "Sam Kim", Role::User).await,
         storage,
+        thumbnails,
         _dir: dir,
         _stop: stop,
     }
@@ -239,6 +241,30 @@ async fn makes_documents_in_the_docs_place() {
 
     let (_, list) = server.api(&server.alex, "GET", "/documents", None).await;
     assert_eq!(list["top"], json!(top));
+}
+
+#[tokio::test]
+async fn lists_each_documents_page_thumbnail() {
+    let server = start().await;
+    let id = server.new_document(&server.alex).await;
+    let (_, list) = server.api(&server.alex, "GET", "/documents", None).await;
+    assert_eq!(list["documents"][0]["thumbnail"], json!(null));
+
+    let file = server
+        .storage
+        .item(id.parse().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let accordion_core::storage::ItemKind::File { blob, .. } = file.kind else {
+        panic!("a document is a file");
+    };
+    assert!(server.thumbnails.make_now(blob.hash).await.unwrap());
+    let (_, list) = server.api(&server.alex, "GET", "/documents", None).await;
+    let listed = &list["documents"][0];
+    assert_eq!(listed["thumbnail"], "page");
+    assert_eq!(listed["sha256"], blob.hash.to_hex());
+    assert!(listed["thumbnail_version"].is_string(), "{listed}");
 }
 
 #[tokio::test]

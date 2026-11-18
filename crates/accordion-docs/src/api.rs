@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use accordion_core::identity::SignedIn;
 use accordion_core::storage::{Access, Error, Item, ItemKind, Storage};
+use accordion_core::thumbnails::ThumbnailKind;
 use accordion_module::{ApiError, Authenticated, coedit};
 use accordion_types::{ItemId, UserId};
 use axum::extract::{Path, State, WebSocketUpgrade};
@@ -47,6 +48,38 @@ struct DocumentView {
     access: &'static str,
     /// Who owns it, for a document someone shared.
     owner: Option<String>,
+    /// The contents' SHA-256, which the thumbnail's address carries, so
+    /// browsers fetch a new one for each version.
+    sha256: Option<String>,
+    /// "page" once core has made the document's thumbnail, its first lines
+    /// with their headings and styles, which Drive's
+    /// `/items/{id}/thumbnail` sends.
+    thumbnail: Option<&'static str>,
+    /// Changes each time core makes the thumbnail again.
+    thumbnail_version: Option<String>,
+}
+
+impl DocumentView {
+    fn new(state: &DocsState, item: Item, access: &'static str, owner: Option<String>) -> Self {
+        let hash = match &item.kind {
+            ItemKind::File { blob, .. } => Some(blob.hash),
+            ItemKind::Folder => None,
+        };
+        let found = hash
+            .and_then(|hash| state.thumbnails.find(hash))
+            .filter(|found| found.kind == ThumbnailKind::Page);
+        Self {
+            id: item.id,
+            name: item.name,
+            folder: item.parent,
+            modified_at: item.modified_at,
+            access,
+            owner,
+            sha256: hash.map(|hash| hash.to_hex()),
+            thumbnail: found.is_some().then_some("page"),
+            thumbnail_version: found.map(|found| found.version()),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -113,14 +146,7 @@ async fn list(
     let mut documents: Vec<DocumentView> = documents_in(&state.storage, top)
         .await?
         .into_iter()
-        .map(|item| DocumentView {
-            id: item.id,
-            name: item.name,
-            folder: item.parent,
-            modified_at: item.modified_at,
-            access: "owner",
-            owner: None,
-        })
+        .map(|item| DocumentView::new(&state, item, "owner", None))
         .collect();
 
     let mut seen: HashSet<ItemId> = documents.iter().map(|document| document.id).collect();
@@ -155,14 +181,7 @@ async fn list(
                     name
                 }
             };
-            documents.push(DocumentView {
-                id: item.id,
-                name: item.name,
-                folder: item.parent,
-                modified_at: item.modified_at,
-                access,
-                owner,
-            });
+            documents.push(DocumentView::new(&state, item, access, owner));
         }
     }
     documents.sort_by(|a, b| b.modified_at.cmp(&a.modified_at).then(a.name.cmp(&b.name)));
@@ -231,14 +250,7 @@ async fn create(
     })?;
     Ok((
         StatusCode::CREATED,
-        Json(DocumentView {
-            id: item.id,
-            name: item.name,
-            folder: item.parent,
-            modified_at: item.modified_at,
-            access: "owner",
-            owner: None,
-        }),
+        Json(DocumentView::new(&state, item, "owner", None)),
     ))
 }
 
@@ -280,14 +292,12 @@ async fn open(
             .flatten()
             .map(|user| user.display_name)
     };
-    Ok(Json(DocumentView {
-        id: item.id,
-        name: item.name,
-        folder: item.parent,
-        modified_at: item.modified_at,
-        access: access_name(access),
+    Ok(Json(DocumentView::new(
+        &state,
+        item,
+        access_name(access),
         owner,
-    }))
+    )))
 }
 
 /// `GET /documents/{id}/live`: a WebSocket for editing a document together

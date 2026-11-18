@@ -17,6 +17,7 @@ pub mod yjs;
 use accordion_core::coedit::CoEditing;
 use accordion_core::identity::Identity;
 use accordion_core::storage::{AppPlace, Storage};
+use accordion_core::thumbnails::Thumbnails;
 use accordion_module::{BoxFuture, Module, Routes, Services, StartError, Started, Stopping};
 use axum::extract::FromRef;
 
@@ -54,6 +55,7 @@ impl Module for Docs {
                 identity: services.identity,
                 storage: services.storage,
                 coediting: services.coediting,
+                thumbnails: services.thumbnails,
             };
             Ok(Started {
                 routes: Routes {
@@ -71,6 +73,7 @@ struct DocsState {
     identity: Identity,
     storage: Storage,
     coediting: CoEditing,
+    thumbnails: Thumbnails,
 }
 
 impl FromRef<DocsState> for Identity {
