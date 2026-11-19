@@ -1,0 +1,758 @@
+//! A document as an OpenDocument text file (`.odt`), for **Download as**
+//! (decision 30), with the same look as the Word file: Arial 11 point,
+//! the document's paper and margins, and everything the editor has.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
+use crate::model::{Block, Cell, Image, Inline, Marks, PageSetup};
+use crate::office::{self, Grid, Part, Slot, escape, escaped};
+use crate::picture::{Picture, Pictures};
+
+/// `blocks` on `setup`'s page as an OpenDocument file, with `pictures` in
+/// it and `title` in its properties.
+pub fn write(
+    blocks: &[Block],
+    setup: Option<&PageSetup>,
+    title: &str,
+    pictures: &Pictures,
+) -> Vec<u8> {
+    let page = office::page_of(setup);
+    let mut writer = Writer {
+        pictures: Some(pictures),
+        ..Writer::default()
+    };
+    writer.blocks(blocks, &Context::top(office::text_width(&page)));
+
+    let mut content = String::from(XML);
+    let _ = write!(
+        content,
+        "<office:document-content {NAMESPACES} office:version=\"1.3\">{FONTS}<office:automatic-styles>{CONTENT_STYLES}{}",
+        lists()
+    );
+    for (key, name) in &writer.spans {
+        let _ = write!(
+            content,
+            "<style:style style:name=\"{name}\" style:family=\"text\"><style:text-properties{}/></style:style>",
+            key.properties()
+        );
+    }
+    for depth in 1..=writer.deepest_quote {
+        let _ = write!(
+            content,
+            "<style:style style:name=\"Quote{depth}\" style:family=\"paragraph\" style:parent-style-name=\"Quotations\">\
+             <style:paragraph-properties fo:margin-left=\"{}pt\"/></style:style>",
+            depth * 18
+        );
+    }
+    content.push_str(&writer.styles);
+    content.push_str("</office:automatic-styles><office:body><office:text>");
+    content.push_str(&writer.out);
+    content.push_str("</office:text></office:body></office:document-content>");
+
+    let (width, height) = page.points();
+    let [top, right, bottom, left] = page.margins.map(office::number);
+    let styles = format!(
+        "{XML}<office:document-styles {NAMESPACES} office:version=\"1.3\">{FONTS}{STYLES}\
+         <office:automatic-styles><style:page-layout style:name=\"Page\">\
+         <style:page-layout-properties fo:page-width=\"{}pt\" fo:page-height=\"{}pt\" style:print-orientation=\"{}\" \
+         fo:margin-top=\"{top}pt\" fo:margin-right=\"{right}pt\" fo:margin-bottom=\"{bottom}pt\" fo:margin-left=\"{left}pt\"/>\
+         </style:page-layout></office:automatic-styles>\
+         <office:master-styles><style:master-page style:name=\"Standard\" style:page-layout-name=\"Page\"/></office:master-styles>\
+         </office:document-styles>",
+        office::number(width),
+        office::number(height),
+        if page.landscape {
+            "landscape"
+        } else {
+            "portrait"
+        },
+    );
+    let meta = format!(
+        "{XML}<office:document-meta {NAMESPACES} office:version=\"1.3\"><office:meta>\
+         <dc:title>{}</dc:title></office:meta></office:document-meta>",
+        escaped(title)
+    );
+    let media_paths: Vec<String> = writer.media.iter().map(media_path).collect();
+    let mut manifest = MANIFEST.to_owned();
+    let entries: String = media_paths
+        .iter()
+        .zip(&writer.media)
+        .map(|(path, picture)| {
+            format!(
+                "<manifest:file-entry manifest:full-path=\"{path}\" manifest:media-type=\"{}\"/>",
+                picture.content_type
+            )
+        })
+        .collect();
+    manifest = manifest.replace(
+        "</manifest:manifest>",
+        &format!("{entries}</manifest:manifest>"),
+    );
+    let mut parts = vec![
+        // First and stored as is, so a program can tell what the file is
+        // from its first bytes.
+        Part {
+            path: "mimetype",
+            contents: MIME_TYPE.as_bytes(),
+            stored: true,
+        },
+        Part {
+            path: "META-INF/manifest.xml",
+            contents: manifest.as_bytes(),
+            stored: false,
+        },
+        Part {
+            path: "content.xml",
+            contents: content.as_bytes(),
+            stored: false,
+        },
+        Part {
+            path: "styles.xml",
+            contents: styles.as_bytes(),
+            stored: false,
+        },
+        Part {
+            path: "meta.xml",
+            contents: meta.as_bytes(),
+            stored: false,
+        },
+    ];
+    for (path, picture) in media_paths.iter().zip(&writer.media) {
+        parts.push(Part {
+            path,
+            contents: &picture.contents,
+            // Pictures are compressed already.
+            stored: true,
+        });
+    }
+    office::pack(&parts)
+}
+
+/// Where a picture goes in the package, named by its hash.
+fn media_path(picture: &Picture) -> String {
+    format!("Pictures/{}.{}", picture.hash, picture.extension())
+}
+
+pub const MIME_TYPE: &str = "application/vnd.oasis.opendocument.text";
+
+const XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+
+const NAMESPACES: &str = "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
+xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" \
+xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" \
+xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" \
+xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" \
+xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\" \
+xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" \
+xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+xmlns:meta=\"urn:oasis:names:tc:opendocument:xmlns:meta:1.0\"";
+
+/// The marks a span of text has, which name its style.
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct SpanKey {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strike: bool,
+    code: bool,
+    /// A done checklist item's text: gray.
+    gray: bool,
+}
+
+impl SpanKey {
+    fn properties(&self) -> String {
+        let mut out = String::new();
+        if self.bold {
+            out.push_str(" fo:font-weight=\"bold\"");
+        }
+        if self.italic {
+            out.push_str(" fo:font-style=\"italic\"");
+        }
+        if self.underline {
+            out.push_str(
+                " style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"",
+            );
+        }
+        if self.strike {
+            out.push_str(
+                " style:text-line-through-style=\"solid\" style:text-line-through-type=\"single\"",
+            );
+        }
+        if self.code {
+            out.push_str(" style:font-name=\"Courier New\" fo:background-color=\"#f1f3f4\"");
+        }
+        if self.gray {
+            out.push_str(" fo:color=\"#5f6368\"");
+        }
+        out
+    }
+}
+
+#[derive(Clone)]
+struct Context {
+    /// How many quotes deep.
+    quotes: usize,
+    /// In a list.
+    listed: bool,
+    /// Struck through and gray: a done checklist item's text.
+    done: bool,
+    /// In a table cell, and whether it's a heading cell.
+    cell: Option<bool>,
+    /// The room for text across, in points, for tables.
+    room: f64,
+}
+
+impl Context {
+    fn top(room: f64) -> Self {
+        Self {
+            quotes: 0,
+            listed: false,
+            done: false,
+            cell: None,
+            room,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Writer<'a> {
+    out: String,
+    pictures: Option<&'a Pictures>,
+    /// Each picture in the file, once.
+    media: Vec<Picture>,
+    /// How many pictures are drawn, for their names.
+    drawings: usize,
+    /// Each mix of marks used, and its style's name.
+    spans: BTreeMap<SpanKey, String>,
+    /// Table, column, and cell styles, written as tables are.
+    styles: String,
+    tables: usize,
+    deepest_quote: usize,
+    /// Whether the text written next starts a line, where a space would
+    /// be dropped.
+    line_start: bool,
+}
+
+impl Writer<'_> {
+    fn blocks(&mut self, blocks: &[Block], context: &Context) {
+        for block in blocks {
+            self.block(block, context);
+        }
+    }
+
+    fn paragraph_style(&mut self, context: &Context) -> String {
+        match context.cell {
+            Some(true) => "Table_20_Heading".to_owned(),
+            Some(false) => "Table_20_Contents".to_owned(),
+            None if context.quotes > 0 => {
+                self.deepest_quote = self.deepest_quote.max(context.quotes);
+                format!("Quote{}", context.quotes)
+            }
+            None if context.listed => "ListText".to_owned(),
+            None => "Standard".to_owned(),
+        }
+    }
+
+    fn block(&mut self, block: &Block, context: &Context) {
+        match block {
+            Block::Paragraph(inlines) => {
+                let style = self.paragraph_style(context);
+                self.open(&format!("<text:p text:style-name=\"{style}\">"));
+                self.runs(inlines, context);
+                self.out.push_str("</text:p>");
+            }
+            Block::Heading(level, inlines) => {
+                let level = (*level).clamp(1, 6);
+                self.open(&format!(
+                    "<text:h text:style-name=\"Heading_20_{level}\" text:outline-level=\"{level}\">"
+                ));
+                self.runs(inlines, context);
+                self.out.push_str("</text:h>");
+            }
+            Block::Quote(blocks) => {
+                let mut inner = context.clone();
+                inner.quotes += 1;
+                self.blocks(blocks, &inner);
+            }
+            Block::Code(text) => {
+                for line in text.strip_suffix('\n').unwrap_or(text).split('\n') {
+                    self.open("<text:p text:style-name=\"Preformatted_20_Text\">");
+                    self.text(line);
+                    self.out.push_str("</text:p>");
+                }
+            }
+            Block::Rule => self.out.push_str("<text:p text:style-name=\"Rule\"/>"),
+            Block::Bullets(items) => {
+                self.out.push_str("<text:list text:style-name=\"Bullets\">");
+                for item in items {
+                    self.item(item, context, "");
+                }
+                self.out.push_str("</text:list>");
+            }
+            Block::Numbers(start, items) => {
+                self.out.push_str("<text:list text:style-name=\"Numbers\">");
+                for (index, item) in items.iter().enumerate() {
+                    let start = if index == 0 && *start != 1 {
+                        format!(" text:start-value=\"{start}\"")
+                    } else {
+                        String::new()
+                    };
+                    self.item(item, context, &start);
+                }
+                self.out.push_str("</text:list>");
+            }
+            Block::Checks(items) => {
+                // A list of its own for each item, since each item's box
+                // shows whether it's checked.
+                for (checked, item) in items {
+                    let style = if *checked { "Checked" } else { "Unchecked" };
+                    let _ = write!(self.out, "<text:list text:style-name=\"{style}\">");
+                    let mut inner = context.clone();
+                    inner.done = *checked;
+                    self.item(item, &inner, "");
+                    self.out.push_str("</text:list>");
+                }
+            }
+            Block::Table(rows) => self.table(rows, context),
+            Block::Image(image) => self.image(image, context),
+        }
+    }
+
+    /// A picture in a paragraph of its own, as large as it's shown on the
+    /// page. One whose contents are missing is left out.
+    fn image(&mut self, image: &Image, context: &Context) {
+        let Some(picture) = self.pictures.and_then(|pictures| pictures.get(&image.hash)) else {
+            return;
+        };
+        if !self.media.iter().any(|kept| kept.hash == picture.hash) {
+            self.media.push(picture.clone());
+        }
+        self.drawings += 1;
+        let room = context.room - context.quotes as f64 * 18.0;
+        let (width, height) = office::picture_size(picture, image.width, room);
+        let style = self.paragraph_style(context);
+        let _ = write!(
+            self.out,
+            "<text:p text:style-name=\"{style}\"><draw:frame draw:name=\"Picture {}\" text:anchor-type=\"as-char\" \
+             svg:width=\"{}pt\" svg:height=\"{}pt\"><draw:image xlink:href=\"{}\" xlink:type=\"simple\" \
+             xlink:show=\"embed\" xlink:actuate=\"onLoad\"/>",
+            self.drawings,
+            office::number(width),
+            office::number(height),
+            media_path(picture),
+        );
+        if !image.alt.is_empty() {
+            let _ = write!(self.out, "<svg:desc>{}</svg:desc>", escaped(&image.alt));
+        }
+        self.out.push_str("</draw:frame></text:p>");
+    }
+
+    fn item(&mut self, blocks: &[Block], context: &Context, attributes: &str) {
+        let _ = write!(self.out, "<text:list-item{attributes}>");
+        if blocks.is_empty() {
+            self.out.push_str("<text:p/>");
+        }
+        let mut inner = context.clone();
+        inner.listed = true;
+        for block in blocks {
+            self.block(block, &inner);
+            // Only the item's own text is struck through.
+            inner.done = false;
+        }
+        self.out.push_str("</text:list-item>");
+    }
+
+    fn runs(&mut self, inlines: &[Inline], context: &Context) {
+        let mut link: Option<&str> = None;
+        for inline in inlines {
+            let marks = match inline {
+                Inline::Text(text, marks) if !text.is_empty() => Some(marks),
+                Inline::Text(..) => continue,
+                Inline::Break => None,
+            };
+            let href = marks.and_then(|marks| marks.link.as_deref());
+            if link.is_some() && href != link {
+                self.out.push_str("</text:a>");
+                link = None;
+            }
+            if let (Some(href), None) = (href, link) {
+                let _ = write!(
+                    self.out,
+                    "<text:a xlink:type=\"simple\" xlink:href=\"{}\" text:style-name=\"Internet_20_link\">",
+                    escaped(href)
+                );
+                link = Some(href);
+            }
+            match inline {
+                Inline::Text(text, marks) => self.span(text, marks, context),
+                Inline::Break => self.open("<text:line-break/>"),
+            }
+        }
+        if link.is_some() {
+            self.out.push_str("</text:a>");
+        }
+    }
+
+    fn span(&mut self, text: &str, marks: &Marks, context: &Context) {
+        let key = SpanKey {
+            bold: marks.bold,
+            italic: marks.italic,
+            underline: marks.underline,
+            strike: marks.strike || context.done,
+            code: marks.code,
+            gray: context.done,
+        };
+        if key == SpanKey::default() {
+            self.text(text);
+            return;
+        }
+        let count = self.spans.len();
+        let name = self
+            .spans
+            .entry(key)
+            .or_insert_with(|| format!("Span{}", count + 1))
+            .clone();
+        let _ = write!(self.out, "<text:span text:style-name=\"{name}\">");
+        self.text(text);
+        self.out.push_str("</text:span>");
+    }
+
+    /// Writes text as OpenDocument keeps it. Spaces in the XML collapse
+    /// into one, and go at the start of a line, so a run of them is one
+    /// space and a counted `<text:s>`, and tabs and line ends are elements.
+    fn text(&mut self, text: &str) {
+        let mut spaces = 0;
+        let mut one = [0; 4];
+        for c in text.chars() {
+            if c == ' ' {
+                spaces += 1;
+                continue;
+            }
+            self.spaces(spaces);
+            spaces = 0;
+            match c {
+                '\t' => self.out.push_str("<text:tab/>"),
+                '\n' => self.out.push_str("<text:line-break/>"),
+                c => escape(&mut self.out, c.encode_utf8(&mut one)),
+            }
+            self.line_start = c == '\t' || c == '\n';
+        }
+        self.spaces(spaces);
+    }
+
+    fn spaces(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let kept = if self.line_start {
+            count
+        } else {
+            self.out.push(' ');
+            count - 1
+        };
+        match kept {
+            0 => {}
+            1 => self.out.push_str("<text:s/>"),
+            kept => {
+                let _ = write!(self.out, "<text:s text:c=\"{kept}\"/>");
+            }
+        }
+        self.line_start = false;
+    }
+
+    /// Opens a paragraph or heading.
+    fn open(&mut self, tag: &str) {
+        self.out.push_str(tag);
+        self.line_start = true;
+    }
+
+    fn table(&mut self, rows: &[Vec<Cell>], context: &Context) {
+        let grid = Grid::new(
+            rows,
+            (context.room - context.quotes as f64 * 18.0).max(72.0),
+        );
+        self.tables += 1;
+        let name = format!("Table{}", self.tables);
+        let total: f64 = grid.widths.iter().sum();
+        let _ = write!(
+            self.styles,
+            "<style:style style:name=\"{name}\" style:family=\"table\">\
+             <style:table-properties style:width=\"{}pt\" table:align=\"left\" table:border-model=\"collapsing\" fo:margin-bottom=\"6pt\"/></style:style>",
+            office::number(total)
+        );
+        for (index, width) in grid.widths.iter().enumerate() {
+            let _ = write!(
+                self.styles,
+                "<style:style style:name=\"{name}.C{index}\" style:family=\"table-column\">\
+                 <style:table-column-properties style:column-width=\"{}pt\"/></style:style>",
+                office::number(*width)
+            );
+        }
+        let _ = write!(
+            self.out,
+            "<table:table table:name=\"{name}\" table:style-name=\"{name}\">"
+        );
+        for index in 0..grid.columns {
+            let _ = write!(
+                self.out,
+                "<table:table-column table:style-name=\"{name}.C{index}\"/>"
+            );
+        }
+        // Rows of heading cells at the top repeat on each page.
+        let heading_rows = rows
+            .iter()
+            .take_while(|row| !row.is_empty() && row.iter().all(|cell| cell.header))
+            .count()
+            .min(rows.len().saturating_sub(1));
+        for (index, row) in grid.rows.iter().enumerate() {
+            if index == 0 && heading_rows > 0 {
+                self.out.push_str("<table:table-header-rows>");
+            }
+            self.out.push_str("<table:table-row>");
+            let mut column = 0;
+            for slot in row {
+                match slot {
+                    Slot::Cell { cell, span, rows } => {
+                        let style = if cell.header { "HeadingCell" } else { "Cell" };
+                        let _ = write!(
+                            self.out,
+                            "<table:table-cell table:style-name=\"{style}\" office:value-type=\"string\""
+                        );
+                        if *span > 1 {
+                            let _ = write!(self.out, " table:number-columns-spanned=\"{span}\"");
+                        }
+                        if *rows > 1 {
+                            let _ = write!(self.out, " table:number-rows-spanned=\"{rows}\"");
+                        }
+                        self.out.push('>');
+                        let mut inner = Context::top(grid.width(column, *span) - 8.0);
+                        inner.cell = Some(cell.header);
+                        if cell.content.is_empty() {
+                            self.out.push_str("<text:p/>");
+                        }
+                        self.blocks(&cell.content, &inner);
+                        self.out.push_str("</table:table-cell>");
+                        for _ in 1..*span {
+                            self.out.push_str("<table:covered-table-cell/>");
+                        }
+                        column += span;
+                    }
+                    Slot::Below { span } => {
+                        for _ in 0..*span {
+                            self.out.push_str("<table:covered-table-cell/>");
+                        }
+                        column += span;
+                    }
+                    Slot::Empty => {
+                        self.out.push_str(
+                            "<table:table-cell table:style-name=\"Cell\" office:value-type=\"string\"><text:p/></table:table-cell>",
+                        );
+                        column += 1;
+                    }
+                }
+            }
+            self.out.push_str("</table:table-row>");
+            if index + 1 == heading_rows {
+                self.out.push_str("</table:table-header-rows>");
+            }
+        }
+        self.out.push_str("</table:table>");
+    }
+}
+
+/// Styles that LibreOffice reads only among a document's own: table cells,
+/// and paragraphs in lists, which sit closer together.
+const CONTENT_STYLES: &str = "<style:style style:name=\"Cell\" style:family=\"table-cell\">\
+<style:table-cell-properties fo:padding=\"4pt\" fo:border=\"0.75pt solid #c4c7c5\"/></style:style>\
+<style:style style:name=\"HeadingCell\" style:family=\"table-cell\">\
+<style:table-cell-properties fo:background-color=\"#f1f3f4\" fo:padding=\"4pt\" fo:border=\"0.75pt solid #c4c7c5\"/></style:style>\
+<style:style style:name=\"ListText\" style:family=\"paragraph\" style:parent-style-name=\"Standard\">\
+<style:paragraph-properties fo:margin-bottom=\"2pt\"/></style:style>";
+
+const FONTS: &str = "<office:font-face-decls>\
+<style:font-face style:name=\"Arial\" svg:font-family=\"Arial\" style:font-family-generic=\"swiss\" style:font-pitch=\"variable\"/>\
+<style:font-face style:name=\"Courier New\" svg:font-family=\"&apos;Courier New&apos;\" style:font-family-generic=\"modern\" style:font-pitch=\"fixed\"/>\
+<style:font-face style:name=\"Segoe UI Symbol\" svg:font-family=\"&apos;Segoe UI Symbol&apos;\" style:font-pitch=\"variable\"/>\
+</office:font-face-decls>";
+
+/// The list styles: bullets, numbers, and the two checklist boxes, each to
+/// ten levels. Numbers are 1, 2, 3 at every level, as browsers show them. Each level's text is half an inch further in, with its label
+/// hanging a quarter inch to its left.
+fn lists() -> String {
+    let mut out = String::new();
+    let bullets: [(&str, [&str; 3]); 3] = [
+        ("Bullets", ["•", "◦", "▪"]),
+        ("Unchecked", ["☐"; 3]),
+        ("Checked", ["☑"; 3]),
+    ];
+    for (name, symbols) in bullets {
+        let _ = write!(out, "<text:list-style style:name=\"{name}\">");
+        for level in 1..=10 {
+            let _ = write!(
+                out,
+                "<text:list-level-style-bullet text:level=\"{level}\" text:bullet-char=\"{}\">{}</text:list-level-style-bullet>",
+                symbols[(level - 1) % 3],
+                level_properties(level)
+            );
+        }
+        out.push_str("</text:list-style>");
+    }
+    out.push_str("<text:list-style style:name=\"Numbers\">");
+    for level in 1..=10 {
+        let _ = write!(
+            out,
+            "<text:list-level-style-number text:level=\"{level}\" style:num-format=\"1\" style:num-suffix=\".\">{}</text:list-level-style-number>",
+            level_properties(level)
+        );
+    }
+    out.push_str("</text:list-style>");
+    out
+}
+
+fn level_properties(level: usize) -> String {
+    let margin = office::number(level as f64 * 36.0);
+    format!(
+        "<style:list-level-properties text:list-level-position-and-space-mode=\"label-alignment\">\
+         <style:list-level-label-alignment text:label-followed-by=\"listtab\" text:list-tab-stop-position=\"{margin}pt\" \
+         fo:text-indent=\"-18pt\" fo:margin-left=\"{margin}pt\"/></style:list-level-properties>"
+    )
+}
+
+/// The common styles, matching the page Docs writes and the Word file.
+const STYLES: &str = "<office:styles>\
+<style:default-style style:family=\"paragraph\"><style:paragraph-properties fo:margin-top=\"0pt\" fo:margin-bottom=\"6pt\" fo:line-height=\"115%\"/>\
+<style:text-properties style:font-name=\"Arial\" fo:font-size=\"11pt\" fo:color=\"#1f1f1f\"/></style:default-style>\
+<style:style style:name=\"Standard\" style:family=\"paragraph\" style:class=\"text\"/>\
+<style:style style:name=\"Heading_20_1\" style:display-name=\"Heading 1\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"1\" style:class=\"text\">\
+<style:paragraph-properties fo:margin-top=\"20pt\" fo:margin-bottom=\"6pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"20pt\" fo:font-weight=\"bold\"/></style:style>\
+<style:style style:name=\"Heading_20_2\" style:display-name=\"Heading 2\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"2\" style:class=\"text\">\
+<style:paragraph-properties fo:margin-top=\"18pt\" fo:margin-bottom=\"6pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"16pt\" fo:font-weight=\"bold\"/></style:style>\
+<style:style style:name=\"Heading_20_3\" style:display-name=\"Heading 3\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"3\" style:class=\"text\">\
+<style:paragraph-properties fo:margin-top=\"16pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"14pt\" fo:font-weight=\"bold\"/></style:style>\
+<style:style style:name=\"Heading_20_4\" style:display-name=\"Heading 4\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"4\" style:class=\"text\">\
+<style:paragraph-properties fo:margin-top=\"14pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"12pt\" fo:font-weight=\"bold\"/></style:style>\
+<style:style style:name=\"Heading_20_5\" style:display-name=\"Heading 5\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"5\" style:class=\"text\">\
+<style:paragraph-properties fo:margin-top=\"12pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-weight=\"bold\"/></style:style>\
+<style:style style:name=\"Heading_20_6\" style:display-name=\"Heading 6\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"6\" style:class=\"text\">\
+<style:paragraph-properties fo:margin-top=\"12pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-weight=\"bold\" fo:font-style=\"italic\"/></style:style>\
+<style:style style:name=\"Quotations\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\">\
+<style:paragraph-properties fo:padding-left=\"8pt\" fo:border-left=\"2.25pt solid #dadce0\" fo:border-right=\"none\" fo:border-top=\"none\" fo:border-bottom=\"none\"/>\
+<style:text-properties fo:color=\"#444746\"/></style:style>\
+<style:style style:name=\"Preformatted_20_Text\" style:display-name=\"Preformatted Text\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\">\
+<style:paragraph-properties fo:margin-top=\"0pt\" fo:margin-bottom=\"0pt\" fo:line-height=\"100%\" fo:background-color=\"#f1f3f4\"/>\
+<style:text-properties style:font-name=\"Courier New\" fo:font-size=\"10pt\"/></style:style>\
+<style:style style:name=\"Rule\" style:family=\"paragraph\" style:parent-style-name=\"Standard\">\
+<style:paragraph-properties fo:padding-bottom=\"2pt\" fo:border-bottom=\"0.75pt solid #c4c7c5\" fo:border-top=\"none\" fo:border-left=\"none\" fo:border-right=\"none\"/></style:style>\
+<style:style style:name=\"Table_20_Contents\" style:display-name=\"Table Contents\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"extra\">\
+<style:paragraph-properties fo:margin-bottom=\"0pt\"/></style:style>\
+<style:style style:name=\"Table_20_Heading\" style:display-name=\"Table Heading\" style:family=\"paragraph\" style:parent-style-name=\"Table_20_Contents\" style:class=\"extra\">\
+<style:text-properties fo:font-weight=\"bold\"/></style:style>\
+<style:style style:name=\"Internet_20_link\" style:display-name=\"Internet link\" style:family=\"text\">\
+<style:text-properties fo:color=\"#1155cc\" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"/></style:style>\
+</office:styles>";
+
+const MANIFEST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<manifest:manifest xmlns:manifest=\"urn:oasis:names:tc:opendocument:xmlns:manifest:1.0\" manifest:version=\"1.3\">\
+<manifest:file-entry manifest:full-path=\"/\" manifest:version=\"1.3\" manifest:media-type=\"application/vnd.oasis.opendocument.text\"/>\
+<manifest:file-entry manifest:full-path=\"content.xml\" manifest:media-type=\"text/xml\"/>\
+<manifest:file-entry manifest:full-path=\"styles.xml\" manifest:media-type=\"text/xml\"/>\
+<manifest:file-entry manifest:full-path=\"meta.xml\" manifest:media-type=\"text/xml\"/>\
+</manifest:manifest>";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::PageSize;
+    use std::io::Read;
+
+    fn part(file: &[u8], path: &str) -> String {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(file)).unwrap();
+        let mut text = String::new();
+        zip.by_name(path)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        text
+    }
+
+    fn text(text: &str) -> Inline {
+        Inline::Text(text.to_owned(), Marks::default())
+    }
+
+    #[test]
+    fn writes_an_opendocument_file_on_the_documents_paper() {
+        let bold = Marks {
+            bold: true,
+            ..Marks::default()
+        };
+        let blocks = vec![
+            Block::Heading(2, vec![text("Plan")]),
+            Block::Paragraph(vec![
+                text(" two  spaces"),
+                Inline::Text("bold".to_owned(), bold),
+            ]),
+            Block::Numbers(3, vec![vec![Block::Paragraph(vec![text("Third")])]]),
+            Block::Checks(vec![(true, vec![Block::Paragraph(vec![text("Done")])])]),
+        ];
+        let setup = PageSetup {
+            size: PageSize::Letter,
+            landscape: false,
+            margins: [72.0, 36.0, 72.0, 36.0],
+        };
+        let file = write(&blocks, Some(&setup), "Plan", &Pictures::new());
+        // The mimetype comes first, stored as is, as OpenDocument asks.
+        assert_eq!(&file[30..38], b"mimetype");
+        assert_eq!(&file[38..38 + MIME_TYPE.len()], MIME_TYPE.as_bytes());
+        let content = part(&file, "content.xml");
+        assert!(
+            content.contains(
+                "<text:h text:style-name=\"Heading_20_2\" text:outline-level=\"2\">Plan</text:h>"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("<text:s/>two <text:s/>spaces<text:span text:style-name=\"Span"),
+            "{content}"
+        );
+        assert!(
+            content.contains("<text:list-item text:start-value=\"3\">"),
+            "{content}"
+        );
+        assert!(
+            content.contains("<text:list text:style-name=\"Checked\">"),
+            "{content}"
+        );
+        assert!(content.contains("text-line-through-style"), "{content}");
+        let styles = part(&file, "styles.xml");
+        assert!(
+            styles.contains("fo:page-width=\"612pt\" fo:page-height=\"792pt\""),
+            "{styles}"
+        );
+        assert!(styles.contains("fo:margin-right=\"36pt\""), "{styles}");
+        assert!(part(&file, "meta.xml").contains("<dc:title>Plan</dc:title>"));
+
+        // Pictures go in the file, once each, sized to fit the page.
+        let picture = Picture::read(crate::picture::tests::png(400, 300)).unwrap();
+        let image = Block::Image(Image {
+            hash: picture.hash.clone(),
+            alt: "Dot".into(),
+            width: Some(200),
+        });
+        let pictures: Pictures = [(picture.hash.clone(), picture.clone())]
+            .into_iter()
+            .collect();
+        let file = write(&[image], Some(&setup), "Pictures", &pictures);
+        let content = part(&file, "content.xml");
+        let path = format!("Pictures/{}.png", picture.hash);
+        assert!(
+            content.contains(&format!(
+                "svg:width=\"150pt\" svg:height=\"112.5pt\"><draw:image xlink:href=\"{path}\""
+            )),
+            "{content}"
+        );
+        assert!(content.contains("<svg:desc>Dot</svg:desc>"), "{content}");
+        assert!(part(&file, "META-INF/manifest.xml").contains(&path));
+    }
+}

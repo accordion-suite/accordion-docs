@@ -16,6 +16,7 @@
 //! | [`Block::Numbers`] | `ordered_list` (`order`), `list_item` | `<ol>`, `<li>` |
 //! | [`Block::Checks`] | `check_list`, `check_item` (`checked`) | `<ul class="checklist">`, `<li>` |
 //! | [`Block::Table`] | `table`, `table_row`, `table_cell`, `table_header` | `<table>`, `<tr>`, `<td>`, `<th>` |
+//! | [`Block::Image`] | `image` (`src`, `alt`, `width`) | `<img>` |
 //! | [`Inline::Break`] | `hard_break` | `<br>` |
 //!
 //! Marks: `bold` (`<strong>`), `italic` (`<em>`), `underline` (`<u>`),
@@ -67,6 +68,56 @@ pub enum Block {
     Checks(Vec<(bool, Vec<Block>)>),
     /// Rows of cells.
     Table(Vec<Vec<Cell>>),
+    /// A picture, on a line of its own.
+    Image(Image),
+}
+
+/// A picture in a document. Its contents are kept apart from the blocks,
+/// by their hash ([`crate::picture`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    /// The SHA-256 hash of the picture's contents, in lowercase hex. The
+    /// editor's node keeps it as `src`.
+    pub hash: String,
+    /// Words that say what the picture shows, for people who can't see it.
+    pub alt: String,
+    /// How wide it's shown, in pixels, once someone has set it. Otherwise
+    /// it's as wide as it is, or as the page.
+    pub width: Option<u32>,
+}
+
+/// The longest alt text kept.
+const MAX_ALT: usize = 1000;
+
+/// The widest a picture is shown, in pixels: wider than any page.
+const MAX_WIDTH: u32 = 5000;
+
+/// The hash of every picture in `blocks`, each once, in order.
+pub fn image_hashes(blocks: &[Block]) -> Vec<String> {
+    fn walk(blocks: &[Block], out: &mut Vec<String>) {
+        for block in blocks {
+            match block {
+                Block::Image(image) => {
+                    if !out.contains(&image.hash) {
+                        out.push(image.hash.clone());
+                    }
+                }
+                Block::Quote(blocks) => walk(blocks, out),
+                Block::Bullets(items) | Block::Numbers(_, items) => {
+                    items.iter().for_each(|item| walk(item, out));
+                }
+                Block::Checks(items) => items.iter().for_each(|(_, item)| walk(item, out)),
+                Block::Table(rows) => rows
+                    .iter()
+                    .flatten()
+                    .for_each(|cell| walk(&cell.content, out)),
+                Block::Paragraph(_) | Block::Heading(..) | Block::Code(_) | Block::Rule => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(blocks, &mut out);
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +130,144 @@ pub struct Cell {
     /// someone has dragged a column's edge.
     pub colwidth: Option<Vec<u32>>,
     pub content: Vec<Block>,
+}
+
+/// A page size people can choose, as in Google Docs and Word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PageSize {
+    /// 8.5 by 11 inches, usual in the US, Canada, and Mexico.
+    #[default]
+    Letter,
+    /// 210 by 297 mm, usual everywhere else.
+    A4,
+    /// 8.5 by 14 inches.
+    Legal,
+    /// 148 by 210 mm.
+    A5,
+    /// 297 by 420 mm.
+    A3,
+    /// 11 by 17 inches.
+    Tabloid,
+}
+
+impl PageSize {
+    pub const ALL: [PageSize; 6] = [
+        PageSize::Letter,
+        PageSize::A4,
+        PageSize::Legal,
+        PageSize::A5,
+        PageSize::A3,
+        PageSize::Tabloid,
+    ];
+
+    /// The name in files and in the co-editing document.
+    pub fn name(self) -> &'static str {
+        match self {
+            PageSize::Letter => "letter",
+            PageSize::A4 => "a4",
+            PageSize::Legal => "legal",
+            PageSize::A5 => "a5",
+            PageSize::A3 => "a3",
+            PageSize::Tabloid => "tabloid",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<PageSize> {
+        Self::ALL.into_iter().find(|size| size.name() == name)
+    }
+
+    /// Width and height upright, as CSS lengths and in points.
+    fn dimensions(self) -> ((&'static str, &'static str), (f64, f64)) {
+        const MM: f64 = 72.0 / 25.4;
+        match self {
+            PageSize::Letter => (("8.5in", "11in"), (612.0, 792.0)),
+            PageSize::A4 => (("210mm", "297mm"), (210.0 * MM, 297.0 * MM)),
+            PageSize::Legal => (("8.5in", "14in"), (612.0, 1008.0)),
+            PageSize::A5 => (("148mm", "210mm"), (148.0 * MM, 210.0 * MM)),
+            PageSize::A3 => (("297mm", "420mm"), (297.0 * MM, 420.0 * MM)),
+            PageSize::Tabloid => (("11in", "17in"), (792.0, 1224.0)),
+        }
+    }
+}
+
+/// A document's page: its size, which way up, and its margins, for printing
+/// and for how wide the editor's page is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageSetup {
+    pub size: PageSize,
+    pub landscape: bool,
+    /// Top, right, bottom, and left, in points (72 to the inch).
+    pub margins: [f64; 4],
+}
+
+/// One inch, the usual margin in Google Docs and Word.
+pub const DEFAULT_MARGIN: f64 = 72.0;
+
+/// The most a margin can be: 4 inches.
+pub const MAX_MARGIN: f64 = 288.0;
+
+/// The least room the margins leave for text, across and down: 1 inch.
+const MIN_TEXT: f64 = 72.0;
+
+impl PageSetup {
+    /// A page of `size`, upright, with 1-inch margins.
+    pub fn new(size: PageSize) -> Self {
+        Self {
+            size,
+            landscape: false,
+            margins: [DEFAULT_MARGIN; 4],
+        }
+    }
+
+    /// Width and height as laid out, as CSS lengths.
+    pub fn css_size(&self) -> (&'static str, &'static str) {
+        let ((width, height), _) = self.size.dimensions();
+        if self.landscape {
+            (height, width)
+        } else {
+            (width, height)
+        }
+    }
+
+    /// Width and height as laid out, in points.
+    pub fn points(&self) -> (f64, f64) {
+        let (_, (width, height)) = self.size.dimensions();
+        if self.landscape {
+            (height, width)
+        } else {
+            (width, height)
+        }
+    }
+
+    /// The same page with margins that fit: none below zero or above 4
+    /// inches, rounded to a hundredth of a point, and at least an inch of
+    /// room for text each way.
+    pub fn normalized(mut self) -> Self {
+        for margin in &mut self.margins {
+            let value = if margin.is_finite() {
+                *margin
+            } else {
+                DEFAULT_MARGIN
+            };
+            *margin = (value.clamp(0.0, MAX_MARGIN) * 100.0).round() / 100.0;
+        }
+        let (width, height) = self.points();
+        let [top, right, bottom, left] = &mut self.margins;
+        shrink_pair(left, right, width - MIN_TEXT);
+        shrink_pair(top, bottom, height - MIN_TEXT);
+        self
+    }
+}
+
+/// Shrinks two margins in proportion until they add up to at most `room`.
+fn shrink_pair(a: &mut f64, b: &mut f64, room: f64) {
+    let total = *a + *b;
+    if total > room && total > 0.0 {
+        let scale = room / total;
+        *a = (*a * scale * 100.0).floor() / 100.0;
+        *b = (*b * scale * 100.0).floor() / 100.0;
+    }
 }
 
 /// The most rows or columns a cell can span. More is a mistake, or a file
@@ -112,6 +301,22 @@ pub fn normalize_block(block: Block) -> Option<Block> {
         Block::Quote(blocks) => Block::Quote(at_least_a_paragraph(blocks)),
         Block::Code(text) => Block::Code(text),
         Block::Rule => Block::Rule,
+        Block::Image(image) => {
+            if !crate::picture::is_hash(&image.hash) {
+                return None;
+            }
+            let alt: String = image
+                .alt
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_ALT)
+                .collect();
+            Block::Image(Image {
+                hash: image.hash,
+                alt: alt.trim().to_owned(),
+                width: image.width.filter(|width| (1..=MAX_WIDTH).contains(width)),
+            })
+        }
         Block::Bullets(items) => {
             let items: Vec<_> = items.into_iter().map(item).collect();
             if items.is_empty() {
@@ -233,7 +438,7 @@ pub fn first_text(blocks: &[Block]) -> Option<String> {
                 .flatten()
                 .find_map(|cell| first_text(&cell.content))
                 .unwrap_or_default(),
-            Block::Rule => String::new(),
+            Block::Rule | Block::Image(_) => String::new(),
         };
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         if !text.is_empty() {
@@ -330,6 +535,24 @@ mod tests {
         assert_eq!(safe_link("JavaScript:alert(1)"), None);
         assert_eq!(safe_link("data:text/html,x"), None);
         assert_eq!(safe_link("/relative"), None);
+    }
+
+    #[test]
+    fn margins_always_leave_room_for_text() {
+        let mut page = PageSetup::new(PageSize::A5);
+        page.margins = [-5.0, 288.0, f64::NAN, 288.0];
+        let page = page.normalized();
+        assert_eq!(page.margins[0], 0.0);
+        assert_eq!(page.margins[2], DEFAULT_MARGIN);
+        let (width, _) = page.points();
+        assert!(page.margins[1] + page.margins[3] <= width - MIN_TEXT);
+        assert_eq!(page.margins[1], page.margins[3]);
+        // Sideways, the same page has room for them.
+        let mut wide = PageSetup::new(PageSize::A5);
+        wide.landscape = true;
+        wide.margins = [72.0, 200.0, 72.0, 200.0];
+        assert_eq!(wide.normalized().margins, [72.0, 200.0, 72.0, 200.0]);
+        assert_eq!(wide.css_size(), ("210mm", "148mm"));
     }
 
     #[test]

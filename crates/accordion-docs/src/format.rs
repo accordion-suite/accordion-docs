@@ -7,13 +7,20 @@
 //! read and write files, and make a document match a file with few edits.
 
 use accordion_core::coedit::{Format, FormatError};
-use yrs::{Doc, ReadTxn, StateVector, Transact, XmlFragment};
+use yrs::updates::decoder::Decode;
+use yrs::{Doc, OffsetKind, Options, ReadTxn, StateVector, Transact, Update, XmlFragment};
 
 use crate::html;
-use crate::model::Block;
+use crate::images::Images;
+use crate::model::{self, Block, PageSetup};
+use crate::picture::Pictures;
 use crate::yjs;
 
-pub(crate) struct DocFormat;
+pub(crate) struct DocFormat {
+    /// Where the pictures are, since the editor's document has only their
+    /// hashes.
+    pub images: Images,
+}
 
 impl Format for DocFormat {
     fn name(&self) -> &'static str {
@@ -27,9 +34,18 @@ impl Format for DocFormat {
     /// Replaces only the blocks that differ, so people typing elsewhere in
     /// the document keep their place, and their typing.
     fn absorb(&self, doc: &Doc, contents: &[u8]) -> Result<(), FormatError> {
-        let wanted = html::read(contents);
+        let html::Document {
+            blocks: wanted,
+            setup,
+            pictures,
+        } = html::read_document(contents);
+        self.images.remember(pictures);
         let fragment = doc.get_or_insert_xml_fragment(yjs::FRAGMENT);
+        let page = doc.get_or_insert_map(yjs::PAGE);
         let mut txn = doc.transact_mut();
+        if yjs::read_page(&txn, &page) != setup {
+            yjs::write_page(&mut txn, &page, setup.as_ref());
+        }
         let have = yjs::read_each(&txn, &fragment);
         let (same_start, same_end) = unchanged_ends(&have, &wanted);
         let removed = have.len() - same_start - same_end;
@@ -47,10 +63,14 @@ impl Format for DocFormat {
 
     fn write(&self, doc: &Doc) -> Result<Vec<u8>, FormatError> {
         let fragment = doc.get_or_insert_xml_fragment(yjs::FRAGMENT);
+        let page = doc.get_or_insert_map(yjs::PAGE);
         let txn = doc.transact();
         let blocks = yjs::read(&txn, &fragment);
+        let setup = yjs::read_page(&txn, &page);
         let state = txn.encode_state_as_update_v1(&StateVector::default());
-        Ok(html::page(&blocks, Some(&state)).into_bytes())
+        drop(txn);
+        let pictures = self.images.for_saving(&model::image_hashes(&blocks));
+        Ok(html::page(&blocks, setup.as_ref(), Some(&state), &pictures).into_bytes())
     }
 }
 
@@ -71,10 +91,45 @@ fn unchanged_ends(have: &[Option<Block>], wanted: &[Block]) -> (usize, usize) {
     (start, end)
 }
 
-/// The file for a new, empty document. It has no state yet: the first
-/// person to open it makes one from the body.
-pub(crate) fn new_document() -> Vec<u8> {
-    html::page(&[Block::Paragraph(Vec::new())], None).into_bytes()
+impl DocFormat {
+    /// The file for a new document whose first changes were made in a
+    /// browser before it had a file: `update` is the browser's whole state,
+    /// kept as the file's, so the browser joins it without merging its
+    /// changes in twice. `setup` is the paper if the state has none.
+    /// Nothing if `update` isn't a co-editing state.
+    pub(crate) fn file_from_draft(&self, update: &[u8], setup: &PageSetup) -> Option<Vec<u8>> {
+        let update = Update::decode_v1(update).ok()?;
+        let doc = Doc::with_options(Options {
+            offset_kind: OffsetKind::Bytes,
+            ..Options::default()
+        });
+        let page = doc.get_or_insert_map(yjs::PAGE);
+        doc.get_or_insert_xml_fragment(yjs::FRAGMENT);
+        {
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update).ok()?;
+            // Parts it depends on, which a whole state never lacks.
+            if txn.store().pending_update().is_some() || txn.store().pending_ds().is_some() {
+                return None;
+            }
+            if yjs::read_page(&txn, &page).is_none() {
+                yjs::write_page(&mut txn, &page, Some(setup));
+            }
+        }
+        self.write(&doc).ok()
+    }
+}
+
+/// The file for a new, empty document on `setup`'s page. It has no state
+/// yet: the first person to open it makes one from the body.
+pub(crate) fn new_document(setup: &PageSetup) -> Vec<u8> {
+    html::page(
+        &[Block::Paragraph(Vec::new())],
+        Some(setup),
+        None,
+        &Pictures::new(),
+    )
+    .into_bytes()
 }
 
 #[cfg(test)]
@@ -83,7 +138,14 @@ mod tests {
     use yrs::{OffsetKind, Options, Update, XmlFragmentRef};
 
     use super::*;
-    use crate::model::{Inline, Marks};
+    use crate::model::{Image, Inline, Marks, PageSize};
+    use crate::picture::Picture;
+
+    fn format() -> DocFormat {
+        DocFormat {
+            images: Images::in_memory(),
+        }
+    }
 
     fn doc() -> Doc {
         Doc::with_options(Options {
@@ -94,6 +156,11 @@ mod tests {
 
     fn paragraph(text: &str) -> Block {
         Block::Paragraph(vec![Inline::Text(text.into(), Marks::default())])
+    }
+
+    fn page(doc: &Doc) -> Option<PageSetup> {
+        let page = doc.get_or_insert_map(yjs::PAGE);
+        yjs::read_page(&doc.transact(), &page)
     }
 
     fn blocks(doc: &Doc) -> Vec<Block> {
@@ -127,24 +194,152 @@ mod tests {
                 ]),
                 Block::Checks(vec![(true, vec![paragraph("Milk")])]),
             ],
+            Some(&PageSetup::new(PageSize::A4)),
             None,
+            &Pictures::new(),
         );
-        DocFormat.absorb(&doc, file.as_bytes()).unwrap();
-        let written = DocFormat.write(&doc).unwrap();
+        format().absorb(&doc, file.as_bytes()).unwrap();
+        let written = format().write(&doc).unwrap();
         assert_eq!(html::read(&written), html::read(file.as_bytes()));
 
         // The state in the file makes the same document elsewhere.
-        let state = DocFormat.state_in(&written).unwrap();
+        let state = format().state_in(&written).unwrap();
         let other = self::doc();
         other
             .transact_mut()
             .apply_update(Update::decode_v1(&state).unwrap())
             .unwrap();
         assert_eq!(blocks(&other), blocks(&doc));
+        assert_eq!(page(&other), Some(PageSetup::new(PageSize::A4)));
         // And reading its own file back changes nothing.
         let before = doc.transact().state_vector();
-        DocFormat.absorb(&doc, &written).unwrap();
+        format().absorb(&doc, &written).unwrap();
         assert_eq!(doc.transact().state_vector(), before);
+    }
+
+    #[test]
+    fn a_draft_becomes_a_file_with_its_own_state() {
+        // A browser typed into a document that had no file yet.
+        let draft = doc();
+        {
+            let fragment = draft.get_or_insert_xml_fragment(yjs::FRAGMENT);
+            let mut txn = draft.transact_mut();
+            yjs::insert_blocks(&mut txn, &fragment, 0, &[paragraph("First words")]);
+        }
+        let update = draft
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        let file = format()
+            .file_from_draft(&update, &PageSetup::new(PageSize::A4))
+            .unwrap();
+        let read = html::read_document(&file);
+        assert_eq!(read.blocks, vec![paragraph("First words")]);
+        assert_eq!(read.setup, Some(PageSetup::new(PageSize::A4)));
+
+        // The browser's state is the file's, so joining adds nothing twice.
+        let joined = doc();
+        joined
+            .transact_mut()
+            .apply_update(Update::decode_v1(&format().state_in(&file).unwrap()).unwrap())
+            .unwrap();
+        joined
+            .transact_mut()
+            .apply_update(Update::decode_v1(&update).unwrap())
+            .unwrap();
+        assert_eq!(blocks(&joined), vec![paragraph("First words")]);
+
+        // A paper the browser chose wins over the default.
+        {
+            let page = draft.get_or_insert_map(yjs::PAGE);
+            let mut txn = draft.transact_mut();
+            yjs::write_page(&mut txn, &page, Some(&PageSetup::new(PageSize::Legal)));
+        }
+        let update = draft
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        let file = format()
+            .file_from_draft(&update, &PageSetup::new(PageSize::A4))
+            .unwrap();
+        assert_eq!(
+            html::read_document(&file).setup,
+            Some(PageSetup::new(PageSize::Legal))
+        );
+
+        assert_eq!(
+            format().file_from_draft(b"not a state", &PageSetup::new(PageSize::A4)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn saving_writes_each_picture_into_the_file() {
+        let format = format();
+        let doc = doc();
+        // Someone added a picture, and the editor refers to it by hash.
+        let picture = Picture::read(crate::picture::tests::png(40, 30)).unwrap();
+        format.images.add(picture.clone()).await.unwrap();
+        let image = Block::Image(Image {
+            hash: picture.hash.clone(),
+            alt: "A dot".into(),
+            width: Some(20),
+        });
+        {
+            let fragment = doc.get_or_insert_xml_fragment(yjs::FRAGMENT);
+            let mut txn = doc.transact_mut();
+            yjs::insert_blocks(&mut txn, &fragment, 0, &[paragraph("Look"), image.clone()]);
+        }
+        let written = format.write(&doc).unwrap();
+        let text = String::from_utf8(written.clone()).unwrap();
+        assert!(text.contains(&picture.data_address()), "{text}");
+        let read = html::read_document(&written);
+        assert_eq!(read.blocks, vec![paragraph("Look"), image]);
+        assert_eq!(read.pictures.get(&picture.hash), Some(&picture));
+
+        // Another server opening the file has the picture from it.
+        let elsewhere = self::format();
+        let other = self::doc();
+        elsewhere.absorb(&other, &written).unwrap();
+        assert!(
+            String::from_utf8(elsewhere.write(&other).unwrap())
+                .unwrap()
+                .contains(&picture.data_address())
+        );
+    }
+
+    #[test]
+    fn a_page_setup_changed_outside_comes_in() {
+        let doc = doc();
+        let blocks = [paragraph("One")];
+        let a4 = PageSetup::new(PageSize::A4);
+        format()
+            .absorb(
+                &doc,
+                html::page(&blocks, Some(&a4), None, &Pictures::new()).as_bytes(),
+            )
+            .unwrap();
+        let mut sideways = a4;
+        sideways.landscape = true;
+        sideways.margins[1] = 36.0;
+        format()
+            .absorb(
+                &doc,
+                html::page(&blocks, Some(&sideways), None, &Pictures::new()).as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(page(&doc), Some(sideways));
+        // A file without one, such as an older version, has none.
+        format()
+            .absorb(
+                &doc,
+                html::page(&blocks, None, None, &Pictures::new()).as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(page(&doc), None);
+        assert!(
+            !String::from_utf8(format().write(&doc).unwrap())
+                .unwrap()
+                .contains("@page")
+        );
     }
 
     #[test]
@@ -153,8 +348,10 @@ mod tests {
         let first = html::page(
             &[paragraph("One"), paragraph("Two"), paragraph("Three")],
             None,
+            None,
+            &Pictures::new(),
         );
-        DocFormat.absorb(&doc, first.as_bytes()).unwrap();
+        format().absorb(&doc, first.as_bytes()).unwrap();
         let fragment = doc.get_or_insert_xml_fragment(yjs::FRAGMENT);
         let first_id = fragment.get(&doc.transact(), 0).unwrap().id();
         let last_id = fragment.get(&doc.transact(), 2).unwrap().id();
@@ -162,8 +359,10 @@ mod tests {
         let changed = html::page(
             &[paragraph("One"), paragraph("2"), paragraph("Three")],
             None,
+            None,
+            &Pictures::new(),
         );
-        DocFormat.absorb(&doc, changed.as_bytes()).unwrap();
+        format().absorb(&doc, changed.as_bytes()).unwrap();
         assert_eq!(blocks(&doc), html::read(changed.as_bytes()));
         // The blocks that didn't change are the same ones.
         assert_eq!(fragment.get(&doc.transact(), 0).unwrap().id(), first_id);
@@ -173,10 +372,11 @@ mod tests {
     #[test]
     fn a_new_document_opens_with_one_paragraph() {
         let doc = doc();
-        let file = new_document();
+        let file = new_document(&PageSetup::new(PageSize::A4));
         assert!(html::is_document(&file));
-        assert_eq!(DocFormat.state_in(&file), None);
-        DocFormat.absorb(&doc, &file).unwrap();
+        assert_eq!(format().state_in(&file), None);
+        format().absorb(&doc, &file).unwrap();
         assert_eq!(blocks(&doc), vec![Block::Paragraph(Vec::new())]);
+        assert_eq!(page(&doc), Some(PageSetup::new(PageSize::A4)));
     }
 }

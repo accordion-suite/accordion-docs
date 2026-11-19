@@ -9,9 +9,15 @@
 //! the editing, and this crate gives it the format.
 
 mod api;
+pub mod docx;
 mod format;
 pub mod html;
+mod images;
+pub mod markdown;
 pub mod model;
+pub mod odt;
+mod office;
+pub mod picture;
 pub mod yjs;
 
 use accordion_core::coedit::CoEditing;
@@ -20,6 +26,8 @@ use accordion_core::storage::{AppPlace, Storage};
 use accordion_core::thumbnails::Thumbnails;
 use accordion_module::{BoxFuture, Module, Routes, Services, StartError, Started, Stopping};
 use axum::extract::FromRef;
+
+use crate::images::Images;
 
 /// Docs' place beside My Drive.
 pub(crate) const PLACE: AppPlace = AppPlace {
@@ -47,24 +55,46 @@ impl Module for Docs {
     fn start(
         &self,
         services: Services,
-        _stopping: Stopping,
+        stopping: Stopping,
     ) -> BoxFuture<Result<Started, StartError>> {
         Box::pin(async move {
             services.storage.add_place(PLACE);
+            let images = Images::open(services.db).await?;
             let state = DocsState {
                 identity: services.identity,
                 storage: services.storage,
                 coediting: services.coediting,
                 thumbnails: services.thumbnails,
+                images: images.clone(),
             };
             Ok(Started {
                 routes: Routes {
                     api: Some(api::routes(state)),
                     ..Routes::default()
                 },
-                background: None,
+                background: Some(Box::pin(tidy(images, stopping))),
             })
         })
+    }
+}
+
+/// Once a day, from a minute after starting, leaves out pictures no
+/// document has used for months.
+async fn tidy(images: Images, stopping: Stopping) {
+    let work = async {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        loop {
+            match images.tidy().await {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "left out pictures no document uses"),
+                Err(err) => tracing::warn!(%err, "couldn't tidy documents' pictures"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+        }
+    };
+    tokio::select! {
+        () = work => {}
+        () = stopping.wait() => {}
     }
 }
 
@@ -74,6 +104,8 @@ struct DocsState {
     storage: Storage,
     coediting: CoEditing,
     thumbnails: Thumbnails,
+    /// Pictures in documents, while they're open.
+    images: Images,
 }
 
 impl FromRef<DocsState> for Identity {

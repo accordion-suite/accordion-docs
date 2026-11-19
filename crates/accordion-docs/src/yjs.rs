@@ -13,14 +13,80 @@ use std::sync::Arc;
 use yrs::types::Attrs;
 use yrs::types::text::YChange;
 use yrs::{
-    Any, Out, ReadTxn, Text, TransactionMut, Xml, XmlElementPrelim, XmlElementRef, XmlFragment,
-    XmlFragmentRef, XmlOut, XmlTextPrelim, XmlTextRef,
+    Any, Map, MapRef, Number, Out, ReadTxn, Text, TransactionMut, Xml, XmlElementPrelim,
+    XmlElementRef, XmlFragment, XmlFragmentRef, XmlOut, XmlTextPrelim, XmlTextRef,
 };
 
-use crate::model::{self, Block, Cell, Inline, Marks};
+use crate::model::{self, Block, Cell, Image, Inline, Marks, PageSetup, PageSize};
 
 /// The fragment y-prosemirror binds the editor to.
 pub const FRAGMENT: &str = "prosemirror";
+
+/// The map that holds the page setup, beside the fragment. Each part is a
+/// key of its own, so one person changing the size and another the margins
+/// both keep their change.
+pub const PAGE: &str = "page";
+
+const MARGIN_KEYS: [&str; 4] = ["top", "right", "bottom", "left"];
+
+/// The page setup in `page`, or `None` if nobody has set one.
+pub fn read_page<T: ReadTxn>(txn: &T, page: &MapRef) -> Option<PageSetup> {
+    let size = match page.get(txn, "size")? {
+        Out::Any(Any::String(name)) => PageSize::from_name(&name)?,
+        _ => return None,
+    };
+    let landscape = matches!(
+        page.get(txn, "orientation"),
+        Some(Out::Any(Any::String(orientation))) if &*orientation == "landscape"
+    );
+    let margins = MARGIN_KEYS.map(|key| match page.get(txn, key) {
+        Some(Out::Any(Any::Number(value))) => value.as_f64().unwrap_or(model::DEFAULT_MARGIN),
+        _ => model::DEFAULT_MARGIN,
+    });
+    Some(
+        PageSetup {
+            size,
+            landscape,
+            margins,
+        }
+        .normalized(),
+    )
+}
+
+/// Makes `page` hold `setup`, or nothing, changing only the keys that
+/// differ.
+pub fn write_page(txn: &mut TransactionMut, page: &MapRef, setup: Option<&PageSetup>) {
+    let Some(setup) = setup else {
+        page.clear(txn);
+        return;
+    };
+    // Numbers compare by value, since the editor writes whole ones as
+    // integers.
+    let mut set = |key: &str, value: Any| {
+        let same = match (page.get(txn, key), &value) {
+            (Some(Out::Any(Any::Number(have))), Any::Number(want)) => {
+                have.as_f64() == want.as_f64()
+            }
+            (Some(Out::Any(have)), want) => have == *want,
+            _ => false,
+        };
+        if !same {
+            page.insert(txn, key, value);
+        }
+    };
+    set("size", Any::from(setup.size.name()));
+    set(
+        "orientation",
+        Any::from(if setup.landscape {
+            "landscape"
+        } else {
+            "portrait"
+        }),
+    );
+    for (key, margin) in MARGIN_KEYS.into_iter().zip(setup.margins) {
+        set(key, Any::Number(Number::try_i64(margin)));
+    }
+}
 
 /// The document's blocks, as the editor would show them.
 pub fn read<T: ReadTxn>(txn: &T, fragment: &XmlFragmentRef) -> Vec<Block> {
@@ -75,6 +141,17 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
                 .collect(),
         ),
         "horizontal_rule" => Block::Rule,
+        "image" => {
+            let text = |name| match element.get_attribute(txn, name) {
+                Some(Out::Any(Any::String(text))) => text.to_string(),
+                _ => String::new(),
+            };
+            Block::Image(Image {
+                hash: text("src"),
+                alt: text("alt"),
+                width: number(txn, element, "width").and_then(|width| u32::try_from(width).ok()),
+            })
+        }
         "bullet_list" => Block::Bullets(items(txn, element, "list_item")),
         "ordered_list" => {
             let start = number(txn, element, "order")
@@ -283,6 +360,16 @@ fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32
         }
         Block::Rule => {
             element(txn, parent, index, "horizontal_rule");
+        }
+        Block::Image(image) => {
+            // The editor keeps the hash as the node's `src`, and turns it
+            // into the picture's address as it shows it.
+            let el = element(txn, parent, index, "image");
+            el.insert_attribute(txn, "src", Any::from(image.hash.as_str()));
+            el.insert_attribute(txn, "alt", Any::from(image.alt.as_str()));
+            if let Some(width) = image.width {
+                el.insert_attribute(txn, "width", int(i64::from(width)));
+            }
         }
         Block::Bullets(items) => {
             let el = element(txn, parent, index, "bullet_list");

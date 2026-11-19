@@ -17,7 +17,9 @@ use std::fmt::Write as _;
 
 use scraper::{Html, Node};
 
-use crate::model::{self, Block, Cell, Inline, Marks};
+use crate::model::{self, Block, Cell, Image, Inline, Marks, PageSetup, PageSize};
+use crate::office::number;
+use crate::picture::{self, Picture, Pictures};
 
 /// How every document starts. Docs recognizes its files by it, so a web page
 /// someone uploads stays a web page.
@@ -30,15 +32,18 @@ const DATA_TYPE: &str = "application/x-accordion-docs";
 pub const DATA_VERSION: u32 = 1;
 
 /// How the page looks on screen and in print, kept small. The editor in the
-/// web app has its own styles.
+/// web app has its own styles. Only blocks of text keep typed spaces: list
+/// items and cells hold blocks, with line breaks between them in the file
+/// that aren't part of the text.
 const STYLE: &str = "\
 body{margin:0;background:#f8f9fa;color:#1f1f1f;font:16px/1.6 system-ui,sans-serif}\
 main{box-sizing:border-box;max-width:816px;margin:24px auto;padding:72px 96px;background:#fff;\
 box-shadow:0 1px 3px rgba(0,0,0,.15)}\
-p,h1,h2,h3,h4,h5,h6,li,td,th{white-space:pre-wrap}\
+p,h1,h2,h3,h4,h5,h6{white-space:pre-wrap}\
 p{margin:0 0 .6em}\
 pre{background:#f1f3f4;padding:12px;border-radius:4px;overflow-x:auto;white-space:pre-wrap}\
 code{font-family:ui-monospace,monospace;font-size:.9em}\
+img{display:block;max-width:100%;height:auto;margin:0 0 .6em}\
 blockquote{margin:0 0 .6em;padding-left:16px;border-left:3px solid #dadce0;color:#444746}\
 table{border-collapse:collapse;margin:0 0 .6em}\
 td,th{border:1px solid #c4c7c5;padding:4px 8px;vertical-align:top;min-width:40px}\
@@ -49,25 +54,77 @@ ul.checklist>li>input{float:left;margin:6px 8px 0 0}\
 ul.checklist>li[data-checked=true]>p{text-decoration:line-through;color:#5f6368}\
 @media (max-width:860px){main{margin:0;padding:24px 16px;box-shadow:none}}\
 @media print{body{background:none}main{max-width:none;margin:0;padding:0;box-shadow:none}}\
-@media (prefers-color-scheme:dark){body{background:#131314;color:#e3e3e3}\
+@media screen and (prefers-color-scheme:dark){body{background:#131314;color:#e3e3e3}\
 main{background:#1f1f1f}pre,th{background:#2d2f31}td,th{border-color:#444746}\
 blockquote{border-color:#444746;color:#c4c7c5}}";
 
-/// The whole file for `blocks`, with `state`, the co-editing state, in its
-/// data block when there is one.
-pub fn page(blocks: &[Block], state: Option<&[u8]>) -> String {
+/// The whole file for `blocks` on the page `setup`, with `state`, the
+/// co-editing state, in its data block when there is one.
+pub fn page(
+    blocks: &[Block],
+    setup: Option<&PageSetup>,
+    state: Option<&[u8]>,
+    pictures: &Pictures,
+) -> String {
     let title = model::first_text(blocks)
         .map(|text| text.chars().take(100).collect::<String>())
         .unwrap_or_else(|| "Untitled document".to_owned());
-    let mut out = String::with_capacity(4096);
+    write_page(blocks, setup, state, &title, pictures)
+}
+
+/// The page to print `blocks` on `setup`'s paper, titled `title`, which
+/// browsers offer as the PDF's name. It has no data block.
+pub fn print_page(
+    blocks: &[Block],
+    setup: Option<&PageSetup>,
+    title: &str,
+    pictures: &Pictures,
+) -> String {
+    write_page(blocks, setup, None, title, pictures)
+}
+
+fn write_page(
+    blocks: &[Block],
+    setup: Option<&PageSetup>,
+    state: Option<&[u8]>,
+    title: &str,
+    pictures: &Pictures,
+) -> String {
+    let room: usize = pictures
+        .values()
+        .map(|picture| picture.contents.len() / 3 * 4 + 100)
+        .sum();
+    let mut out = String::with_capacity(4096 + room);
     out.push_str(MARKER);
     out.push_str(">\n<head>\n<meta charset=\"utf-8\">\n");
     out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
     out.push_str("<meta name=\"generator\" content=\"Accordion Docs\">\n");
-    let _ = writeln!(out, "<title>{}</title>", escape_text(&title));
+    let _ = writeln!(out, "<title>{}</title>", escape_text(title));
     let _ = writeln!(out, "<style>{STYLE}</style>");
-    out.push_str("</head>\n<body>\n<main>\n");
-    write_blocks(&mut out, blocks);
+    match setup {
+        Some(setup) => {
+            let _ = writeln!(out, "<style>{}</style>", page_style(setup));
+            out.push_str("</head>\n<body>\n");
+            let _ = writeln!(
+                out,
+                "<main data-page=\"{}\" data-orientation=\"{}\" data-margins=\"{}\">",
+                setup.size.name(),
+                if setup.landscape {
+                    "landscape"
+                } else {
+                    "portrait"
+                },
+                setup
+                    .margins
+                    .iter()
+                    .map(|margin| number(*margin))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+        None => out.push_str("</head>\n<body>\n<main>\n"),
+    }
+    write_blocks(&mut out, blocks, pictures);
     out.push_str("</main>\n");
     if let Some(state) = state {
         use base64::Engine as _;
@@ -79,6 +136,18 @@ pub fn page(blocks: &[Block], state: Option<&[u8]>) -> String {
     }
     out.push_str("</body>\n</html>\n");
     out
+}
+
+/// The page's size and margins: in print, as the paper's, and on a wide
+/// screen, as the page's width and padding. Phones keep the narrow layout.
+fn page_style(setup: &PageSetup) -> String {
+    let (width, height) = setup.css_size();
+    let [top, right, bottom, left] = setup.margins.map(number);
+    format!(
+        "@page{{size:{width} {height};margin:{top}pt {right}pt {bottom}pt {left}pt}}\
+         @media screen and (min-width:861px){{main{{max-width:{width};\
+         padding:{top}pt {right}pt {bottom}pt {left}pt}}}}"
+    )
 }
 
 /// Whether `contents` is a Docs document.
@@ -103,13 +172,21 @@ pub fn state_in(contents: &[u8]) -> Option<Vec<u8>> {
         .ok()
 }
 
-fn write_blocks(out: &mut String, blocks: &[Block]) {
+/// `blocks` as HTML on their own, without a page around them, as Markdown
+/// carries what it has no syntax for.
+pub fn fragment(blocks: &[Block], pictures: &Pictures) -> String {
+    let mut out = String::new();
+    write_blocks(&mut out, blocks, pictures);
+    out
+}
+
+fn write_blocks(out: &mut String, blocks: &[Block], pictures: &Pictures) {
     for block in blocks {
-        write_block(out, block);
+        write_block(out, block, pictures);
     }
 }
 
-fn write_block(out: &mut String, block: &Block) {
+fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
     match block {
         Block::Paragraph(inlines) => {
             out.push_str("<p>");
@@ -123,18 +200,19 @@ fn write_block(out: &mut String, block: &Block) {
         }
         Block::Quote(blocks) => {
             out.push_str("<blockquote>\n");
-            write_blocks(out, blocks);
+            write_blocks(out, blocks, pictures);
             out.push_str("</blockquote>\n");
         }
         Block::Code(text) => {
             let _ = writeln!(out, "<pre><code>{}</code></pre>", escape_text(text));
         }
         Block::Rule => out.push_str("<hr>\n"),
+        Block::Image(image) => write_image(out, image, pictures.get(&image.hash)),
         Block::Bullets(items) => {
             out.push_str("<ul>\n");
             for blocks in items {
                 out.push_str("<li>\n");
-                write_blocks(out, blocks);
+                write_blocks(out, blocks, pictures);
                 out.push_str("</li>\n");
             }
             out.push_str("</ul>\n");
@@ -147,7 +225,7 @@ fn write_block(out: &mut String, block: &Block) {
             }
             for blocks in items {
                 out.push_str("<li>\n");
-                write_blocks(out, blocks);
+                write_blocks(out, blocks, pictures);
                 out.push_str("</li>\n");
             }
             out.push_str("</ol>\n");
@@ -162,7 +240,7 @@ fn write_block(out: &mut String, block: &Block) {
                 } else {
                     out.push_str("<li data-checked=\"false\"><input type=\"checkbox\" disabled>\n");
                 }
-                write_blocks(out, blocks);
+                write_blocks(out, blocks, pictures);
                 out.push_str("</li>\n");
             }
             out.push_str("</ul>\n");
@@ -185,7 +263,7 @@ fn write_block(out: &mut String, block: &Block) {
                         let _ = write!(out, " data-colwidth=\"{}\"", widths.join(","));
                     }
                     out.push_str(">\n");
-                    write_blocks(out, &cell.content);
+                    write_blocks(out, &cell.content, pictures);
                     let _ = writeln!(out, "</{tag}>");
                 }
                 out.push_str("</tr>\n");
@@ -193,6 +271,25 @@ fn write_block(out: &mut String, block: &Block) {
             out.push_str("</tbody>\n</table>\n");
         }
     }
+}
+
+/// A picture, with its contents in its `src`. One whose contents are
+/// missing keeps its hash, so it comes back if they turn up.
+fn write_image(out: &mut String, image: &Image, picture: Option<&Picture>) {
+    out.push_str("<img");
+    if let Some(picture) = picture {
+        let _ = write!(out, " src=\"{}\"", picture.data_address());
+    }
+    let _ = write!(
+        out,
+        " alt=\"{}\" data-hash=\"{}\"",
+        escape_attribute(&image.alt),
+        image.hash
+    );
+    if let Some(width) = image.width {
+        let _ = write!(out, " width=\"{width}\"");
+    }
+    out.push_str(">\n");
 }
 
 /// A mark as a tag, in the order they nest, outermost first.
@@ -302,6 +399,22 @@ fn escape_attribute(text: &str) -> String {
 /// doesn't have is left out: scripts, styles, forms, and so on. Text in
 /// elements the schema doesn't know stays, as plain text.
 pub fn read(contents: &[u8]) -> Vec<Block> {
+    read_document(contents).blocks
+}
+
+/// A page as Docs reads it.
+#[derive(Debug, Default)]
+pub struct Document {
+    pub blocks: Vec<Block>,
+    /// The page setup Docs wrote on its `<main>`, if it has one.
+    pub setup: Option<PageSetup>,
+    /// The pictures in its body, by their hash.
+    pub pictures: Pictures,
+}
+
+/// The blocks of an HTML page, as [`read`] reads them, with its page setup
+/// and its pictures.
+pub fn read_document(contents: &[u8]) -> Document {
     let text = String::from_utf8_lossy(contents);
     let html = Html::parse_document(&text);
     let root = html.root_element();
@@ -310,11 +423,46 @@ pub fn read(contents: &[u8]) -> Vec<Block> {
         .descendants()
         .find(|node| matches!(node.value(), Node::Element(el) if el.name() == "main"));
     let mut blocks = Vec::new();
+    let mut pictures = Pictures::new();
+    let setup = main.and_then(|main| read_setup(&main));
     match main {
-        Some(main) => read_blocks(main, &mut blocks),
-        None => read_blocks(*root, &mut blocks),
+        Some(main) => read_blocks(main, &mut blocks, &mut pictures),
+        None => read_blocks(*root, &mut blocks, &mut pictures),
     }
-    model::normalize(blocks)
+    let blocks = model::normalize(blocks);
+    // Only pictures the document shows.
+    let shown = model::image_hashes(&blocks);
+    pictures.retain(|hash, _| shown.contains(hash));
+    Document {
+        blocks,
+        setup,
+        pictures,
+    }
+}
+
+/// The page setup on Docs' `<main>`. A size Docs doesn't know means no
+/// setup; margins that are missing or unreadable are an inch.
+fn read_setup(main: &NodeRef) -> Option<PageSetup> {
+    let size = PageSize::from_name(attribute(main, "data-page")?.trim())?;
+    let landscape = attribute(main, "data-orientation").map(str::trim) == Some("landscape");
+    let mut margins = [model::DEFAULT_MARGIN; 4];
+    if let Some(written) = attribute(main, "data-margins") {
+        let read: Vec<f64> = written
+            .split_ascii_whitespace()
+            .filter_map(|margin| margin.parse().ok())
+            .collect();
+        if let Ok(read) = <[f64; 4]>::try_from(read) {
+            margins = read;
+        }
+    }
+    Some(
+        PageSetup {
+            size,
+            landscape,
+            margins,
+        }
+        .normalized(),
+    )
 }
 
 type NodeRef<'a> = ego_tree::NodeRef<'a, Node>;
@@ -322,8 +470,8 @@ type NodeRef<'a> = ego_tree::NodeRef<'a, Node>;
 /// Elements whose contents are never part of a document.
 const SKIPPED: &[&str] = &[
     "head", "script", "style", "template", "noscript", "iframe", "object", "embed", "svg", "math",
-    "title", "meta", "link", "input", "button", "select", "textarea", "img", "video", "audio",
-    "canvas", "picture", "source", "track", "map", "area", "dialog",
+    "title", "meta", "link", "input", "button", "select", "textarea", "video", "audio", "canvas",
+    "picture", "source", "track", "map", "area", "dialog",
 ];
 
 /// Inline text gathered between blocks, for a paragraph of its own.
@@ -459,6 +607,7 @@ fn element(node: &NodeRef) -> Option<&'static str> {
         "caption",
         "colgroup",
         "col",
+        "img",
     ];
     let name = el.name();
     KNOWN
@@ -477,7 +626,7 @@ fn attribute<'a>(node: &NodeRef<'a>, name: &str) -> Option<&'a str> {
 }
 
 /// Reads the children of `parent` as blocks.
-fn read_blocks(parent: NodeRef, out: &mut Vec<Block>) {
+fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
     let mut runs = Runs::default();
     let flush = |runs: &mut Runs, out: &mut Vec<Block>| {
         let taken = std::mem::take(runs);
@@ -501,16 +650,22 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>) {
             "p" => {
                 flush(&mut runs, out);
                 out.push(Block::Paragraph(inlines_of(child)));
+                images_in(child, out, pictures);
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 flush(&mut runs, out);
                 let level = name[1..].parse().unwrap_or(1);
                 out.push(Block::Heading(level, inlines_of(child)));
+                images_in(child, out, pictures);
+            }
+            "img" => {
+                flush(&mut runs, out);
+                out.extend(image(child, pictures));
             }
             "blockquote" => {
                 flush(&mut runs, out);
                 let mut blocks = Vec::new();
-                read_blocks(child, &mut blocks);
+                read_blocks(child, &mut blocks, pictures);
                 out.push(Block::Quote(blocks));
             }
             "pre" => {
@@ -523,11 +678,11 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>) {
             }
             "ul" | "ol" => {
                 flush(&mut runs, out);
-                out.push(list(child, name == "ol"));
+                out.push(list(child, name == "ol", pictures));
             }
             "table" => {
                 flush(&mut runs, out);
-                out.push(table(child));
+                out.push(table(child, pictures));
             }
             "br" => runs.runs.push(Run::Break),
             "div" | "section" | "article" | "main" | "header" | "footer" | "nav" | "aside"
@@ -535,13 +690,45 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>) {
             | "details" | "summary" | "address" | "dl" | "dd" | "dt" | "li" | "thead" | "tbody"
             | "tfoot" | "tr" | "td" | "th" | "caption" => {
                 flush(&mut runs, out);
-                read_blocks(child, out);
+                read_blocks(child, out, pictures);
             }
             "colgroup" | "col" => {}
             _ => read_inline(child, &Marks::default(), &mut runs),
         }
     }
     flush(&mut runs, out);
+}
+
+/// A picture: from its `data:` address, or by the hash Docs wrote beside it
+/// when its contents were missing. Pictures from elsewhere on the web are
+/// left out, since showing one would tell its site who's reading.
+fn image(node: NodeRef, pictures: &mut Pictures) -> Option<Block> {
+    let hash = match attribute(&node, "src").and_then(Picture::from_data_address) {
+        Some(found) => {
+            let hash = found.hash.clone();
+            pictures.entry(hash.clone()).or_insert(found);
+            hash
+        }
+        None => attribute(&node, "data-hash")
+            .map(str::trim)
+            .filter(|hash| picture::is_hash(hash))?
+            .to_owned(),
+    };
+    Some(Block::Image(Image {
+        hash,
+        alt: attribute(&node, "alt").unwrap_or_default().to_owned(),
+        width: attribute(&node, "width").and_then(|width| width.trim().parse().ok()),
+    }))
+}
+
+/// The pictures inside a paragraph or heading, as blocks after it, since
+/// the editor's pictures are on lines of their own.
+fn images_in(node: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
+    for child in node.descendants() {
+        if element(&child) == Some("img") {
+            out.extend(image(child, pictures));
+        }
+    }
 }
 
 /// The inline contents of a paragraph or heading.
@@ -630,7 +817,7 @@ fn text_of(node: NodeRef) -> String {
     out
 }
 
-fn list(node: NodeRef, numbered: bool) -> Block {
+fn list(node: NodeRef, numbered: bool, pictures: &mut Pictures) -> Block {
     let checklist = attribute(&node, "class")
         .is_some_and(|class| class.split_ascii_whitespace().any(|c| c == "checklist"))
         || attribute(&node, "data-type") == Some("checklist")
@@ -642,13 +829,13 @@ fn list(node: NodeRef, numbered: bool) -> Block {
         match element(&child) {
             Some("li") => {
                 let mut blocks = Vec::new();
-                read_blocks(child, &mut blocks);
+                read_blocks(child, &mut blocks, pictures);
                 items.push((is_checked(&child), blocks));
             }
             // A list right inside a list, which some programs write, goes
             // with the item before it.
             Some("ul" | "ol") => {
-                let nested = list(child, element(&child) == Some("ol"));
+                let nested = list(child, element(&child) == Some("ol"), pictures);
                 match items.last_mut() {
                     Some((_, blocks)) => blocks.push(nested),
                     None => items.push((false, vec![nested])),
@@ -680,16 +867,16 @@ fn is_checked(item: &NodeRef) -> bool {
             .any(|child| element(&child) == Some("input") && attribute(&child, "checked").is_some())
 }
 
-fn table(node: NodeRef) -> Block {
+fn table(node: NodeRef, pictures: &mut Pictures) -> Block {
     let mut rows = Vec::new();
-    collect_rows(node, &mut rows);
+    collect_rows(node, &mut rows, pictures);
     Block::Table(rows)
 }
 
-fn collect_rows(node: NodeRef, rows: &mut Vec<Vec<Cell>>) {
+fn collect_rows(node: NodeRef, rows: &mut Vec<Vec<Cell>>, pictures: &mut Pictures) {
     for child in node.children() {
         match element(&child) {
-            Some("thead" | "tbody" | "tfoot") => collect_rows(child, rows),
+            Some("thead" | "tbody" | "tfoot") => collect_rows(child, rows, pictures),
             Some("tr") => {
                 let mut cells = Vec::new();
                 for cell in child.children() {
@@ -710,7 +897,7 @@ fn collect_rows(node: NodeRef, rows: &mut Vec<Vec<Cell>>) {
                             .collect::<Option<Vec<u32>>>()
                     });
                     let mut content = Vec::new();
-                    read_blocks(cell, &mut content);
+                    read_blocks(cell, &mut content, pictures);
                     cells.push(Cell {
                         header,
                         colspan: span("colspan"),
@@ -807,11 +994,71 @@ mod tests {
     #[test]
     fn reads_back_what_it_wrote() {
         let blocks = sample();
-        let page = page(&blocks, Some(b"state"));
+        let page = page(&blocks, None, Some(b"state"), &Pictures::new());
         assert!(is_document(page.as_bytes()));
         assert_eq!(read(page.as_bytes()), blocks);
         assert_eq!(state_in(page.as_bytes()), Some(b"state".to_vec()));
         assert!(page.contains("<title>Trip &lt;plan&gt; &amp; more</title>"));
+    }
+
+    #[test]
+    fn keeps_the_page_setup() {
+        let blocks = sample();
+        let setup = PageSetup {
+            size: PageSize::A4,
+            landscape: true,
+            margins: [36.0, 72.0, 56.69, 144.0],
+        };
+        let written = page(&blocks, Some(&setup), None, &Pictures::new());
+        assert!(written.contains("@page{size:297mm 210mm;margin:36pt 72pt 56.69pt 144pt}"));
+        let read = read_document(written.as_bytes());
+        assert_eq!((read.blocks, read.setup), (blocks.clone(), Some(setup)));
+        // Without one, there's none to read.
+        let plain = page(&blocks, None, None, &Pictures::new());
+        assert!(!plain.contains("@page"));
+        assert_eq!(read_document(plain.as_bytes()).setup, None);
+        // A size Docs doesn't know is no setup, and odd margins are fixed.
+        assert_eq!(
+            read_document(b"<main data-page=\"b5\"><p>x</p></main>").setup,
+            None
+        );
+        assert_eq!(
+            read_document(b"<main data-page=\"letter\" data-margins=\"1 2\"><p>x</p></main>").setup,
+            Some(PageSetup::new(PageSize::Letter))
+        );
+    }
+
+    #[test]
+    fn reads_pictures_other_programs_write() {
+        let picture = Picture::read(crate::picture::tests::png(4, 3)).unwrap();
+        let address = picture.data_address();
+        let hash = picture::hash(b"elsewhere");
+        let page = format!(
+            "<p>Before<span><img src=\"{address}\" alt=\"Dot\" width=\"200\"></span></p>\
+             <img src=\"https://tracker.example/pixel.png\" alt=\"Remote\">\
+             <img alt=\"Kept\" data-hash=\"{hash}\">\
+             <img src=\"data:image/svg+xml;base64,PHN2Zy8+\" alt=\"Drawing\">"
+        );
+        let read = read_document(page.as_bytes());
+        assert_eq!(
+            read.blocks,
+            vec![
+                Block::Paragraph(vec![Inline::Text("Before".into(), Marks::default())]),
+                Block::Image(Image {
+                    hash: picture.hash.clone(),
+                    alt: "Dot".into(),
+                    width: Some(200),
+                }),
+                // Its contents are missing, but it keeps its place.
+                Block::Image(Image {
+                    hash,
+                    alt: "Kept".into(),
+                    width: None,
+                }),
+            ]
+        );
+        assert_eq!(read.pictures.len(), 1);
+        assert_eq!(read.pictures[&picture.hash], picture);
     }
 
     #[test]
