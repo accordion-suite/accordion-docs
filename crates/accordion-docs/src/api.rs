@@ -33,6 +33,7 @@ pub(crate) fn routes(state: DocsState) -> Router {
     Router::new()
         .route("/documents", get(list).post(create))
         .route("/documents/{id}", get(open))
+        .route("/documents/{id}/copy", post(copy))
         .route("/documents/{id}/live", get(live))
         .route("/documents/{id}/print", get(print))
         .route("/documents/{id}/download", get(download))
@@ -290,6 +291,91 @@ async fn create(
     Ok((
         StatusCode::CREATED,
         Json(DocumentView::new(&state, item, "owner", None)),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CopyRequest {
+    /// The copy's name, such as "Copy of Plans.html". It gets `.html` if it
+    /// doesn't end with it, and a number if it's taken.
+    name: String,
+}
+
+/// `POST /documents/{id}/copy`: a copy of a document with everyone's latest
+/// edits, as Google Docs' **Make a copy**. It goes beside the original if
+/// the person can add to that folder, and to the top of their Docs place
+/// if not, so a viewer keeps a copy of their own.
+async fn copy(
+    State(state): State<DocsState>,
+    Authenticated(me): Authenticated,
+    Path(id): Path<ItemId>,
+    Json(request): Json<CopyRequest>,
+) -> Result<(StatusCode, Json<DocumentView>), ApiError> {
+    let (item, _) = reach(&state, &me, id).await?;
+    let name = request.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Give the copy a name, then try again.",
+        ));
+    }
+    let stem = match name.len().checked_sub(".html".len()) {
+        Some(end) if name.is_char_boundary(end) && name[end..].eq_ignore_ascii_case(".html") => {
+            &name[..end]
+        }
+        _ => name,
+    };
+    // The copy has what's been typed up to now.
+    state.coediting.save_now(id).await;
+    let here = match item.parent {
+        Some(parent) => state.storage.access(me.user.id, parent).await?,
+        None => None,
+    };
+    let folder = match (item.parent, here) {
+        (Some(parent), Some(access)) if access >= Access::Editor => parent,
+        _ => state.storage.place_folder(me.user.id, PLACE.id).await?,
+    };
+    let storage = state.storage.acting_as(accordion_module::auth::actor(&me));
+    let mut copied = None;
+    for number in 1..=100 {
+        let name = match number {
+            1 => format!("{stem}.html"),
+            n => format!("{stem} ({n}).html"),
+        };
+        match storage.copy_file(id, folder, &name).await {
+            Err(Error::NameTaken { .. }) => continue,
+            result => {
+                copied = Some(result?);
+                break;
+            }
+        }
+    }
+    let copy = copied.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "This folder already has too many documents with that name. Choose another name, then try again.",
+        )
+    })?;
+    let access = state
+        .storage
+        .access(me.user.id, copy.id)
+        .await?
+        .unwrap_or(Access::Owner);
+    let owner = if copy.owner == me.user.id {
+        None
+    } else {
+        state
+            .identity
+            .user(copy.owner)
+            .await
+            .ok()
+            .flatten()
+            .map(|user| user.display_name)
+    };
+    Ok((
+        StatusCode::CREATED,
+        Json(DocumentView::new(&state, copy, access_name(access), owner)),
     ))
 }
 

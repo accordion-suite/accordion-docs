@@ -621,6 +621,84 @@ async fn people_reach_only_documents_shared_with_them() {
 }
 
 #[tokio::test]
+async fn copies_a_document_beside_it_or_into_the_viewers_docs() {
+    let server = start().await;
+    let id = server.new_document(&server.alex).await;
+    let copy = |name: &str| json!({ "name": name });
+    let (status, made) = server
+        .api(
+            &server.alex,
+            "POST",
+            &format!("/documents/{id}/copy"),
+            Some(copy("Copy of Plans")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{made}");
+    assert_eq!(made["name"], "Copy of Plans.html");
+    assert_eq!(made["access"], "owner");
+    assert_eq!(
+        server.file_text(made["id"].as_str().unwrap()).await,
+        server.file_text(&id).await
+    );
+    // A name that's taken gets a number.
+    let (_, again) = server
+        .api(
+            &server.alex,
+            "POST",
+            &format!("/documents/{id}/copy"),
+            Some(copy("Copy of Plans.html")),
+        )
+        .await;
+    assert_eq!(again["name"], "Copy of Plans (2).html");
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "POST",
+            &format!("/documents/{id}/copy"),
+            Some(copy("  ")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Nobody else can copy it, until it's shared with them. A viewer's copy
+    // is theirs, in their own Docs.
+    let (status, _) = server
+        .api(
+            &server.sam,
+            "POST",
+            &format!("/documents/{id}/copy"),
+            Some(copy("Mine")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    server
+        .as_person(&server.alex)
+        .share(
+            id.parse().unwrap(),
+            server.sam.id,
+            ShareLevel::Viewer,
+            server.alex.id,
+        )
+        .await
+        .unwrap();
+    let (status, mine) = server
+        .api(
+            &server.sam,
+            "POST",
+            &format!("/documents/{id}/copy"),
+            Some(copy("Mine")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{mine}");
+    assert_eq!(mine["access"], "owner");
+    assert_eq!(mine["owner"], Value::Null);
+    assert_eq!(
+        server.names(&server.sam).await,
+        ["Mine.html", "Untitled document.html"]
+    );
+}
+
+#[tokio::test]
 async fn new_documents_go_only_in_the_persons_docs_place() {
     let server = start().await;
     let my_drive = server.storage.top_folder(server.alex.id).await.unwrap();
