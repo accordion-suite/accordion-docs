@@ -232,7 +232,7 @@ mod tests {
             colspan,
             rowspan,
             colwidth,
-            content: vec![Block::Paragraph(Vec::new())],
+            content: vec![Block::Paragraph(crate::model::Para::default(), Vec::new())],
         }
     }
 

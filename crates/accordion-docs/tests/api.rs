@@ -13,7 +13,7 @@ use accordion_core::thumbnails::{Thumbnails, Tools};
 use accordion_core::transcripts::Transcripts;
 use accordion_docs::Docs;
 use accordion_docs::html::{self, MARKER};
-use accordion_docs::model::{Block, Image, Inline, Marks};
+use accordion_docs::model::{Block, Image, Inline, Marks, Para};
 use accordion_docs::picture::{self, Picture};
 use accordion_module::{Module, Services, Stopping};
 use accordion_types::{ItemId, Role, UserId};
@@ -363,7 +363,10 @@ async fn adds_pictures_to_documents() {
 }
 
 fn paragraph(text: &str) -> Block {
-    Block::Paragraph(vec![Inline::Text(text.into(), Marks::default())])
+    Block::Paragraph(
+        Para::default(),
+        vec![Inline::Text(text.into(), Marks::default())],
+    )
 }
 
 #[tokio::test]
@@ -796,17 +799,20 @@ mod live {
             .unwrap();
 
         let mut alex = Browser::open(address, &server.alex, &id).await;
-        assert_eq!(alex.blocks(), [Block::Paragraph(Vec::new())]);
+        assert_eq!(
+            alex.blocks(),
+            [Block::Paragraph(Para::default(), Vec::new())]
+        );
         let mut sam = Browser::open(address, &server.sam, &id).await;
         alex.add_paragraph("From Alex").await;
         sam.add_paragraph("From Sam").await;
         let both = [
-            Block::Paragraph(Vec::new()),
+            Block::Paragraph(Para::default(), Vec::new()),
             paragraph("From Alex"),
             paragraph("From Sam"),
         ];
         let other_order = [
-            Block::Paragraph(Vec::new()),
+            Block::Paragraph(Para::default(), Vec::new()),
             paragraph("From Sam"),
             paragraph("From Alex"),
         ];
@@ -907,10 +913,11 @@ mod live {
             .await
             .unwrap();
         alex.wait_for(&[
-            Block::Paragraph(Vec::new()),
+            Block::Paragraph(Para::default(), Vec::new()),
             paragraph("Typed"),
             Block::Heading(
                 2,
+                Para::default(),
                 vec![Inline::Text("Added elsewhere".into(), Marks::default())],
             ),
         ])
@@ -938,7 +945,7 @@ mod live {
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(
             file_blocks(&server, &id).await,
-            [Block::Paragraph(Vec::new())]
+            [Block::Paragraph(Para::default(), Vec::new())]
         );
     }
 }

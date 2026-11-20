@@ -2,12 +2,16 @@
 //!
 //! It writes CommonMark with GitHub's extensions: tables, checklists, and
 //! strikethrough. What Markdown can't say is written as HTML, which
-//! Markdown readers show: underlined text, and tables with merged cells or
-//! with lists inside. Pictures are in the file as `data:` addresses, so it
-//! stands alone. The page setup has no place in Markdown and is left out.
+//! Markdown readers show: underlined text, superscript and subscript, and
+//! tables with merged cells or with lists inside. Pictures are in the file
+//! as `data:` addresses, so it stands alone. Centered, right-aligned, and
+//! justified paragraphs are HTML with GitHub's `align`, and page breaks are
+//! the `<div>` that Markdown-to-PDF tools break pages at. The page setup,
+//! colors, sizes, fonts, indents, and spacing have no place in Markdown and
+//! are left out, since GitHub drops the styles that would carry them.
 
 use crate::html;
-use crate::model::{Block, Cell, Image, Inline, Marks};
+use crate::model::{Align, Block, Cell, Image, Inline, Marks, Para, Script};
 use crate::picture::Pictures;
 
 /// `blocks` as a Markdown file, with `pictures` in it.
@@ -40,7 +44,7 @@ impl Writer<'_> {
             // other marker.
             let other = last_list.is_some_and(|other: bool| !other);
             last_list = match block {
-                Block::Bullets(_) | Block::Numbers(..) | Block::Checks(_) => Some(other),
+                Block::Bullets(..) | Block::Numbers(..) | Block::Checks(_) => Some(other),
                 _ => None,
             };
             self.block(out, block, other);
@@ -49,8 +53,15 @@ impl Writer<'_> {
 
     fn block(&mut self, out: &mut String, block: &Block, other_marker: bool) {
         match block {
-            Block::Paragraph(inlines) => write_inlines(out, inlines, false),
-            Block::Heading(level, inlines) => {
+            Block::Paragraph(para, inlines) if para.align != Align::Left => {
+                aligned(out, "p", para, inlines);
+            }
+            Block::Heading(level, para, inlines) if para.align != Align::Left => {
+                aligned(out, &format!("h{level}"), para, inlines);
+            }
+            Block::PageBreak => out.push_str("<div style=\"page-break-after: always;\"></div>"),
+            Block::Paragraph(_, inlines) => write_inlines(out, inlines, false),
+            Block::Heading(level, _, inlines) => {
                 for _ in 0..*level {
                     out.push('#');
                 }
@@ -74,11 +85,11 @@ impl Writer<'_> {
             }
             Block::Rule => out.push_str("---"),
             Block::Image(image) => self.image(out, image),
-            Block::Bullets(items) => {
+            Block::Bullets(_, items) => {
                 let marker = if other_marker { "* " } else { "- " };
                 self.items(out, items.iter().map(|item| (marker.to_owned(), item)));
             }
-            Block::Numbers(start, items) => {
+            Block::Numbers(start, _, items) => {
                 let dot = if other_marker { ')' } else { '.' };
                 self.items(
                     out,
@@ -128,7 +139,7 @@ impl Writer<'_> {
                     // without a blank line, or it reads as more of the text.
                     let nested = matches!(
                         block,
-                        Block::Bullets(_) | Block::Numbers(1, _) | Block::Checks(_)
+                        Block::Bullets(..) | Block::Numbers(1, ..) | Block::Checks(_)
                     );
                     inner.push_str(if nested { "\n" } else { "\n\n" });
                 }
@@ -160,8 +171,16 @@ impl Writer<'_> {
 }
 
 /// A paragraph with nothing in it, which Markdown has no way to keep.
+/// A centered, right-aligned, or justified paragraph or heading, as HTML
+/// with the `align` that GitHub keeps.
+fn aligned(out: &mut String, tag: &str, para: &Para, inlines: &[Inline]) {
+    out.push_str(&format!("<{tag} align=\"{}\">", para.align.name()));
+    out.push_str(&html::inline_fragment(inlines));
+    out.push_str(&format!("</{tag}>"));
+}
+
 fn is_blank(block: &Block) -> bool {
-    matches!(block, Block::Paragraph(inlines) if inlines.iter().all(|inline| matches!(inline, Inline::Text(text, _) if text.is_empty())))
+    matches!(block, Block::Paragraph(_, inlines) if inlines.iter().all(|inline| matches!(inline, Inline::Text(text, _) if text.is_empty())))
 }
 
 /// Writes `text` with `first` before its first line and `rest` before each
@@ -194,7 +213,7 @@ fn is_plain_table(rows: &[Vec<Cell>]) -> bool {
                         && cell
                             .content
                             .iter()
-                            .all(|block| matches!(block, Block::Paragraph(_) | Block::Heading(..)))
+                            .all(|block| matches!(block, Block::Paragraph(..) | Block::Heading(..)))
                 })
         })
 }
@@ -213,7 +232,7 @@ fn write_table(out: &mut String, rows: &[Vec<Cell>]) {
                 if index > 0 {
                     text.push_str("<br>");
                 }
-                if let Block::Paragraph(inlines) | Block::Heading(_, inlines) = block {
+                if let Block::Paragraph(_, inlines) | Block::Heading(_, _, inlines) = block {
                     write_inlines(&mut text, inlines, true);
                 }
             }
@@ -266,6 +285,8 @@ enum Mark {
     Bold,
     Italic,
     Underline,
+    Super,
+    Sub,
 }
 
 fn marks_of(marks: &Marks) -> Vec<Mark> {
@@ -276,6 +297,8 @@ fn marks_of(marks: &Marks) -> Vec<Mark> {
         (marks.bold, Mark::Bold),
         (marks.italic, Mark::Italic),
         (marks.underline, Mark::Underline),
+        (marks.script == Some(Script::Super), Mark::Super),
+        (marks.script == Some(Script::Sub), Mark::Sub),
     ] {
         if on {
             list.push(mark);
@@ -291,6 +314,8 @@ fn opener(mark: Mark) -> &'static str {
         Mark::Bold => "**",
         Mark::Italic => "*",
         Mark::Underline => "<u>",
+        Mark::Super => "<sup>",
+        Mark::Sub => "<sub>",
     }
 }
 
@@ -301,6 +326,8 @@ fn closer(mark: Mark, link: Option<&str>) -> String {
         Mark::Bold => "**".to_owned(),
         Mark::Italic => "*".to_owned(),
         Mark::Underline => "</u>".to_owned(),
+        Mark::Super => "</sup>".to_owned(),
+        Mark::Sub => "</sub>".to_owned(),
     }
 }
 
@@ -467,7 +494,7 @@ mod tests {
     }
 
     fn paragraph(inlines: Vec<Inline>) -> Block {
-        Block::Paragraph(inlines)
+        Block::Paragraph(Para::default(), inlines)
     }
 
     #[test]
@@ -482,7 +509,7 @@ mod tests {
             ..Marks::default()
         };
         let blocks = vec![
-            Block::Heading(2, vec![text("Plan")]),
+            Block::Heading(2, Para::default(), vec![text("Plan")]),
             paragraph(vec![
                 text("Some "),
                 marked("bold ", bold.clone()),
@@ -490,17 +517,20 @@ mod tests {
                 marked(" text", bold),
                 text(" here."),
             ]),
-            Block::Bullets(vec![
-                vec![paragraph(vec![text("One")])],
+            Block::Bullets(
+                None,
                 vec![
-                    paragraph(vec![text("Two")]),
-                    Block::Numbers(1, vec![vec![paragraph(vec![text("Three")])]]),
+                    vec![paragraph(vec![text("One")])],
+                    vec![
+                        paragraph(vec![text("Two")]),
+                        Block::Numbers(1, None, vec![vec![paragraph(vec![text("Three")])]]),
+                    ],
+                    vec![
+                        paragraph(vec![text("Four")]),
+                        Block::Numbers(5, None, vec![vec![paragraph(vec![text("Five")])]]),
+                    ],
                 ],
-                vec![
-                    paragraph(vec![text("Four")]),
-                    Block::Numbers(5, vec![vec![paragraph(vec![text("Five")])]]),
-                ],
-            ]),
+            ),
             Block::Checks(vec![
                 (true, vec![paragraph(vec![text("Done")])]),
                 (
@@ -594,5 +624,14 @@ mod tests {
         let written = write(&[merged], &Pictures::new());
         assert!(written.starts_with("<table>"), "{written}");
         assert!(written.contains("colspan=\"2\""), "{written}");
+    }
+
+    #[test]
+    fn aligned_paragraphs_and_page_breaks_are_html() {
+        let markdown = write(&crate::html::tests::laid_out(), &Pictures::new());
+        assert!(markdown.starts_with(
+            "<p align=\"center\">Trip</p>\n\nSummer\n\n<h5 align=\"right\">Days</h5>"
+        ));
+        assert!(markdown.contains("<div style=\"page-break-after: always;\"></div>"));
     }
 }

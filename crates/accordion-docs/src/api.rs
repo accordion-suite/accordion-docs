@@ -382,7 +382,7 @@ async fn live(
 /// What a document's print page may do: show its own styles and pictures,
 /// and nothing else. It runs no scripts, and only Accordion's own pages can
 /// show it in a frame.
-const PRINT_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; \
+const PRINT_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src 'self'; \
      form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
 
 /// A document's file with everyone's latest edits in it: an open

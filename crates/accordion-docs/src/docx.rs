@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-use crate::model::{Block, Image, Inline, Marks, PageSetup};
+use crate::model::{Align, Block, Image, Inline, Kind, ListStyle, Marks, PageSetup, Para, Script};
 use crate::office::{self, Grid, Part, Slot, escape, escaped};
 use crate::picture::{Picture, Pictures};
 
@@ -183,6 +183,18 @@ const CHECKED: usize = 3;
 /// Each numbered list gets a numbering of its own from here on, so it
 /// starts at its own number.
 const FIRST_NUMBERED: usize = 4;
+/// The numbering, and its definition, for each bulleted [`ListStyle`], by
+/// its place in [`ListStyle::ALL`]. Numbered styles' definitions are here
+/// too, used by each numbered list's own numbering.
+const STYLED: usize = 1000;
+
+fn styled(style: ListStyle) -> usize {
+    STYLED
+        + ListStyle::ALL
+            .iter()
+            .position(|known| *known == style)
+            .unwrap_or_default()
+}
 
 /// Where blocks are being written, which decides their paragraphs' look.
 #[derive(Clone)]
@@ -224,9 +236,9 @@ struct Writer<'a> {
     out: String,
     /// Each link's address, by its place: `rIdLink{index}`.
     links: Vec<String>,
-    /// Each numbered list's level and first number, by its place after
-    /// `FIRST_NUMBERED`.
-    numbered: Vec<(usize, u32)>,
+    /// Each numbered list's level, first number, and style, by its place
+    /// after `FIRST_NUMBERED`.
+    numbered: Vec<(usize, u32, Option<ListStyle>)>,
     pictures: &'a Pictures,
     /// Each picture in the file, by its place: `rIdPicture{index}`.
     media: Vec<Picture>,
@@ -241,7 +253,7 @@ impl Writer<'_> {
         for block in blocks {
             // Two tables in a row would join into one in Word.
             if after_table && matches!(block, Block::Table(_)) {
-                self.paragraph(&context, None, &[]);
+                self.paragraph(&context, None, &Para::default(), &[]);
             }
             self.block(block, &context);
             after_table = matches!(block, Block::Table(_));
@@ -253,11 +265,21 @@ impl Writer<'_> {
 
     fn block(&mut self, block: &Block, context: &Context) {
         match block {
-            Block::Paragraph(inlines) => self.paragraph(context, None, inlines),
-            Block::Heading(level, inlines) => {
-                let style = format!("Heading{}", (*level).clamp(1, 6));
-                self.paragraph(context, Some(&style), inlines);
+            Block::Paragraph(para, inlines) => {
+                let style = match para.kind {
+                    Some(Kind::Title) => Some("Title"),
+                    Some(Kind::Subtitle) => Some("Subtitle"),
+                    None => None,
+                };
+                self.paragraph(context, style, para, inlines);
             }
+            Block::Heading(level, para, inlines) => {
+                let style = format!("Heading{}", (*level).clamp(1, 6));
+                self.paragraph(context, Some(&style), para, inlines);
+            }
+            Block::PageBreak => self
+                .out
+                .push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>"),
             Block::Quote(blocks) => {
                 let mut inner = context.clone();
                 inner.quotes += 1;
@@ -271,22 +293,28 @@ impl Writer<'_> {
                     .collect();
                 for line in lines {
                     let code = Inline::Text(line.to_owned(), Marks::default());
-                    self.paragraph(context, Some("Code"), std::slice::from_ref(&code));
+                    self.paragraph(
+                        context,
+                        Some("Code"),
+                        &Para::default(),
+                        std::slice::from_ref(&code),
+                    );
                 }
             }
             Block::Rule => {
                 self.out.push_str("<w:p><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"6\" w:space=\"1\" w:color=\"C4C7C5\"/></w:pBdr>");
-                self.indent(context, false);
+                self.indent(context, false, &Para::default());
                 self.out.push_str("</w:pPr></w:p>");
             }
-            Block::Bullets(items) => {
+            Block::Bullets(style, items) => {
+                let numbering = style.map_or(BULLETS, styled);
                 for item in items {
-                    self.item(item, context, BULLETS, false);
+                    self.item(item, context, numbering, false);
                 }
             }
-            Block::Numbers(start, items) => {
+            Block::Numbers(start, style, items) => {
                 let level = context.lists.min(DEEPEST);
-                self.numbered.push((level, *start));
+                self.numbered.push((level, *start, *style));
                 let numbering = FIRST_NUMBERED + self.numbered.len() - 1;
                 for item in items {
                     self.item(item, context, numbering, false);
@@ -331,7 +359,7 @@ impl Writer<'_> {
         if context.quotes > 0 {
             self.out.push_str("<w:pStyle w:val=\"Quote\"/>");
         }
-        self.indent(context, false);
+        self.indent(context, false, &Para::default());
         let _ = write!(
             self.out,
             "</w:pPr><w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
@@ -351,27 +379,45 @@ impl Writer<'_> {
         inner.lists += 1;
         inner.done = done;
         if blocks.is_empty() {
-            self.paragraph(&inner, None, &[]);
+            self.paragraph(&inner, None, &Para::default(), &[]);
         } else {
             self.blocks(blocks, &inner);
         }
     }
 
-    /// Writes the indent for a paragraph inside quotes or lists. A list
-    /// item's first paragraph hangs its bullet or number in the indent.
-    fn indent(&mut self, context: &Context, hanging: bool) {
-        let left = context.indent();
-        if left == 0 {
+    /// Writes the indent for a paragraph inside quotes or lists, and its
+    /// own. A list item's first paragraph hangs its bullet or number in the
+    /// indent, unless its own first line says otherwise.
+    fn indent(&mut self, context: &Context, hanging: bool, para: &Para) {
+        let left = context.indent() + i64::from(para.indent);
+        let right = i64::from(para.indent_right);
+        let first = match (para.first_line, hanging) {
+            (0, true) => -360,
+            (first, _) => i64::from(first),
+        };
+        if left == 0 && right == 0 && first == 0 {
             return;
         }
-        if hanging {
-            let _ = write!(self.out, "<w:ind w:left=\"{left}\" w:hanging=\"360\"/>");
-        } else {
-            let _ = write!(self.out, "<w:ind w:left=\"{left}\"/>");
+        let _ = write!(self.out, "<w:ind w:left=\"{left}\" w:right=\"{right}\"");
+        match first {
+            0 => {}
+            first if first < 0 => {
+                let _ = write!(self.out, " w:hanging=\"{}\"", -first);
+            }
+            first => {
+                let _ = write!(self.out, " w:firstLine=\"{first}\"");
+            }
         }
+        self.out.push_str("/>");
     }
 
-    fn paragraph(&mut self, context: &Context, style: Option<&str>, inlines: &[Inline]) {
+    fn paragraph(
+        &mut self,
+        context: &Context,
+        style: Option<&str>,
+        para: &Para,
+        inlines: &[Inline],
+    ) {
         self.out.push_str("<w:p><w:pPr>");
         let style = style.or(if context.quotes > 0 {
             Some("Quote")
@@ -387,12 +433,35 @@ impl Writer<'_> {
                 "<w:numPr><w:ilvl w:val=\"{level}\"/><w:numId w:val=\"{numbering}\"/></w:numPr>"
             );
         }
-        if context.lists > 0 || context.quotes > 0 {
-            // Paragraphs in a list sit close together, as on the page.
-            if context.lists > 0 {
-                self.out.push_str("<w:spacing w:after=\"40\"/>");
+        // Paragraphs in a list sit close together, as on the page.
+        let after = para
+            .after
+            .map(i64::from)
+            .or((context.lists > 0).then_some(40));
+        if para.before.is_some() || after.is_some() || para.line.is_some() {
+            self.out.push_str("<w:spacing");
+            if let Some(before) = para.before {
+                let _ = write!(self.out, " w:before=\"{before}\"");
             }
-            self.indent(context, context.item.is_some());
+            if let Some(after) = after {
+                let _ = write!(self.out, " w:after=\"{after}\"");
+            }
+            if let Some(line) = para.line {
+                // Lines in 240ths of single spacing.
+                let _ = write!(
+                    self.out,
+                    " w:line=\"{}\" w:lineRule=\"auto\"",
+                    u32::from(line) * 240 / 100
+                );
+            }
+            self.out.push_str("/>");
+        }
+        self.indent(context, context.item.is_some(), para);
+        match para.align {
+            Align::Left => {}
+            Align::Center => self.out.push_str("<w:jc w:val=\"center\"/>"),
+            Align::Right => self.out.push_str("<w:jc w:val=\"right\"/>"),
+            Align::Justify => self.out.push_str("<w:jc w:val=\"both\"/>"),
         }
         self.out.push_str("</w:pPr>");
         self.runs(inlines, context);
@@ -436,7 +505,13 @@ impl Writer<'_> {
         if marks.link.is_some() {
             self.out.push_str("<w:rStyle w:val=\"Hyperlink\"/>");
         }
-        if marks.code {
+        if let Some(font) = &marks.font {
+            let font = escaped(font);
+            let _ = write!(
+                self.out,
+                "<w:rFonts w:ascii=\"{font}\" w:hAnsi=\"{font}\" w:eastAsia=\"{font}\" w:cs=\"{font}\"/>"
+            );
+        } else if marks.code {
             self.out.push_str(
                 "<w:rFonts w:ascii=\"Courier New\" w:hAnsi=\"Courier New\" w:cs=\"Courier New\"/>",
             );
@@ -452,13 +527,34 @@ impl Writer<'_> {
         }
         if context.done {
             self.out.push_str("<w:color w:val=\"5F6368\"/>");
+        } else if let Some(color) = marks.color {
+            let _ = write!(self.out, "<w:color w:val=\"{}\"/>", color.hex_upper());
+        }
+        if let Some(size) = marks.size {
+            let _ = write!(
+                self.out,
+                "<w:sz w:val=\"{size}\"/><w:szCs w:val=\"{size}\"/>"
+            );
         }
         if marks.underline {
             self.out.push_str("<w:u w:val=\"single\"/>");
         }
-        if marks.code {
+        // Word's own highlights come in 16 colors only, so any color is
+        // shading, as Google Docs writes it.
+        if let Some(color) = marks.highlight {
+            let _ = write!(
+                self.out,
+                "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{}\"/>",
+                color.hex_upper()
+            );
+        } else if marks.code {
             self.out
                 .push_str("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F1F3F4\"/>");
+        }
+        match marks.script {
+            Some(Script::Super) => self.out.push_str("<w:vertAlign w:val=\"superscript\"/>"),
+            Some(Script::Sub) => self.out.push_str("<w:vertAlign w:val=\"subscript\"/>"),
+            None => {}
         }
         self.out.push_str("</w:rPr>");
         // Tabs and line ends are elements of their own in Word.
@@ -564,7 +660,7 @@ impl Writer<'_> {
 /// The numbering part: one definition each for bullets, checklists, and
 /// numbers, and a numbering of its own for each numbered list, so each
 /// starts at its own number.
-fn numbering(numbered: &[(usize, u32)]) -> String {
+fn numbering(numbered: &[(usize, u32, Option<ListStyle>)]) -> String {
     let mut out = String::from(XML);
     out.push_str(
         "<w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
@@ -603,18 +699,57 @@ fn numbering(numbered: &[(usize, u32)]) -> String {
         }
         out.push_str("</w:abstractNum>");
     }
+    // A definition for each list style, the same at every level.
+    for style in ListStyle::ALL {
+        let id = styled(style);
+        let _ = write!(
+            out,
+            "<w:abstractNum w:abstractNumId=\"{id}\"><w:multiLevelType w:val=\"hybridMultilevel\"/>"
+        );
+        for level in 0..=DEEPEST {
+            let (format, text) = match style {
+                ListStyle::Decimal => ("decimal", format!("%{}.", level + 1)),
+                ListStyle::DecimalParen => ("decimal", format!("%{})", level + 1)),
+                ListStyle::LowerAlpha => ("lowerLetter", format!("%{}.", level + 1)),
+                ListStyle::UpperAlpha => ("upperLetter", format!("%{}.", level + 1)),
+                ListStyle::LowerRoman => ("lowerRoman", format!("%{}.", level + 1)),
+                ListStyle::UpperRoman => ("upperRoman", format!("%{}.", level + 1)),
+                bullet => ("bullet", bullet.bullet().unwrap_or('•').to_string()),
+            };
+            let _ = write!(
+                out,
+                "<w:lvl w:ilvl=\"{level}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"{format}\"/>\
+                 <w:lvlText w:val=\"{text}\"/><w:lvlJc w:val=\"left\"/>\
+                 <w:pPr><w:ind w:left=\"{}\" w:hanging=\"360\"/></w:pPr>",
+                (level + 1) * 720
+            );
+            if matches!(style, ListStyle::Arrow | ListStyle::Star) {
+                out.push_str("<w:rPr><w:rFonts w:ascii=\"Segoe UI Symbol\" w:hAnsi=\"Segoe UI Symbol\"/></w:rPr>");
+            }
+            out.push_str("</w:lvl>");
+        }
+        out.push_str("</w:abstractNum>");
+    }
     for (id, abstract_id) in [(BULLETS, 1), (UNCHECKED, 2), (CHECKED, 3)] {
         let _ = write!(
             out,
             "<w:num w:numId=\"{id}\"><w:abstractNumId w:val=\"{abstract_id}\"/></w:num>"
         );
     }
-    for (index, (level, start)) in numbered.iter().enumerate() {
+    for style in ListStyle::ALL.into_iter().filter(|style| !style.numbered()) {
+        let id = styled(style);
         let _ = write!(
             out,
-            "<w:num w:numId=\"{}\"><w:abstractNumId w:val=\"4\"/>\
+            "<w:num w:numId=\"{id}\"><w:abstractNumId w:val=\"{id}\"/></w:num>"
+        );
+    }
+    for (index, (level, start, style)) in numbered.iter().enumerate() {
+        let _ = write!(
+            out,
+            "<w:num w:numId=\"{}\"><w:abstractNumId w:val=\"{}\"/>\
              <w:lvlOverride w:ilvl=\"{level}\"><w:startOverride w:val=\"{start}\"/></w:lvlOverride></w:num>",
-            FIRST_NUMBERED + index
+            FIRST_NUMBERED + index,
+            style.map_or(4, styled)
         );
     }
     out.push_str("</w:numbering>");
@@ -646,6 +781,10 @@ const STYLES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\
 <w:pPrDefault><w:pPr><w:spacing w:after=\"120\" w:line=\"276\" w:lineRule=\"auto\"/></w:pPr></w:pPrDefault></w:docDefaults>\
 <w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:qFormat/></w:style>\
 <w:style w:type=\"character\" w:default=\"1\" w:styleId=\"DefaultParagraphFont\"><w:name w:val=\"Default Paragraph Font\"/><w:uiPriority w:val=\"1\"/><w:semiHidden/></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"Title\"><w:name w:val=\"Title\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
+<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"0\" w:after=\"60\"/></w:pPr><w:rPr><w:sz w:val=\"52\"/><w:szCs w:val=\"52\"/></w:rPr></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"Subtitle\"><w:name w:val=\"Subtitle\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
+<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"0\" w:after=\"320\"/></w:pPr><w:rPr><w:color w:val=\"666666\"/><w:sz w:val=\"30\"/><w:szCs w:val=\"30\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Heading1\"><w:name w:val=\"heading 1\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
 <w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"400\" w:after=\"120\"/><w:outlineLvl w:val=\"0\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"40\"/><w:szCs w:val=\"40\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Heading2\"><w:name w:val=\"heading 2\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
@@ -699,34 +838,53 @@ mod tests {
             ..Marks::default()
         };
         let blocks = vec![
-            Block::Heading(1, vec![Inline::Text("Plan".to_owned(), Marks::default())]),
-            Block::Paragraph(vec![
-                Inline::Text("See ".to_owned(), Marks::default()),
-                Inline::Text("the site".to_owned(), link),
-            ]),
+            Block::Heading(
+                1,
+                Para::default(),
+                vec![Inline::Text("Plan".to_owned(), Marks::default())],
+            ),
+            Block::Paragraph(
+                Para::default(),
+                vec![
+                    Inline::Text("See ".to_owned(), Marks::default()),
+                    Inline::Text("the site".to_owned(), link),
+                    Inline::Text(
+                        "styled".to_owned(),
+                        Marks {
+                            color: Some(crate::style::Color([0xcc, 0, 0])),
+                            highlight: Some(crate::style::Color([0xff, 0xf2, 0xcc])),
+                            size: Some(21),
+                            font: Some("Open Sans".into()),
+                            script: Some(Script::Super),
+                            ..Marks::default()
+                        },
+                    ),
+                ],
+            ),
             Block::Numbers(
                 3,
-                vec![vec![Block::Paragraph(vec![Inline::Text(
-                    "Third".to_owned(),
-                    Marks::default(),
-                )])]],
+                None,
+                vec![vec![Block::Paragraph(
+                    Para::default(),
+                    vec![Inline::Text("Third".to_owned(), Marks::default())],
+                )]],
             ),
             Block::Checks(vec![(
                 true,
-                vec![Block::Paragraph(vec![Inline::Text(
-                    "Done".to_owned(),
-                    Marks::default(),
-                )])],
+                vec![Block::Paragraph(
+                    Para::default(),
+                    vec![Inline::Text("Done".to_owned(), Marks::default())],
+                )],
             )]),
             Block::Table(vec![vec![Cell {
                 header: true,
                 colspan: 1,
                 rowspan: 1,
                 colwidth: None,
-                content: vec![Block::Paragraph(vec![Inline::Text(
-                    "Head".to_owned(),
-                    Marks::default(),
-                )])],
+                content: vec![Block::Paragraph(
+                    Para::default(),
+                    vec![Inline::Text("Head".to_owned(), Marks::default())],
+                )],
             }]]),
         ];
         let setup = PageSetup {
@@ -748,6 +906,7 @@ mod tests {
         assert!(document.contains("<w:numId w:val=\"3\"/>"), "{document}");
         assert!(document.contains("<w:strike/>"), "{document}");
         assert!(document.contains("<w:tblHeader/>"), "{document}");
+        assert!(document.contains("<w:rFonts w:ascii=\"Open Sans\" w:hAnsi=\"Open Sans\" w:eastAsia=\"Open Sans\" w:cs=\"Open Sans\"/><w:color w:val=\"CC0000\"/><w:sz w:val=\"21\"/><w:szCs w:val=\"21\"/><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"FFF2CC\"/><w:vertAlign w:val=\"superscript\"/>"), "{document}");
         // A4 landscape: 297 by 210 mm.
         assert!(
             document.contains("<w:pgSz w:w=\"16838\" w:h=\"11906\" w:orient=\"landscape\"/>"),
@@ -797,5 +956,23 @@ mod tests {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&file[..])).unwrap();
         assert!(zip.by_name("word/media/picture0.png").is_ok());
         assert!(zip.by_name("word/media/picture1.png").is_err());
+    }
+
+    #[test]
+    fn writes_paragraph_layout_list_styles_and_page_breaks() {
+        let blocks = crate::html::tests::laid_out();
+        let file = write(&blocks, None, "Layout", &Pictures::new());
+        let document = part(&file, "word/document.xml");
+        assert!(document.contains("<w:pStyle w:val=\"Title\"/><w:jc w:val=\"center\"/>"));
+        assert!(document.contains(
+            "<w:spacing w:before=\"240\" w:after=\"0\" w:line=\"360\" w:lineRule=\"auto\"/>\
+             <w:ind w:left=\"720\" w:right=\"360\" w:hanging=\"360\"/><w:jc w:val=\"both\"/>"
+        ));
+        assert!(document.contains("<w:br w:type=\"page\"/>"));
+        let numbering = part(&file, "word/numbering.xml");
+        assert!(numbering.contains("<w:numFmt w:val=\"upperRoman\"/>"));
+        assert!(numbering.contains("<w:lvlText w:val=\"➢\"/>"));
+        assert!(numbering.contains("<w:lvlText w:val=\"%1)\"/>"));
+        assert!(part(&file, "word/styles.xml").contains("w:styleId=\"Subtitle\""));
     }
 }

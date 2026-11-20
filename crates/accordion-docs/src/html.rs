@@ -3,8 +3,8 @@
 //! (decision 30).
 //!
 //! The server writes the body from the schema in [`crate::model`], so only
-//! its elements and attributes reach the file: never a script, a style
-//! attribute, or an event handler. Reading goes the other way, through the
+//! its elements and attributes reach the file: never a script or an event
+//! handler, and styles only as the schema writes them. Reading goes the other way, through the
 //! same schema, for HTML Docs wrote and HTML any other program wrote.
 //!
 //! The writer puts each block on a line of its own, and nothing else between
@@ -17,9 +17,13 @@ use std::fmt::Write as _;
 
 use scraper::{Html, Node};
 
-use crate::model::{self, Block, Cell, Image, Inline, Marks, PageSetup, PageSize};
+use crate::model::{
+    self, Align, Block, Cell, Image, Inline, Kind, ListStyle, Marks, PageSetup, PageSize, Para,
+    Script,
+};
 use crate::office::number;
 use crate::picture::{self, Picture, Pictures};
+use crate::style::{self, Color};
 
 /// How every document starts. Docs recognizes its files by it, so a web page
 /// someone uploads stays a web page.
@@ -34,13 +38,30 @@ pub const DATA_VERSION: u32 = 1;
 /// How the page looks on screen and in print, kept small. The editor in the
 /// web app has its own styles. Only blocks of text keep typed spaces: list
 /// items and cells hold blocks, with line breaks between them in the file
-/// that aren't part of the text.
+/// that aren't part of the text. Text is Arial at 11 points, as in Google
+/// Docs and the Word download, or the fonts made to match it. Lines and
+/// paragraphs are spaced as the Word download spaces them: 1.15 lines, 6
+/// points after each paragraph, and Google Docs' space around headings.
 const STYLE: &str = "\
-body{margin:0;background:#f8f9fa;color:#1f1f1f;font:16px/1.6 system-ui,sans-serif}\
+body{margin:0;background:#f8f9fa;color:#1f1f1f;font:11pt/1.3225 Arial,Arimo,'Liberation Sans',sans-serif}\
 main{box-sizing:border-box;max-width:816px;margin:24px auto;padding:72px 96px;background:#fff;\
 box-shadow:0 1px 3px rgba(0,0,0,.15)}\
 p,h1,h2,h3,h4,h5,h6{white-space:pre-wrap}\
-p{margin:0 0 .6em}\
+p{margin:0 0 6pt}\
+h1,h2,h3,h4,h5,h6{font-weight:700}\
+h1{font-size:20pt;margin:20pt 0 6pt}h2{font-size:16pt;margin:18pt 0 6pt}h3{font-size:14pt;margin:16pt 0 4pt}\
+h4{font-size:12pt;margin:14pt 0 4pt}h5{font-size:11pt;margin:12pt 0 4pt}h6{font-size:11pt;font-style:italic;margin:12pt 0 4pt}\
+p.title{font-size:26pt;margin:0 0 3pt}p.subtitle{font-size:15pt;color:#666;margin:0 0 16pt}\
+main>:first-child{margin-top:0}\
+ul[data-list=disc]{list-style-type:disc}ul[data-list=circle]{list-style-type:circle}\
+ul[data-list=square]{list-style-type:square}ul[data-list=dash]{list-style-type:'\\2013  '}\
+ul[data-list=arrow]{list-style-type:'\\27A2  '}ul[data-list=star]{list-style-type:'\\2605  '}\
+@counter-style decimal-paren{system:extends decimal;suffix:') '}\
+ol[data-list=decimal]{list-style-type:decimal}ol[data-list=decimal-paren]{list-style-type:decimal-paren}\
+ol[data-list=lower-alpha]{list-style-type:lower-alpha}ol[data-list=upper-alpha]{list-style-type:upper-alpha}\
+ol[data-list=lower-roman]{list-style-type:lower-roman}ol[data-list=upper-roman]{list-style-type:upper-roman}\
+div.page-break{break-after:page}\
+@media screen{div.page-break{margin:12pt 0;border-top:1px dashed #c4c7c5}}\
 pre{background:#f1f3f4;padding:12px;border-radius:4px;overflow-x:auto;white-space:pre-wrap}\
 code{font-family:ui-monospace,monospace;font-size:.9em}\
 img{display:block;max-width:100%;height:auto;margin:0 0 .6em}\
@@ -53,9 +74,13 @@ ul.checklist{list-style:none;padding-left:4px}\
 ul.checklist>li>input{float:left;margin:6px 8px 0 0}\
 ul.checklist>li[data-checked=true]>p{text-decoration:line-through;color:#5f6368}\
 @media (max-width:860px){main{margin:0;padding:24px 16px;box-shadow:none}}\
-@media print{body{background:none}main{max-width:none;margin:0;padding:0;box-shadow:none}}\
-@media screen and (prefers-color-scheme:dark){body{background:#131314;color:#e3e3e3}\
-main{background:#1f1f1f}pre,th{background:#2d2f31}td,th{border-color:#444746}\
+@media print{body{background:none}main{max-width:none;margin:0;padding:0;box-shadow:none}}";
+
+/// Dark colors, on screens only. A document with colored text or
+/// highlights stays as it was written, dark on white, so its colors still
+/// read.
+const DARK_STYLE: &str = "@media screen and (prefers-color-scheme:dark){body{background:#131314;color:#e3e3e3}\
+main{background:#1f1f1f}pre,th{background:#2d2f31}td,th{border-color:#444746}p.subtitle{color:#9aa0a6}\
 blockquote{border-color:#444746;color:#c4c7c5}}";
 
 /// The whole file for `blocks` on the page `setup`, with `state`, the
@@ -100,7 +125,14 @@ fn write_page(
     out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
     out.push_str("<meta name=\"generator\" content=\"Accordion Docs\">\n");
     let _ = writeln!(out, "<title>{}</title>", escape_text(title));
-    let _ = writeln!(out, "<style>{STYLE}</style>");
+    let colored = model::any_marks(blocks, &|marks| {
+        marks.color.is_some() || marks.highlight.is_some()
+    });
+    let _ = writeln!(
+        out,
+        "<style>{STYLE}{}</style>",
+        if colored { "" } else { DARK_STYLE }
+    );
     match setup {
         Some(setup) => {
             let _ = writeln!(out, "<style>{}</style>", page_style(setup));
@@ -186,18 +218,97 @@ fn write_blocks(out: &mut String, blocks: &[Block], pictures: &Pictures) {
     }
 }
 
+/// A paragraph's or heading's opening tag, with its layout.
+fn open_para(out: &mut String, tag: &str, para: &Para) {
+    let _ = write!(out, "<{tag}");
+    if let Some(kind) = para.kind {
+        let _ = write!(out, " class=\"{}\"", kind.name());
+    }
+    let css = para_style(para);
+    if !css.is_empty() {
+        let _ = write!(out, " style=\"{css}\"");
+    }
+    // Line spacing in Docs' own terms, since the style's line height is
+    // one other programs read differently.
+    if let Some(line) = para.line {
+        let _ = write!(
+            out,
+            " data-line-height=\"{}\"",
+            number(f64::from(line) / 100.0)
+        );
+    }
+    out.push('>');
+}
+
+/// The CSS for a paragraph's layout, such as `text-align:center`. Every
+/// part is a number or a name from the schema, so none can end the
+/// attribute.
+pub(crate) fn para_style(para: &Para) -> String {
+    let mut parts = Vec::new();
+    if para.align != Align::Left {
+        parts.push(format!("text-align:{}", para.align.name()));
+    }
+    let length = |twips| format!("{}pt", number(model::points(twips)));
+    if para.indent != 0 {
+        parts.push(format!("margin-left:{}", length(para.indent)));
+    }
+    if para.indent_right != 0 {
+        parts.push(format!("margin-right:{}", length(para.indent_right)));
+    }
+    if para.first_line != 0 {
+        parts.push(format!("text-indent:{}", length(para.first_line)));
+    }
+    if let Some(line) = para.line {
+        parts.push(format!(
+            "line-height:{}",
+            number(f64::from(line) / 100.0 * model::SINGLE)
+        ));
+    }
+    if let Some(before) = para.before {
+        parts.push(format!("margin-top:{}", length(before)));
+    }
+    if let Some(after) = para.after {
+        parts.push(format!("margin-bottom:{}", length(after)));
+    }
+    parts.join(";")
+}
+
+/// A list's opening tag, with its style: a name Docs reads back, and the
+/// old `type` attribute that programs without styles still show.
+fn open_list(out: &mut String, tag: &str, style: Option<ListStyle>, start: Option<u32>) {
+    let _ = write!(out, "<{tag}");
+    if let Some(start) = start.filter(|start| *start != 1) {
+        let _ = write!(out, " start=\"{start}\"");
+    }
+    if let Some(style) = style {
+        let kind = match style {
+            ListStyle::LowerAlpha => Some("a"),
+            ListStyle::UpperAlpha => Some("A"),
+            ListStyle::LowerRoman => Some("i"),
+            ListStyle::UpperRoman => Some("I"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let _ = write!(out, " type=\"{kind}\"");
+        }
+        let _ = write!(out, " data-list=\"{}\"", style.name());
+    }
+    out.push_str(">\n");
+}
+
 fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
     match block {
-        Block::Paragraph(inlines) => {
-            out.push_str("<p>");
+        Block::Paragraph(para, inlines) => {
+            open_para(out, "p", para);
             write_inlines(out, inlines);
             out.push_str("</p>\n");
         }
-        Block::Heading(level, inlines) => {
-            let _ = write!(out, "<h{level}>");
+        Block::Heading(level, para, inlines) => {
+            open_para(out, &format!("h{level}"), para);
             write_inlines(out, inlines);
             let _ = writeln!(out, "</h{level}>");
         }
+        Block::PageBreak => out.push_str("<div class=\"page-break\"></div>\n"),
         Block::Quote(blocks) => {
             out.push_str("<blockquote>\n");
             write_blocks(out, blocks, pictures);
@@ -208,8 +319,8 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
         }
         Block::Rule => out.push_str("<hr>\n"),
         Block::Image(image) => write_image(out, image, pictures.get(&image.hash)),
-        Block::Bullets(items) => {
-            out.push_str("<ul>\n");
+        Block::Bullets(style, items) => {
+            open_list(out, "ul", *style, None);
             for blocks in items {
                 out.push_str("<li>\n");
                 write_blocks(out, blocks, pictures);
@@ -217,12 +328,8 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
             }
             out.push_str("</ul>\n");
         }
-        Block::Numbers(start, items) => {
-            if *start == 1 {
-                out.push_str("<ol>\n");
-            } else {
-                let _ = writeln!(out, "<ol start=\"{start}\">");
-            }
+        Block::Numbers(start, style, items) => {
+            open_list(out, "ol", *style, Some(*start));
             for blocks in items {
                 out.push_str("<li>\n");
                 write_blocks(out, blocks, pictures);
@@ -296,11 +403,35 @@ fn write_image(out: &mut String, image: &Image, picture: Option<&Picture>) {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tag {
     Link(String),
+    /// Color, highlight, size, and font, as one `<span style>`.
+    Style(String),
     Bold,
     Italic,
     Underline,
     Strike,
     Code,
+    Super,
+    Sub,
+}
+
+/// The CSS for a run's styles, such as `color:#ff0000;font-size:12pt`.
+/// [`Marks::normalized`] has checked each part, so none can end the
+/// attribute.
+pub(crate) fn style_of(marks: &Marks) -> String {
+    let mut parts = Vec::new();
+    if let Some(font) = &marks.font {
+        parts.push(format!("font-family:'{font}'"));
+    }
+    if let Some(size) = marks.size {
+        parts.push(format!("font-size:{}pt", style::points_text(size)));
+    }
+    if let Some(color) = marks.color {
+        parts.push(format!("color:{}", color.css()));
+    }
+    if let Some(color) = marks.highlight {
+        parts.push(format!("background-color:{}", color.css()));
+    }
+    parts.join(";")
 }
 
 impl Tag {
@@ -309,12 +440,17 @@ impl Tag {
         if let Some(href) = &marks.link {
             tags.push(Tag::Link(href.clone()));
         }
+        if marks.has_style() {
+            tags.push(Tag::Style(style_of(marks)));
+        }
         for (on, tag) in [
             (marks.bold, Tag::Bold),
             (marks.italic, Tag::Italic),
             (marks.underline, Tag::Underline),
             (marks.strike, Tag::Strike),
             (marks.code, Tag::Code),
+            (marks.script == Some(Script::Super), Tag::Super),
+            (marks.script == Some(Script::Sub), Tag::Sub),
         ] {
             if on {
                 tags.push(tag);
@@ -328,24 +464,39 @@ impl Tag {
             Tag::Link(href) => {
                 let _ = write!(out, "<a href=\"{}\">", escape_attribute(href));
             }
+            Tag::Style(css) => {
+                let _ = write!(out, "<span style=\"{}\">", escape_attribute(css));
+            }
             Tag::Bold => out.push_str("<strong>"),
             Tag::Italic => out.push_str("<em>"),
             Tag::Underline => out.push_str("<u>"),
             Tag::Strike => out.push_str("<s>"),
             Tag::Code => out.push_str("<code>"),
+            Tag::Super => out.push_str("<sup>"),
+            Tag::Sub => out.push_str("<sub>"),
         }
     }
 
     fn close(&self, out: &mut String) {
         out.push_str(match self {
             Tag::Link(_) => "</a>",
+            Tag::Style(_) => "</span>",
             Tag::Bold => "</strong>",
             Tag::Italic => "</em>",
             Tag::Underline => "</u>",
             Tag::Strike => "</s>",
             Tag::Code => "</code>",
+            Tag::Super => "</sup>",
+            Tag::Sub => "</sub>",
         });
     }
+}
+
+/// Text with its marks as HTML, without a block around it.
+pub(crate) fn inline_fragment(inlines: &[Inline]) -> String {
+    let mut out = String::new();
+    write_inlines(&mut out, inlines);
+    out
 }
 
 /// Text with its marks, keeping tags open across runs that share them.
@@ -582,6 +733,11 @@ fn element(node: &NodeRef) -> Option<&'static str> {
         "kbd",
         "samp",
         "tt",
+        "sup",
+        "sub",
+        "mark",
+        "span",
+        "font",
         "a",
         "div",
         "section",
@@ -631,7 +787,7 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
     let flush = |runs: &mut Runs, out: &mut Vec<Block>| {
         let taken = std::mem::take(runs);
         if !taken.is_blank() {
-            out.push(Block::Paragraph(taken.finish()));
+            out.push(Block::Paragraph(Para::default(), taken.finish()));
         }
     };
     for child in parent.children() {
@@ -646,17 +802,33 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
         if SKIPPED.contains(&name) {
             continue;
         }
+        let (break_before, break_after) = page_breaks(&child);
+        if break_before {
+            flush(&mut runs, out);
+            out.push(Block::PageBreak);
+            // Google Docs and Word mark a break with a rule or a line
+            // break that isn't shown.
+            if matches!(name, "hr" | "br") {
+                continue;
+            }
+        }
         match name {
             "p" => {
                 flush(&mut runs, out);
-                out.push(Block::Paragraph(inlines_of(child)));
+                out.push(Block::Paragraph(para_of(&child), inlines_of(child)));
                 images_in(child, out, pictures);
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 flush(&mut runs, out);
                 let level = name[1..].parse().unwrap_or(1);
-                out.push(Block::Heading(level, inlines_of(child)));
+                out.push(Block::Heading(level, para_of(&child), inlines_of(child)));
                 images_in(child, out, pictures);
+            }
+            "div" if has_class(&child, "page-break") => {
+                flush(&mut runs, out);
+                if !break_after {
+                    out.push(Block::PageBreak);
+                }
             }
             "img" => {
                 flush(&mut runs, out);
@@ -693,10 +865,176 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
                 read_blocks(child, out, pictures);
             }
             "colgroup" | "col" => {}
+            // Text elements around blocks, as Google Docs wraps what it
+            // copies in a <b>, are read as a <div> would be.
+            _ if holds_blocks(&child) => {
+                flush(&mut runs, out);
+                read_blocks(child, out, pictures);
+            }
             _ => read_inline(child, &Marks::default(), &mut runs),
+        }
+        if break_after {
+            flush(&mut runs, out);
+            out.push(Block::PageBreak);
         }
     }
     flush(&mut runs, out);
+}
+
+/// Whether any of an element's children is a block.
+fn holds_blocks(node: &NodeRef) -> bool {
+    node.children().any(|child| {
+        matches!(
+            element(&child),
+            Some(
+                "p" | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "blockquote"
+                    | "pre"
+                    | "hr"
+                    | "ul"
+                    | "ol"
+                    | "table"
+                    | "div"
+            )
+        )
+    })
+}
+
+fn has_class(node: &NodeRef, name: &str) -> bool {
+    attribute(node, "class").is_some_and(|class| {
+        class
+            .split_ascii_whitespace()
+            .any(|class| class.eq_ignore_ascii_case(name))
+    })
+}
+
+/// Whether an element's style starts a new page before it, and after it.
+fn page_breaks(node: &NodeRef) -> (bool, bool) {
+    let Some(css) = attribute(node, "style") else {
+        return (false, false);
+    };
+    let mut breaks = (false, false);
+    for (name, value) in style::declarations(css) {
+        let value = value.trim().to_ascii_lowercase();
+        let starts_page = matches!(
+            value.as_str(),
+            "always" | "page" | "left" | "right" | "recto" | "verso"
+        );
+        match name.as_str() {
+            "page-break-before" | "break-before" => breaks.0 = starts_page,
+            "page-break-after" | "break-after" => breaks.1 = starts_page,
+            _ => {}
+        }
+    }
+    breaks
+}
+
+/// A paragraph's or heading's layout, from its style, its class (Docs',
+/// Google Docs', and Word's names for titles and subtitles), and the old
+/// `align` attribute.
+fn para_of(node: &NodeRef) -> Para {
+    let mut para = Para::default();
+    if has_class(node, "title") || has_class(node, "MsoTitle") {
+        para.kind = Some(Kind::Title);
+    } else if has_class(node, "subtitle") || has_class(node, "MsoSubtitle") {
+        para.kind = Some(Kind::Subtitle);
+    }
+    if let Some(align) = attribute(node, "align").and_then(Align::from_name) {
+        para.align = align;
+    }
+    if let Some(css) = attribute(node, "style") {
+        for (name, value) in style::declarations(css) {
+            let length = |text: &str| style::length_from_css(text).and_then(model::twips);
+            match name.as_str() {
+                "text-align" => {
+                    if let Some(align) = Align::from_name(&value) {
+                        para.align = align;
+                    }
+                }
+                "margin-left" | "margin-inline-start" => {
+                    para.indent = length(&value).unwrap_or(para.indent);
+                }
+                "margin-right" | "margin-inline-end" => {
+                    para.indent_right = length(&value).unwrap_or(para.indent_right);
+                }
+                "text-indent" => para.first_line = length(&value).unwrap_or(para.first_line),
+                "line-height" => para.line = style::line_from_css(&value).or(para.line),
+                "margin-top" | "margin-block-start" => para.before = length(&value).or(para.before),
+                "margin-bottom" | "margin-block-end" => para.after = length(&value).or(para.after),
+                "margin" => {
+                    let sides: Vec<Option<model::Twips>> =
+                        value.split_ascii_whitespace().map(length).collect();
+                    let [top, right, bottom, left] = match sides.as_slice() {
+                        [all] => [*all; 4],
+                        [vertical, across] => [*vertical, *across, *vertical, *across],
+                        [top, across, bottom] => [*top, *across, *bottom, *across],
+                        [top, right, bottom, left] => [*top, *right, *bottom, *left],
+                        _ => [None; 4],
+                    };
+                    para.before = top.or(para.before);
+                    para.after = bottom.or(para.after);
+                    para.indent = left.unwrap_or(para.indent);
+                    para.indent_right = right.unwrap_or(para.indent_right);
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(line) = attribute(node, "data-line-height")
+        .and_then(|line| line.trim().parse::<f64>().ok())
+        .filter(|line| line.is_finite() && *line > 0.0 && *line <= 100.0)
+    {
+        para.line = Some((line * 100.0).round() as u16);
+    }
+    para
+}
+
+/// A list's style: the name Docs writes, a `list-style-type` on the list or
+/// on its first item (as Google Docs writes it), or the old `type`.
+fn list_style_of(node: &NodeRef) -> Option<ListStyle> {
+    if let Some(style) = attribute(node, "data-list").and_then(ListStyle::from_name) {
+        return Some(style);
+    }
+    let from_css = |value: &str| {
+        let value = value.trim().to_ascii_lowercase();
+        let first = value.split_ascii_whitespace().next().unwrap_or_default();
+        Some(match first {
+            "disc" => ListStyle::Disc,
+            "circle" => ListStyle::Circle,
+            "square" => ListStyle::Square,
+            "decimal" => ListStyle::Decimal,
+            "lower-alpha" | "lower-latin" => ListStyle::LowerAlpha,
+            "upper-alpha" | "upper-latin" => ListStyle::UpperAlpha,
+            "lower-roman" => ListStyle::LowerRoman,
+            "upper-roman" => ListStyle::UpperRoman,
+            _ => return None,
+        })
+    };
+    let first_item = node.children().find(|child| element(child) == Some("li"));
+    for holder in std::iter::once(*node).chain(first_item) {
+        if let Some(css) = attribute(&holder, "style") {
+            for (name, value) in style::declarations(css) {
+                if (name == "list-style-type" || name == "list-style")
+                    && let Some(style) = from_css(&value)
+                {
+                    return Some(style);
+                }
+            }
+        }
+    }
+    match attribute(node, "type")?.trim() {
+        "1" => Some(ListStyle::Decimal),
+        "a" => Some(ListStyle::LowerAlpha),
+        "A" => Some(ListStyle::UpperAlpha),
+        "i" => Some(ListStyle::LowerRoman),
+        "I" => Some(ListStyle::UpperRoman),
+        other => from_css(other),
+    }
 }
 
 /// A picture: from its `data:` address, or by the hash Docs wrote beside it
@@ -731,13 +1069,104 @@ fn images_in(node: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
     }
 }
 
-/// The inline contents of a paragraph or heading.
+/// The inline contents of a paragraph or heading, with the text styles
+/// the block itself sets, as Word's web pages often do.
 fn inlines_of(node: NodeRef) -> Vec<Inline> {
     let mut runs = Runs::default();
+    let mut marks = Marks::default();
+    apply_style(&node, &mut marks, true);
     for child in node.children() {
-        read_inline(child, &Marks::default(), &mut runs);
+        read_inline(child, &marks, &mut runs);
     }
     runs.finish()
+}
+
+/// The text styles an element's `style` attribute sets, and an old-style
+/// `<font>`'s. A block's background is shading, not a highlight, so only
+/// inline elements highlight.
+fn apply_style(node: &NodeRef, marks: &mut Marks, block: bool) {
+    if element(node) == Some("font") {
+        if let Some(color) = attribute(node, "color").and_then(Color::from_css) {
+            marks.color = Some(color);
+        }
+        if let Some(face) = attribute(node, "face").and_then(style::font_from_css) {
+            marks.font = Some(face);
+        }
+        if let Some(size) = attribute(node, "size").and_then(style::size_from_font_tag) {
+            marks.size = Some(size);
+        }
+    }
+    let Some(css) = attribute(node, "style") else {
+        return;
+    };
+    let declarations = style::declarations(css);
+    // Programs that raise text also make it smaller, which the editor
+    // already does for superscript and subscript.
+    let mut raised = false;
+    for (name, value) in &declarations {
+        if name == "vertical-align" {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "super" => {
+                    marks.script = Some(Script::Super);
+                    raised = true;
+                }
+                "sub" => {
+                    marks.script = Some(Script::Sub);
+                    raised = true;
+                }
+                "baseline" => marks.script = None,
+                _ => {}
+            }
+        }
+    }
+    for (name, value) in &declarations {
+        let lower = value.trim().to_ascii_lowercase();
+        match name.as_str() {
+            "color" => {
+                if let Some(color) = Color::from_css(value) {
+                    marks.color = Some(color);
+                }
+            }
+            "background-color" | "background" if !block => {
+                if let Some(color) = Color::from_css(value) {
+                    marks.highlight = Some(color);
+                }
+            }
+            "font-size" if !raised => {
+                if let Some(size) = style::size_from_css(value, marks.size) {
+                    marks.size = Some(size);
+                }
+            }
+            "font-family" => {
+                if let Some(font) = style::font_from_css(value) {
+                    marks.font = Some(font);
+                }
+            }
+            "font-weight" => match lower.as_str() {
+                "bold" | "bolder" => marks.bold = true,
+                "normal" | "lighter" => marks.bold = false,
+                weight => {
+                    if let Ok(weight) = weight.parse::<u32>() {
+                        marks.bold = weight >= 600;
+                    }
+                }
+            },
+            "font-style" => match lower.as_str() {
+                "italic" | "oblique" => marks.italic = true,
+                "normal" => marks.italic = false,
+                _ => {}
+            },
+            "text-decoration" | "text-decoration-line" => {
+                if lower.contains("underline") {
+                    marks.underline = true;
+                }
+                if lower.contains("line-through") {
+                    marks.strike = true;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn add_text(runs: &mut Runs, text: &str, marks: &Marks) {
@@ -792,6 +1221,9 @@ fn read_inline(node: NodeRef, marks: &Marks, runs: &mut Runs) {
         "u" | "ins" => marks.underline = true,
         "s" | "strike" | "del" => marks.strike = true,
         "code" | "kbd" | "samp" | "tt" => marks.code = true,
+        "sup" => marks.script = Some(Script::Super),
+        "sub" => marks.script = Some(Script::Sub),
+        "mark" => marks.highlight = Some(Color([255, 255, 0])),
         "a" => {
             if let Some(href) = attribute(&node, "href").and_then(model::safe_link) {
                 marks.link = Some(href);
@@ -799,6 +1231,7 @@ fn read_inline(node: NodeRef, marks: &Marks, runs: &mut Runs) {
         }
         _ => {}
     }
+    apply_style(&node, &mut marks, false);
     for child in node.children() {
         read_inline(child, &marks, runs);
     }
@@ -850,9 +1283,16 @@ fn list(node: NodeRef, numbered: bool, pictures: &mut Pictures) -> Block {
         let start = attribute(&node, "start")
             .and_then(|start| start.trim().parse().ok())
             .unwrap_or(1);
-        Block::Numbers(start, items.into_iter().map(|(_, blocks)| blocks).collect())
+        Block::Numbers(
+            start,
+            list_style_of(&node),
+            items.into_iter().map(|(_, blocks)| blocks).collect(),
+        )
     } else {
-        Block::Bullets(items.into_iter().map(|(_, blocks)| blocks).collect())
+        Block::Bullets(
+            list_style_of(&node),
+            items.into_iter().map(|(_, blocks)| blocks).collect(),
+        )
     }
 }
 
@@ -914,7 +1354,7 @@ fn collect_rows(node: NodeRef, rows: &mut Vec<Vec<Cell>>, pictures: &mut Picture
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn text(text: &str) -> Inline {
@@ -939,29 +1379,73 @@ mod tests {
             ..link.clone()
         };
         vec![
-            Block::Heading(1, vec![text("Trip <plan> & more")]),
-            Block::Paragraph(vec![
-                text("Two  spaces,\u{a0}a no-break space, "),
-                marked("bold", bold.clone()),
-                marked(" and linked bold", link_bold),
-                marked(" link", link),
-                Inline::Break,
-                text(" after a break "),
-            ]),
-            Block::Paragraph(Vec::new()),
-            Block::Quote(vec![Block::Paragraph(vec![text("Quoted")])]),
+            Block::Heading(1, Para::default(), vec![text("Trip <plan> & more")]),
+            Block::Paragraph(
+                Para::default(),
+                vec![
+                    text("Two  spaces,\u{a0}a no-break space, "),
+                    marked("bold", bold.clone()),
+                    marked(" and linked bold", link_bold),
+                    marked(" link", link),
+                    Inline::Break,
+                    text(" after a break "),
+                    marked(
+                        "red Lobster",
+                        Marks {
+                            color: Some(Color([255, 0, 0])),
+                            size: Some(29),
+                            font: Some("Lobster".into()),
+                            ..Marks::default()
+                        },
+                    ),
+                    marked(
+                        "2",
+                        Marks {
+                            color: Some(Color([255, 0, 0])),
+                            script: Some(Script::Super),
+                            highlight: Some(Color([255, 255, 0])),
+                            ..Marks::default()
+                        },
+                    ),
+                    marked(
+                        "n",
+                        Marks {
+                            script: Some(Script::Sub),
+                            ..Marks::default()
+                        },
+                    ),
+                ],
+            ),
+            Block::Paragraph(Para::default(), Vec::new()),
+            Block::Quote(vec![Block::Paragraph(
+                Para::default(),
+                vec![text("Quoted")],
+            )]),
             Block::Code("fn main() {\n    println!(\"<hi>\");\n}\n".into()),
             Block::Rule,
-            Block::Bullets(vec![
-                vec![Block::Paragraph(vec![text("One")])],
+            Block::Bullets(
+                None,
                 vec![
-                    Block::Paragraph(vec![text("Two")]),
-                    Block::Numbers(3, vec![vec![Block::Paragraph(vec![text("Inner")])]]),
+                    vec![Block::Paragraph(Para::default(), vec![text("One")])],
+                    vec![
+                        Block::Paragraph(Para::default(), vec![text("Two")]),
+                        Block::Numbers(
+                            3,
+                            None,
+                            vec![vec![Block::Paragraph(Para::default(), vec![text("Inner")])]],
+                        ),
+                    ],
                 ],
-            ]),
+            ),
             Block::Checks(vec![
-                (true, vec![Block::Paragraph(vec![text("Milk")])]),
-                (false, vec![Block::Paragraph(vec![text("Bread")])]),
+                (
+                    true,
+                    vec![Block::Paragraph(Para::default(), vec![text("Milk")])],
+                ),
+                (
+                    false,
+                    vec![Block::Paragraph(Para::default(), vec![text("Bread")])],
+                ),
             ]),
             Block::Table(vec![
                 vec![Cell {
@@ -969,7 +1453,7 @@ mod tests {
                     colspan: 2,
                     rowspan: 1,
                     colwidth: Some(vec![120, 80]),
-                    content: vec![Block::Paragraph(vec![text("Head")])],
+                    content: vec![Block::Paragraph(Para::default(), vec![text("Head")])],
                 }],
                 vec![
                     Cell {
@@ -977,18 +1461,141 @@ mod tests {
                         colspan: 1,
                         rowspan: 1,
                         colwidth: None,
-                        content: vec![Block::Paragraph(vec![text("A")])],
+                        content: vec![Block::Paragraph(Para::default(), vec![text("A")])],
                     },
                     Cell {
                         header: false,
                         colspan: 1,
                         rowspan: 1,
                         colwidth: None,
-                        content: vec![Block::Paragraph(Vec::new())],
+                        content: vec![Block::Paragraph(Para::default(), Vec::new())],
                     },
                 ],
             ]),
         ]
+    }
+
+    /// Blocks with every part of a paragraph's layout, list styles, and a
+    /// page break.
+    pub(crate) fn laid_out() -> Vec<Block> {
+        vec![
+            Block::Paragraph(
+                Para {
+                    kind: Some(Kind::Title),
+                    align: Align::Center,
+                    ..Para::default()
+                },
+                vec![text("Trip")],
+            ),
+            Block::Paragraph(
+                Para {
+                    kind: Some(Kind::Subtitle),
+                    ..Para::default()
+                },
+                vec![text("Summer")],
+            ),
+            Block::Heading(
+                5,
+                Para {
+                    align: Align::Right,
+                    before: Some(0),
+                    ..Para::default()
+                },
+                vec![text("Days")],
+            ),
+            Block::Paragraph(
+                Para {
+                    align: Align::Justify,
+                    indent: 720,
+                    indent_right: 360,
+                    first_line: -360,
+                    line: Some(150),
+                    before: Some(240),
+                    after: Some(0),
+                    kind: None,
+                },
+                vec![text("Hanging")],
+            ),
+            Block::PageBreak,
+            Block::Numbers(
+                4,
+                Some(ListStyle::UpperRoman),
+                vec![vec![
+                    Block::Paragraph(Para::default(), vec![text("Fourth")]),
+                    Block::Bullets(
+                        Some(ListStyle::Arrow),
+                        vec![vec![Block::Paragraph(Para::default(), vec![text("Inner")])]],
+                    ),
+                ]],
+            ),
+            Block::Numbers(
+                1,
+                Some(ListStyle::DecimalParen),
+                vec![vec![Block::Paragraph(Para::default(), vec![text("One")])]],
+            ),
+        ]
+    }
+
+    #[test]
+    fn keeps_paragraph_layout_lists_and_page_breaks() {
+        let blocks = laid_out();
+        let page = page(&blocks, None, None, &Pictures::new());
+        assert_eq!(read(page.as_bytes()), blocks);
+        assert!(page.contains(
+            "<p style=\"text-align:justify;margin-left:36pt;margin-right:18pt;text-indent:-18pt;\
+             line-height:1.72;margin-top:12pt;margin-bottom:0pt\" data-line-height=\"1.5\">"
+        ));
+        assert!(page.contains("<p class=\"title\" style=\"text-align:center\">Trip</p>"));
+        assert!(page.contains("<ol start=\"4\" type=\"I\" data-list=\"upper-roman\">"));
+        assert!(page.contains("<div class=\"page-break\"></div>"));
+    }
+
+    #[test]
+    fn reads_layout_google_docs_and_word_write() {
+        // As Google Docs copies it: line spacing 1.15 as 1.38, a page break
+        // as a hidden rule, and a list's style on its items.
+        let html = r#"<b style="font-weight:normal;" id="docs-internal-guid-1">
+            <p dir="ltr" style="line-height:1.38;text-align:center;margin-top:0pt;margin-bottom:0pt;">
+            <span>Centered</span></p>
+            <hr style="page-break-before:always;display:none;">
+            <ul style="margin-top:0;margin-bottom:0;padding-inline-start:48px;">
+            <li dir="ltr" style="list-style-type:square;"><p dir="ltr"><span>Item</span></p></li></ul>
+            <p class="MsoTitle" align="right" style="margin:0in 0in 8pt .5in;text-indent:-.25in;line-height:107%">Word</p>
+            </b>"#;
+        let blocks = read(html.as_bytes());
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph(
+                    Para {
+                        align: Align::Center,
+                        line: Some(115),
+                        before: Some(0),
+                        after: Some(0),
+                        ..Para::default()
+                    },
+                    vec![text("Centered")]
+                ),
+                Block::PageBreak,
+                Block::Bullets(
+                    Some(ListStyle::Square),
+                    vec![vec![Block::Paragraph(Para::default(), vec![text("Item")])]]
+                ),
+                Block::Paragraph(
+                    Para {
+                        kind: Some(Kind::Title),
+                        align: Align::Right,
+                        indent: 720,
+                        first_line: -360,
+                        line: Some(107),
+                        before: Some(0),
+                        after: Some(160),
+                        indent_right: 0,
+                    },
+                    vec![text("Word")]
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1043,7 +1650,10 @@ mod tests {
         assert_eq!(
             read.blocks,
             vec![
-                Block::Paragraph(vec![Inline::Text("Before".into(), Marks::default())]),
+                Block::Paragraph(
+                    Para::default(),
+                    vec![Inline::Text("Before".into(), Marks::default())]
+                ),
                 Block::Image(Image {
                     hash: picture.hash.clone(),
                     alt: "Dot".into(),
@@ -1099,39 +1709,160 @@ mod tests {
             colspan: 1,
             rowspan: 1,
             colwidth: None,
-            content: vec![Block::Paragraph(vec![text(text_)])],
+            content: vec![Block::Paragraph(Para::default(), vec![text(text_)])],
         };
         assert_eq!(
             read(html.as_bytes()),
             vec![
-                Block::Heading(2, vec![text("Plan")]),
-                Block::Paragraph(vec![
-                    text("Some "),
-                    marked("bold", bold),
-                    text(" and "),
-                    marked("italic", italic),
-                    text(" text, a bad link."),
-                ]),
-                Block::Paragraph(vec![
-                    text("Loose text"),
-                    Inline::Break,
-                    text("after a break")
-                ]),
-                Block::Bullets(vec![
+                // Its color stays, and its script goes.
+                Block::Heading(
+                    2,
+                    Para::default(),
+                    vec![marked(
+                        "Plan",
+                        Marks {
+                            color: Some(Color([255, 0, 0])),
+                            ..Marks::default()
+                        }
+                    )]
+                ),
+                Block::Paragraph(
+                    Para::default(),
                     vec![
-                        Block::Paragraph(vec![text("One")]),
-                        Block::Bullets(vec![vec![Block::Paragraph(vec![text("Nested")])]]),
-                    ],
-                    vec![Block::Paragraph(vec![text("Two")])],
-                ]),
+                        text("Some "),
+                        marked("bold", bold),
+                        text(" and "),
+                        marked("italic", italic),
+                        text(" text, a bad link."),
+                    ]
+                ),
+                Block::Paragraph(
+                    Para::default(),
+                    vec![text("Loose text"), Inline::Break, text("after a break")]
+                ),
+                Block::Bullets(
+                    None,
+                    vec![
+                        vec![
+                            Block::Paragraph(Para::default(), vec![text("One")]),
+                            Block::Bullets(
+                                None,
+                                vec![vec![Block::Paragraph(
+                                    Para::default(),
+                                    vec![text("Nested")]
+                                )]]
+                            ),
+                        ],
+                        vec![Block::Paragraph(Para::default(), vec![text("Two")])],
+                    ]
+                ),
                 Block::Table(vec![vec![cell(true, "H")], vec![cell(false, "C")]]),
             ]
         );
     }
 
     #[test]
+    fn reads_the_styles_google_docs_and_word_write() {
+        // As Google Docs puts a paste on the clipboard.
+        let google = r#"<meta charset="utf-8"><b style="font-weight:normal;" id="docs-internal-guid-1"><p dir="ltr"><span style="font-size:11pt;font-family:Arial,sans-serif;color:#000000;background-color:transparent;font-weight:400;">Plain </span><span style="font-size:11pt;font-family:Arial,sans-serif;color:#ff0000;background-color:#ffff00;font-weight:700;">loud</span><span style="font-size:6.6pt;font-family:Arial,sans-serif;color:#000000;vertical-align:super;">2</span></p></b>"#;
+        let arial = Marks {
+            size: Some(22),
+            font: Some("Arial".into()),
+            ..Marks::default()
+        };
+        assert_eq!(
+            read(google.as_bytes()),
+            vec![Block::Paragraph(
+                Para::default(),
+                vec![
+                    marked("Plain ", arial.clone()),
+                    marked(
+                        "loud",
+                        Marks {
+                            bold: true,
+                            color: Some(Color([255, 0, 0])),
+                            highlight: Some(Color([255, 255, 0])),
+                            ..arial.clone()
+                        }
+                    ),
+                    marked(
+                        "2",
+                        Marks {
+                            script: Some(Script::Super),
+                            size: None,
+                            ..arial
+                        }
+                    ),
+                ]
+            )]
+        );
+        // As Word saves a web page, with styles on the paragraph, an old
+        // <font>, and a font that isn't a name, which is dropped.
+        let word = r#"<p class=MsoNormal style='font-family:"Times New Roman";font-size:12.0pt'>A <font color="navy" size="5">big</font> <span style="font-family:url(x);color:#ff0000ff">word</span></p>"#;
+        let times = Marks {
+            size: Some(24),
+            font: Some("Times New Roman".into()),
+            ..Marks::default()
+        };
+        assert_eq!(
+            read(word.as_bytes()),
+            vec![Block::Paragraph(
+                Para::default(),
+                vec![
+                    marked("A ", times.clone()),
+                    marked(
+                        "big",
+                        Marks {
+                            color: Some(Color([0, 0, 128])),
+                            size: Some(36),
+                            ..times.clone()
+                        }
+                    ),
+                    marked(" ", times.clone()),
+                    marked(
+                        "word",
+                        Marks {
+                            color: Some(Color([255, 0, 0])),
+                            ..times
+                        }
+                    ),
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn colored_documents_stay_light() {
+        let plain = page(
+            &[Block::Paragraph(Para::default(), vec![text("a")])],
+            None,
+            None,
+            &Pictures::new(),
+        );
+        assert!(plain.contains("prefers-color-scheme:dark"));
+        let red = Marks {
+            color: Some(Color([255, 0, 0])),
+            ..Marks::default()
+        };
+        let colored = page(
+            &[Block::Paragraph(Para::default(), vec![marked("a", red)])],
+            None,
+            None,
+            &Pictures::new(),
+        );
+        assert!(!colored.contains("prefers-color-scheme:dark"));
+        assert!(colored.contains("<span style=\"color:#ff0000\">a</span>"));
+    }
+
+    #[test]
     fn an_empty_page_is_one_empty_paragraph() {
-        assert_eq!(read(b""), vec![Block::Paragraph(Vec::new())]);
-        assert_eq!(read(b"<p>   \n  </p>"), vec![Block::Paragraph(Vec::new())]);
+        assert_eq!(
+            read(b""),
+            vec![Block::Paragraph(Para::default(), Vec::new())]
+        );
+        assert_eq!(
+            read(b"<p>   \n  </p>"),
+            vec![Block::Paragraph(Para::default(), Vec::new())]
+        );
     }
 }

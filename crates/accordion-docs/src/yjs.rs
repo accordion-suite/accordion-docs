@@ -17,7 +17,11 @@ use yrs::{
     XmlElementRef, XmlFragment, XmlFragmentRef, XmlOut, XmlTextPrelim, XmlTextRef,
 };
 
-use crate::model::{self, Block, Cell, Image, Inline, Marks, PageSetup, PageSize};
+use crate::model::{
+    self, Align, Block, Cell, Image, Inline, Kind, ListStyle, Marks, PageSetup, PageSize, Para,
+    Script,
+};
+use crate::style::{self, Color};
 
 /// The fragment y-prosemirror binds the editor to.
 pub const FRAGMENT: &str = "prosemirror";
@@ -123,13 +127,54 @@ fn number<T: ReadTxn>(txn: &T, element: &XmlElementRef, name: &str) -> Option<i6
     }
 }
 
+fn float<T: ReadTxn>(txn: &T, element: &XmlElementRef, name: &str) -> Option<f64> {
+    match element.get_attribute(txn, name)? {
+        Out::Any(Any::Number(number)) => number.as_f64(),
+        Out::Any(Any::String(text)) => text.trim().parse().ok(),
+        _ => None,
+    }
+    .filter(|value: &f64| value.is_finite())
+}
+
+fn string<T: ReadTxn>(txn: &T, element: &XmlElementRef, name: &str) -> Option<String> {
+    match element.get_attribute(txn, name)? {
+        Out::Any(Any::String(text)) => Some(text.to_string()),
+        _ => None,
+    }
+}
+
+/// A paragraph's or heading's layout, from its attributes, with lengths
+/// in points.
+fn read_para<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Para {
+    let length = |name| float(txn, element, name).and_then(model::twips);
+    Para {
+        kind: string(txn, element, "kind").and_then(|kind| Kind::from_name(&kind)),
+        align: string(txn, element, "align")
+            .and_then(|align| Align::from_name(&align))
+            .unwrap_or_default(),
+        indent: length("indent").unwrap_or(0),
+        indent_right: length("indent_right").unwrap_or(0),
+        first_line: length("first_line").unwrap_or(0),
+        line: float(txn, element, "line_height")
+            .filter(|line| *line > 0.0 && *line <= 100.0)
+            .map(|line| (line * 100.0).round() as u16),
+        before: length("space_before"),
+        after: length("space_after"),
+    }
+}
+
+fn list_style<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<ListStyle> {
+    string(txn, element, "style").and_then(|style| ListStyle::from_name(&style))
+}
+
 fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
     Some(match element.tag().as_ref() {
-        "paragraph" => Block::Paragraph(read_inlines(txn, element)),
+        "paragraph" => Block::Paragraph(read_para(txn, element), read_inlines(txn, element)),
         "heading" => {
             let level = number(txn, element, "level").unwrap_or(1).clamp(1, 6) as u8;
-            Block::Heading(level, read_inlines(txn, element))
+            Block::Heading(level, read_para(txn, element), read_inlines(txn, element))
         }
+        "page_break" => Block::PageBreak,
         "blockquote" => Block::Quote(read_children(txn, element)),
         "code_block" => Block::Code(
             read_inlines(txn, element)
@@ -152,12 +197,16 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
                 width: number(txn, element, "width").and_then(|width| u32::try_from(width).ok()),
             })
         }
-        "bullet_list" => Block::Bullets(items(txn, element, "list_item")),
+        "bullet_list" => Block::Bullets(list_style(txn, element), items(txn, element, "list_item")),
         "ordered_list" => {
             let start = number(txn, element, "order")
                 .unwrap_or(1)
                 .clamp(0, i64::from(u32::MAX));
-            Block::Numbers(start as u32, items(txn, element, "list_item"))
+            Block::Numbers(
+                start as u32,
+                list_style(txn, element),
+                items(txn, element, "list_item"),
+            )
         }
         "check_list" => Block::Checks(
             element
@@ -275,6 +324,20 @@ fn marks(attributes: Option<&Attrs>) -> Marks {
             "underline" => marks.underline = true,
             "strike" => marks.strike = true,
             "code" => marks.code = true,
+            "superscript" => marks.script = Some(Script::Super),
+            "subscript" => marks.script = Some(Script::Sub),
+            "text_color" => marks.color = attr_text(value, "color").and_then(Color::from_hex),
+            "highlight" => marks.highlight = attr_text(value, "color").and_then(Color::from_hex),
+            "font_family" => marks.font = attr_text(value, "family").and_then(style::font_name),
+            "font_size" => {
+                marks.size = match value {
+                    Any::Map(attrs) => match attrs.get("size") {
+                        Some(Any::Number(points)) => points.as_f64().and_then(style::half_points),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            }
             "link" => {
                 if let Any::Map(attrs) = value
                     && let Some(Any::String(href)) = attrs.get("href")
@@ -287,6 +350,33 @@ fn marks(attributes: Option<&Attrs>) -> Marks {
     }
     marks
 }
+
+/// A text attribute of a mark, such as a color's `color`.
+fn attr_text<'a>(value: &'a Any, name: &str) -> Option<&'a str> {
+    match value {
+        Any::Map(attrs) => match attrs.get(name) {
+            Some(Any::String(text)) => Some(text),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The marks y-prosemirror writes, so a run that hasn't one says so.
+const MARK_NAMES: [&str; 12] = [
+    "bold",
+    "italic",
+    "underline",
+    "strike",
+    "code",
+    "link",
+    "superscript",
+    "subscript",
+    "text_color",
+    "highlight",
+    "font_size",
+    "font_family",
+];
 
 /// The formatting attributes for `marks`, as y-prosemirror writes them.
 fn attributes(marks: &Marks) -> Attrs {
@@ -303,10 +393,43 @@ fn attributes(marks: &Marks) -> Attrs {
             attrs.insert(name.into(), empty());
         }
     }
+    let with = |name: &str, value: Any| {
+        let mut map = HashMap::new();
+        map.insert(name.to_owned(), value);
+        Any::Map(Arc::new(map))
+    };
     if let Some(href) = &marks.link {
-        let mut link = HashMap::new();
-        link.insert("href".to_owned(), Any::String(href.as_str().into()));
-        attrs.insert("link".into(), Any::Map(Arc::new(link)));
+        attrs.insert(
+            "link".into(),
+            with("href", Any::String(href.as_str().into())),
+        );
+    }
+    match marks.script {
+        Some(Script::Super) => {
+            attrs.insert("superscript".into(), empty());
+        }
+        Some(Script::Sub) => {
+            attrs.insert("subscript".into(), empty());
+        }
+        None => {}
+    }
+    if let Some(color) = marks.color {
+        attrs.insert("text_color".into(), with("color", Any::from(color.css())));
+    }
+    if let Some(color) = marks.highlight {
+        attrs.insert("highlight".into(), with("color", Any::from(color.css())));
+    }
+    if let Some(size) = marks.size {
+        attrs.insert(
+            "font_size".into(),
+            with("size", Any::Number(Number::try_i64(style::points(size)))),
+        );
+    }
+    if let Some(font) = &marks.font {
+        attrs.insert(
+            "font_family".into(),
+            with("family", Any::from(font.as_str())),
+        );
     }
     attrs
 }
@@ -336,16 +459,59 @@ fn element<P: XmlFragment>(
     parent.insert(txn, index, XmlElementPrelim::empty(tag))
 }
 
+/// A length in points, as the editor keeps it: a whole number when it is
+/// one.
+fn points(twips: model::Twips) -> Any {
+    Any::Number(Number::try_i64(model::points(twips)))
+}
+
+/// A paragraph's or heading's layout as its attributes. Parts that aren't
+/// set are left out, as y-prosemirror leaves out attributes that are null.
+fn insert_para(txn: &mut TransactionMut, el: &XmlElementRef, para: &Para) {
+    if let Some(kind) = para.kind {
+        el.insert_attribute(txn, "kind", Any::from(kind.name()));
+    }
+    if para.align != Align::Left {
+        el.insert_attribute(txn, "align", Any::from(para.align.name()));
+    }
+    for (name, twips) in [
+        ("indent", para.indent),
+        ("indent_right", para.indent_right),
+        ("first_line", para.first_line),
+    ] {
+        if twips != 0 {
+            el.insert_attribute(txn, name, points(twips));
+        }
+    }
+    if let Some(line) = para.line {
+        el.insert_attribute(
+            txn,
+            "line_height",
+            Any::Number(Number::try_i64(f64::from(line) / 100.0)),
+        );
+    }
+    for (name, space) in [("space_before", para.before), ("space_after", para.after)] {
+        if let Some(twips) = space {
+            el.insert_attribute(txn, name, points(twips));
+        }
+    }
+}
+
 fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32, block: &Block) {
     match block {
-        Block::Paragraph(inlines) => {
+        Block::Paragraph(para, inlines) => {
             let el = element(txn, parent, index, "paragraph");
+            insert_para(txn, &el, para);
             insert_inlines(txn, &el, inlines);
         }
-        Block::Heading(level, inlines) => {
+        Block::Heading(level, para, inlines) => {
             let el = element(txn, parent, index, "heading");
             el.insert_attribute(txn, "level", int(i64::from(*level)));
+            insert_para(txn, &el, para);
             insert_inlines(txn, &el, inlines);
+        }
+        Block::PageBreak => {
+            element(txn, parent, index, "page_break");
         }
         Block::Quote(blocks) => {
             let el = element(txn, parent, index, "blockquote");
@@ -371,13 +537,19 @@ fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32
                 el.insert_attribute(txn, "width", int(i64::from(width)));
             }
         }
-        Block::Bullets(items) => {
+        Block::Bullets(style, items) => {
             let el = element(txn, parent, index, "bullet_list");
+            if let Some(style) = style {
+                el.insert_attribute(txn, "style", Any::from(style.name()));
+            }
             insert_items(txn, &el, "list_item", items);
         }
-        Block::Numbers(start, items) => {
+        Block::Numbers(start, style, items) => {
             let el = element(txn, parent, index, "ordered_list");
             el.insert_attribute(txn, "order", int(i64::from(*start)));
+            if let Some(style) = style {
+                el.insert_attribute(txn, "style", Any::from(style.name()));
+            }
             insert_items(txn, &el, "list_item", items);
         }
         Block::Checks(items) => {
@@ -442,7 +614,7 @@ fn insert_inlines(txn: &mut TransactionMut, element: &XmlElementRef, inlines: &[
                 // Every run names all its marks, and none of the others, so
                 // it doesn't take on the marks of the run before it.
                 let mut attrs = attributes(marks);
-                for name in ["bold", "italic", "underline", "strike", "code", "link"] {
+                for name in MARK_NAMES {
                     attrs.entry(name.into()).or_insert(Any::Null);
                 }
                 current.insert_with_attributes(txn, at, text, attrs);

@@ -5,9 +5,12 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::model::{Block, Cell, Image, Inline, Marks, PageSetup};
+use crate::model::{
+    self, Align, Block, Cell, Image, Inline, Kind, ListStyle, Marks, PageSetup, Para, Script,
+};
 use crate::office::{self, Grid, Part, Slot, escape, escaped};
 use crate::picture::{Picture, Pictures};
+use crate::style::{self, Color, HalfPoints};
 
 /// `blocks` on `setup`'s page as an OpenDocument file, with `pictures` in
 /// it and `title` in its properties.
@@ -43,6 +46,14 @@ pub fn write(
             "<style:style style:name=\"Quote{depth}\" style:family=\"paragraph\" style:parent-style-name=\"Quotations\">\
              <style:paragraph-properties fo:margin-left=\"{}pt\"/></style:style>",
             depth * 18
+        );
+    }
+    for (key, name) in &writer.paras {
+        let _ = write!(
+            content,
+            "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"{}\">\
+             <style:paragraph-properties{}/></style:style>",
+            key.0, key.1
         );
     }
     content.push_str(&writer.styles);
@@ -159,6 +170,11 @@ struct SpanKey {
     code: bool,
     /// A done checklist item's text: gray.
     gray: bool,
+    script: Option<Script>,
+    color: Option<Color>,
+    highlight: Option<Color>,
+    size: Option<HalfPoints>,
+    font: Option<String>,
 }
 
 impl SpanKey {
@@ -180,11 +196,28 @@ impl SpanKey {
                 " style:text-line-through-style=\"solid\" style:text-line-through-type=\"single\"",
             );
         }
-        if self.code {
-            out.push_str(" style:font-name=\"Courier New\" fo:background-color=\"#f1f3f4\"");
+        if let Some(font) = &self.font {
+            let _ = write!(out, " fo:font-family=\"&apos;{}&apos;\"", escaped(font));
+        } else if self.code {
+            out.push_str(" style:font-name=\"Courier New\"");
+        }
+        if let Some(color) = self.highlight {
+            let _ = write!(out, " fo:background-color=\"{}\"", color.css());
+        } else if self.code {
+            out.push_str(" fo:background-color=\"#f1f3f4\"");
         }
         if self.gray {
             out.push_str(" fo:color=\"#5f6368\"");
+        } else if let Some(color) = self.color {
+            let _ = write!(out, " fo:color=\"{}\"", color.css());
+        }
+        if let Some(size) = self.size {
+            let _ = write!(out, " fo:font-size=\"{}pt\"", style::points_text(size));
+        }
+        match self.script {
+            Some(Script::Super) => out.push_str(" style:text-position=\"super 58%\""),
+            Some(Script::Sub) => out.push_str(" style:text-position=\"sub 58%\""),
+            None => {}
         }
         out
     }
@@ -226,6 +259,9 @@ struct Writer<'a> {
     drawings: usize,
     /// Each mix of marks used, and its style's name.
     spans: BTreeMap<SpanKey, String>,
+    /// Each paragraph layout used, by its parent style and properties, and
+    /// its style's name.
+    paras: BTreeMap<(String, String), String>,
     /// Table, column, and cell styles, written as tables are.
     styles: String,
     tables: usize,
@@ -255,22 +291,100 @@ impl Writer<'_> {
         }
     }
 
+    /// The style for a paragraph with `para`'s layout where `base` would
+    /// be its style: `base` itself when it has none of its own.
+    fn layout_style(&mut self, base: String, para: &Para, context: &Context) -> String {
+        // The title and subtitle are styles of their own already.
+        let layout = Para {
+            kind: None,
+            ..para.clone()
+        };
+        if layout.is_default() {
+            return base;
+        }
+        // A style of a document's own can't be another's parent, so those
+        // are written out in full.
+        let mut props = String::new();
+        let (parent, quote_indent) = if base.starts_with("Quote") {
+            ("Quotations".to_owned(), context.quotes as f64 * 18.0)
+        } else if base == "ListText" {
+            if para.after.is_none() {
+                props.push_str(" fo:margin-bottom=\"2pt\"");
+            }
+            ("Standard".to_owned(), 0.0)
+        } else {
+            (base, 0.0)
+        };
+        let points = |twips| office::number(model::points(twips));
+        match para.align {
+            Align::Left => {}
+            Align::Center => props.push_str(" fo:text-align=\"center\""),
+            Align::Right => props.push_str(" fo:text-align=\"end\""),
+            Align::Justify => props.push_str(" fo:text-align=\"justify\""),
+        }
+        // In a list, the list places the text.
+        if !context.listed && (para.indent != 0 || quote_indent > 0.0) {
+            let _ = write!(
+                props,
+                " fo:margin-left=\"{}pt\"",
+                office::number(quote_indent + model::points(para.indent))
+            );
+        }
+        if para.indent_right != 0 {
+            let _ = write!(
+                props,
+                " fo:margin-right=\"{}pt\"",
+                points(para.indent_right)
+            );
+        }
+        if para.first_line != 0 {
+            let _ = write!(props, " fo:text-indent=\"{}pt\"", points(para.first_line));
+        }
+        if let Some(line) = para.line {
+            let _ = write!(props, " fo:line-height=\"{line}%\"");
+        }
+        if let Some(before) = para.before {
+            let _ = write!(props, " fo:margin-top=\"{}pt\"", points(before));
+        }
+        if let Some(after) = para.after {
+            let _ = write!(props, " fo:margin-bottom=\"{}pt\"", points(after));
+        }
+        let count = self.paras.len();
+        self.paras
+            .entry((parent, props))
+            .or_insert_with(|| format!("Layout{}", count + 1))
+            .clone()
+    }
+
     fn block(&mut self, block: &Block, context: &Context) {
         match block {
-            Block::Paragraph(inlines) => {
-                let style = self.paragraph_style(context);
+            Block::Paragraph(para, inlines) => {
+                let base = match para.kind {
+                    // A title in a list or a cell takes the list's or the
+                    // cell's spacing.
+                    Some(Kind::Title) if context.cell.is_none() && context.quotes == 0 => {
+                        "Title".to_owned()
+                    }
+                    Some(Kind::Subtitle) if context.cell.is_none() && context.quotes == 0 => {
+                        "Subtitle".to_owned()
+                    }
+                    _ => self.paragraph_style(context),
+                };
+                let style = self.layout_style(base, para, context);
                 self.open(&format!("<text:p text:style-name=\"{style}\">"));
                 self.runs(inlines, context);
                 self.out.push_str("</text:p>");
             }
-            Block::Heading(level, inlines) => {
+            Block::Heading(level, para, inlines) => {
                 let level = (*level).clamp(1, 6);
+                let style = self.layout_style(format!("Heading_20_{level}"), para, context);
                 self.open(&format!(
-                    "<text:h text:style-name=\"Heading_20_{level}\" text:outline-level=\"{level}\">"
+                    "<text:h text:style-name=\"{style}\" text:outline-level=\"{level}\">"
                 ));
                 self.runs(inlines, context);
                 self.out.push_str("</text:h>");
             }
+            Block::PageBreak => self.out.push_str("<text:p text:style-name=\"PageBreak\"/>"),
             Block::Quote(blocks) => {
                 let mut inner = context.clone();
                 inner.quotes += 1;
@@ -284,15 +398,17 @@ impl Writer<'_> {
                 }
             }
             Block::Rule => self.out.push_str("<text:p text:style-name=\"Rule\"/>"),
-            Block::Bullets(items) => {
-                self.out.push_str("<text:list text:style-name=\"Bullets\">");
+            Block::Bullets(style, items) => {
+                let name = style.map_or("Bullets".to_owned(), list_style_name);
+                let _ = write!(self.out, "<text:list text:style-name=\"{name}\">");
                 for item in items {
                     self.item(item, context, "");
                 }
                 self.out.push_str("</text:list>");
             }
-            Block::Numbers(start, items) => {
-                self.out.push_str("<text:list text:style-name=\"Numbers\">");
+            Block::Numbers(start, style, items) => {
+                let name = style.map_or("Numbers".to_owned(), list_style_name);
+                let _ = write!(self.out, "<text:list text:style-name=\"{name}\">");
                 for (index, item) in items.iter().enumerate() {
                     let start = if index == 0 && *start != 1 {
                         format!(" text:start-value=\"{start}\"")
@@ -403,6 +519,11 @@ impl Writer<'_> {
             strike: marks.strike || context.done,
             code: marks.code,
             gray: context.done,
+            script: marks.script,
+            color: marks.color,
+            highlight: marks.highlight,
+            size: marks.size,
+            font: marks.font.clone(),
         };
         if key == SpanKey::default() {
             self.text(text);
@@ -569,7 +690,10 @@ const CONTENT_STYLES: &str = "<style:style style:name=\"Cell\" style:family=\"ta
 <style:style style:name=\"HeadingCell\" style:family=\"table-cell\">\
 <style:table-cell-properties fo:background-color=\"#f1f3f4\" fo:padding=\"4pt\" fo:border=\"0.75pt solid #c4c7c5\"/></style:style>\
 <style:style style:name=\"ListText\" style:family=\"paragraph\" style:parent-style-name=\"Standard\">\
-<style:paragraph-properties fo:margin-bottom=\"2pt\"/></style:style>";
+<style:paragraph-properties fo:margin-bottom=\"2pt\"/></style:style>\
+<style:style style:name=\"PageBreak\" style:family=\"paragraph\" style:parent-style-name=\"Standard\">\
+<style:paragraph-properties fo:break-after=\"page\" fo:margin-top=\"0pt\" fo:margin-bottom=\"0pt\" fo:line-height=\"100%\"/>\
+<style:text-properties fo:font-size=\"1pt\"/></style:style>";
 
 const FONTS: &str = "<office:font-face-decls>\
 <style:font-face style:name=\"Arial\" svg:font-family=\"Arial\" style:font-family-generic=\"swiss\" style:font-pitch=\"variable\"/>\
@@ -599,6 +723,40 @@ fn lists() -> String {
         }
         out.push_str("</text:list-style>");
     }
+    for style in ListStyle::ALL {
+        let _ = write!(
+            out,
+            "<text:list-style style:name=\"{}\">",
+            list_style_name(style)
+        );
+        for level in 1..=10 {
+            match style.bullet() {
+                Some(bullet) => {
+                    let _ = write!(
+                        out,
+                        "<text:list-level-style-bullet text:level=\"{level}\" text:bullet-char=\"{bullet}\">{}</text:list-level-style-bullet>",
+                        level_properties(level)
+                    );
+                }
+                None => {
+                    let (format, suffix) = match style {
+                        ListStyle::DecimalParen => ("1", ")"),
+                        ListStyle::LowerAlpha => ("a", "."),
+                        ListStyle::UpperAlpha => ("A", "."),
+                        ListStyle::LowerRoman => ("i", "."),
+                        ListStyle::UpperRoman => ("I", "."),
+                        _ => ("1", "."),
+                    };
+                    let _ = write!(
+                        out,
+                        "<text:list-level-style-number text:level=\"{level}\" style:num-format=\"{format}\" style:num-suffix=\"{suffix}\">{}</text:list-level-style-number>",
+                        level_properties(level)
+                    );
+                }
+            }
+        }
+        out.push_str("</text:list-style>");
+    }
     out.push_str("<text:list-style style:name=\"Numbers\">");
     for level in 1..=10 {
         let _ = write!(
@@ -609,6 +767,11 @@ fn lists() -> String {
     }
     out.push_str("</text:list-style>");
     out
+}
+
+/// The list style for a [`ListStyle`], such as `List_lower-alpha`.
+fn list_style_name(style: ListStyle) -> String {
+    format!("List_{}", style.name())
 }
 
 fn level_properties(level: usize) -> String {
@@ -625,6 +788,10 @@ const STYLES: &str = "<office:styles>\
 <style:default-style style:family=\"paragraph\"><style:paragraph-properties fo:margin-top=\"0pt\" fo:margin-bottom=\"6pt\" fo:line-height=\"115%\"/>\
 <style:text-properties style:font-name=\"Arial\" fo:font-size=\"11pt\" fo:color=\"#1f1f1f\"/></style:default-style>\
 <style:style style:name=\"Standard\" style:family=\"paragraph\" style:class=\"text\"/>\
+<style:style style:name=\"Title\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:class=\"chapter\">\
+<style:paragraph-properties fo:margin-top=\"0pt\" fo:margin-bottom=\"3pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"26pt\"/></style:style>\
+<style:style style:name=\"Subtitle\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:class=\"chapter\">\
+<style:paragraph-properties fo:margin-top=\"0pt\" fo:margin-bottom=\"16pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"15pt\" fo:color=\"#666666\"/></style:style>\
 <style:style style:name=\"Heading_20_1\" style:display-name=\"Heading 1\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"1\" style:class=\"text\">\
 <style:paragraph-properties fo:margin-top=\"20pt\" fo:margin-bottom=\"6pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"20pt\" fo:font-weight=\"bold\"/></style:style>\
 <style:style style:name=\"Heading_20_2\" style:display-name=\"Heading 2\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"2\" style:class=\"text\">\
@@ -688,13 +855,34 @@ mod tests {
             ..Marks::default()
         };
         let blocks = vec![
-            Block::Heading(2, vec![text("Plan")]),
-            Block::Paragraph(vec![
-                text(" two  spaces"),
-                Inline::Text("bold".to_owned(), bold),
-            ]),
-            Block::Numbers(3, vec![vec![Block::Paragraph(vec![text("Third")])]]),
-            Block::Checks(vec![(true, vec![Block::Paragraph(vec![text("Done")])])]),
+            Block::Heading(2, Para::default(), vec![text("Plan")]),
+            Block::Paragraph(
+                Para::default(),
+                vec![
+                    text(" two  spaces"),
+                    Inline::Text("bold".to_owned(), bold),
+                    Inline::Text(
+                        "styled".to_owned(),
+                        Marks {
+                            color: Some(Color([0xcc, 0, 0])),
+                            highlight: Some(Color([0xff, 0xf2, 0xcc])),
+                            size: Some(21),
+                            font: Some("Open Sans".into()),
+                            script: Some(Script::Super),
+                            ..Marks::default()
+                        },
+                    ),
+                ],
+            ),
+            Block::Numbers(
+                3,
+                None,
+                vec![vec![Block::Paragraph(Para::default(), vec![text("Third")])]],
+            ),
+            Block::Checks(vec![(
+                true,
+                vec![Block::Paragraph(Para::default(), vec![text("Done")])],
+            )]),
         ];
         let setup = PageSetup {
             size: PageSize::Letter,
@@ -725,6 +913,12 @@ mod tests {
             "{content}"
         );
         assert!(content.contains("text-line-through-style"), "{content}");
+        assert!(
+            content.contains(
+                "fo:font-family=\"&apos;Open Sans&apos;\" fo:background-color=\"#fff2cc\" fo:color=\"#cc0000\" fo:font-size=\"10.5pt\" style:text-position=\"super 58%\""
+            ),
+            "{content}"
+        );
         let styles = part(&file, "styles.xml");
         assert!(
             styles.contains("fo:page-width=\"612pt\" fo:page-height=\"792pt\""),
@@ -754,5 +948,23 @@ mod tests {
         );
         assert!(content.contains("<svg:desc>Dot</svg:desc>"), "{content}");
         assert!(part(&file, "META-INF/manifest.xml").contains(&path));
+    }
+
+    #[test]
+    fn writes_paragraph_layout_list_styles_and_page_breaks() {
+        let blocks = crate::html::tests::laid_out();
+        let file = write(&blocks, None, "Layout", &Pictures::new());
+        let content = part(&file, "content.xml");
+        assert!(content.contains(
+            "style:parent-style-name=\"Standard\"><style:paragraph-properties fo:text-align=\"justify\" \
+             fo:margin-left=\"36pt\" fo:margin-right=\"18pt\" fo:text-indent=\"-18pt\" fo:line-height=\"150%\" \
+             fo:margin-top=\"12pt\" fo:margin-bottom=\"0pt\"/>"
+        ));
+        assert!(content.contains("<text:p text:style-name=\"PageBreak\"/>"));
+        assert!(content.contains("<text:list text:style-name=\"List_upper-roman\">"));
+        assert!(content.contains("style:num-format=\"I\""));
+        // The title is a style of its own, centered by one of the document's.
+        assert!(content.contains("style:parent-style-name=\"Title\"><style:paragraph-properties fo:text-align=\"center\"/>"));
+        assert!(part(&file, "styles.xml").contains("style:name=\"Subtitle\""));
     }
 }

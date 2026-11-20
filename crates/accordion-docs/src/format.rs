@@ -124,7 +124,7 @@ impl DocFormat {
 /// yet: the first person to open it makes one from the body.
 pub(crate) fn new_document(setup: &PageSetup) -> Vec<u8> {
     html::page(
-        &[Block::Paragraph(Vec::new())],
+        &[Block::Paragraph(model::Para::default(), Vec::new())],
         Some(setup),
         None,
         &Pictures::new(),
@@ -138,8 +138,9 @@ mod tests {
     use yrs::{OffsetKind, Options, Update, XmlFragmentRef};
 
     use super::*;
-    use crate::model::{Image, Inline, Marks, PageSize};
+    use crate::model::{Image, Inline, Marks, PageSize, Script};
     use crate::picture::Picture;
+    use crate::style::Color;
 
     fn format() -> DocFormat {
         DocFormat {
@@ -155,7 +156,10 @@ mod tests {
     }
 
     fn paragraph(text: &str) -> Block {
-        Block::Paragraph(vec![Inline::Text(text.into(), Marks::default())])
+        Block::Paragraph(
+            model::Para::default(),
+            vec![Inline::Text(text.into(), Marks::default())],
+        )
     }
 
     fn page(doc: &Doc) -> Option<PageSetup> {
@@ -173,25 +177,43 @@ mod tests {
         let doc = doc();
         let file = html::page(
             &[
-                Block::Heading(1, vec![Inline::Text("Plan".into(), Marks::default())]),
-                Block::Paragraph(vec![
-                    Inline::Text(
-                        "bold".into(),
-                        Marks {
-                            bold: true,
-                            ..Marks::default()
-                        },
-                    ),
-                    Inline::Text(" plain".into(), Marks::default()),
-                    Inline::Break,
-                    Inline::Text(
-                        "linked".into(),
-                        Marks {
-                            link: Some("https://example.com".into()),
-                            ..Marks::default()
-                        },
-                    ),
-                ]),
+                Block::Heading(
+                    1,
+                    model::Para::default(),
+                    vec![Inline::Text("Plan".into(), Marks::default())],
+                ),
+                Block::Paragraph(
+                    model::Para::default(),
+                    vec![
+                        Inline::Text(
+                            "bold".into(),
+                            Marks {
+                                bold: true,
+                                ..Marks::default()
+                            },
+                        ),
+                        Inline::Text(" plain".into(), Marks::default()),
+                        Inline::Break,
+                        Inline::Text(
+                            "linked".into(),
+                            Marks {
+                                link: Some("https://example.com".into()),
+                                ..Marks::default()
+                            },
+                        ),
+                        Inline::Text(
+                            "styled".into(),
+                            Marks {
+                                color: Some(Color([0xcc, 0, 0])),
+                                highlight: Some(Color([0xff, 0xf2, 0xcc])),
+                                size: Some(21),
+                                font: Some("Open Sans".into()),
+                                script: Some(Script::Super),
+                                ..Marks::default()
+                            },
+                        ),
+                    ],
+                ),
                 Block::Checks(vec![(true, vec![paragraph("Milk")])]),
             ],
             Some(&PageSetup::new(PageSize::A4)),
@@ -215,6 +237,17 @@ mod tests {
         let before = doc.transact().state_vector();
         format().absorb(&doc, &written).unwrap();
         assert_eq!(doc.transact().state_vector(), before);
+    }
+
+    #[test]
+    fn layout_survives_the_editor_and_the_file() {
+        let doc = doc();
+        let blocks = html::tests::laid_out();
+        let file = html::page(&blocks, None, None, &Pictures::new());
+        format().absorb(&doc, file.as_bytes()).unwrap();
+        assert_eq!(self::blocks(&doc), blocks);
+        let written = format().write(&doc).unwrap();
+        assert_eq!(html::read(&written), blocks);
     }
 
     #[test]
@@ -376,7 +409,10 @@ mod tests {
         assert!(html::is_document(&file));
         assert_eq!(format().state_in(&file), None);
         format().absorb(&doc, &file).unwrap();
-        assert_eq!(blocks(&doc), vec![Block::Paragraph(Vec::new())]);
+        assert_eq!(
+            blocks(&doc),
+            vec![Block::Paragraph(model::Para::default(), Vec::new())]
+        );
         assert_eq!(page(&doc), Some(PageSetup::new(PageSize::A4)));
     }
 }

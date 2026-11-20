@@ -18,6 +18,7 @@ pub mod model;
 pub mod odt;
 mod office;
 pub mod picture;
+pub mod style;
 pub mod yjs;
 
 use accordion_core::coedit::CoEditing;
