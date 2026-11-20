@@ -251,6 +251,16 @@ mod tests {
     }
 
     #[test]
+    fn cell_colors_survive_the_editor_and_the_file() {
+        let doc = doc();
+        let blocks = html::tests::colored_cells();
+        let file = html::page(&blocks, None, None, &Pictures::new());
+        format().absorb(&doc, file.as_bytes()).unwrap();
+        assert_eq!(self::blocks(&doc), blocks);
+        assert_eq!(html::read(&format().write(&doc).unwrap()), blocks);
+    }
+
+    #[test]
     fn a_draft_becomes_a_file_with_its_own_state() {
         // A browser typed into a document that had no file yet.
         let draft = doc();

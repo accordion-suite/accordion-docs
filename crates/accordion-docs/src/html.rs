@@ -127,7 +127,7 @@ fn write_page(
     let _ = writeln!(out, "<title>{}</title>", escape_text(title));
     let colored = model::any_marks(blocks, &|marks| {
         marks.color.is_some() || marks.highlight.is_some()
-    });
+    }) || model::any_cell_color(blocks);
     let _ = writeln!(
         out,
         "<style>{STYLE}{}</style>",
@@ -368,6 +368,9 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
                     if let Some(widths) = &cell.colwidth {
                         let widths: Vec<String> = widths.iter().map(u32::to_string).collect();
                         let _ = write!(out, " data-colwidth=\"{}\"", widths.join(","));
+                    }
+                    if let Some(color) = cell.background {
+                        let _ = write!(out, " style=\"background-color:{}\"", color.css());
                     }
                     out.push_str(">\n");
                     write_blocks(out, &cell.content, pictures);
@@ -1343,6 +1346,7 @@ fn collect_rows(node: NodeRef, rows: &mut Vec<Vec<Cell>>, pictures: &mut Picture
                         colspan: span("colspan"),
                         rowspan: span("rowspan"),
                         colwidth,
+                        background: cell_color(cell),
                         content,
                     });
                 }
@@ -1351,6 +1355,27 @@ fn collect_rows(node: NodeRef, rows: &mut Vec<Vec<Cell>>, pictures: &mut Picture
             _ => {}
         }
     }
+}
+
+/// A cell's color from its style, as Google Docs and Word write it, or from
+/// the old `bgcolor`. White is the page's own color, which Word names on
+/// every cell, so it's no color.
+fn cell_color(cell: NodeRef) -> Option<Color> {
+    let from_style = attribute(&cell, "style").and_then(|style| {
+        style::declarations(style)
+            .into_iter()
+            .rev()
+            .find_map(|(name, value)| match name.as_str() {
+                "background-color" => Color::from_css(&value),
+                // The shorthand, such as `background:yellow`, or with more in
+                // it, such as `background:#fce5cd none`.
+                "background" => value.split_whitespace().find_map(Color::from_css),
+                _ => None,
+            })
+    });
+    from_style
+        .or_else(|| attribute(&cell, "bgcolor").and_then(Color::from_css))
+        .filter(|color| *color != Color([255, 255, 255]))
 }
 
 #[cfg(test)]
@@ -1453,6 +1478,7 @@ pub(crate) mod tests {
                     colspan: 2,
                     rowspan: 1,
                     colwidth: Some(vec![120, 80]),
+                    background: None,
                     content: vec![Block::Paragraph(Para::default(), vec![text("Head")])],
                 }],
                 vec![
@@ -1461,6 +1487,7 @@ pub(crate) mod tests {
                         colspan: 1,
                         rowspan: 1,
                         colwidth: None,
+                        background: Some(Color([252, 229, 205])),
                         content: vec![Block::Paragraph(Para::default(), vec![text("A")])],
                     },
                     Cell {
@@ -1468,6 +1495,7 @@ pub(crate) mod tests {
                         colspan: 1,
                         rowspan: 1,
                         colwidth: None,
+                        background: None,
                         content: vec![Block::Paragraph(Para::default(), Vec::new())],
                     },
                 ],
@@ -1534,6 +1562,62 @@ pub(crate) mod tests {
                 vec![vec![Block::Paragraph(Para::default(), vec![text("One")])]],
             ),
         ]
+    }
+
+    /// A table with a colored heading cell, a plain one, and a colored
+    /// cell two columns wide.
+    pub(crate) fn colored_cells() -> Vec<Block> {
+        let cell = |header, colspan, background, words: &str| Cell {
+            header,
+            colspan,
+            rowspan: 1,
+            colwidth: None,
+            background,
+            content: vec![Block::Paragraph(Para::default(), vec![text(words)])],
+        };
+        vec![Block::Table(vec![
+            vec![
+                cell(true, 1, Some(Color([252, 229, 205])), "Head"),
+                cell(true, 1, None, "Plain"),
+            ],
+            vec![cell(false, 2, Some(Color([207, 226, 243])), "Wide")],
+        ])]
+    }
+
+    #[test]
+    fn keeps_cell_colors_and_leaves_out_dark_mode() {
+        let blocks = colored_cells();
+        let page = page(&blocks, None, None, &Pictures::new());
+        assert_eq!(read(page.as_bytes()), blocks);
+        assert!(page.contains("<th style=\"background-color:#fce5cd\">"));
+        assert!(page.contains("<td colspan=\"2\" style=\"background-color:#cfe2f3\">"));
+        // Light text on a pale cell couldn't be read.
+        assert!(!page.contains("prefers-color-scheme:dark"));
+    }
+
+    #[test]
+    fn reads_cell_colors_other_programs_write() {
+        let html = r##"<table><tr>
+            <td style="border-left:solid #000 1pt;background-color:#fce5cd;padding:5pt">Google</td>
+            <td style='background:yellow;padding:0in 5.4pt'>Word</td>
+            <td bgcolor="#ff0000">Old</td>
+            <td style="background:white">White</td>
+            <td style="background:#cfe2f3 none">Shorthand</td>
+            </tr></table>"##;
+        let [Block::Table(rows)] = &read(html.as_bytes())[..] else {
+            panic!("not one table");
+        };
+        let colors: Vec<_> = rows[0].iter().map(|cell| cell.background).collect();
+        assert_eq!(
+            colors,
+            [
+                Some(Color([252, 229, 205])),
+                Some(Color([255, 255, 0])),
+                Some(Color([255, 0, 0])),
+                None,
+                Some(Color([207, 226, 243])),
+            ]
+        );
     }
 
     #[test]
@@ -1709,6 +1793,7 @@ pub(crate) mod tests {
             colspan: 1,
             rowspan: 1,
             colwidth: None,
+            background: None,
             content: vec![Block::Paragraph(Para::default(), vec![text(text_)])],
         };
         assert_eq!(

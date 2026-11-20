@@ -278,6 +278,7 @@ fn read_cell<T: ReadTxn>(txn: &T, cell: XmlOut) -> Option<Cell> {
         colspan: span("colspan"),
         rowspan: span("rowspan"),
         colwidth,
+        background: string(txn, &cell, "background").and_then(|color| Color::from_hex(&color)),
         content: read_children(txn, &cell),
     })
 }
@@ -577,6 +578,9 @@ fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32
                         let widths: Vec<Any> =
                             widths.iter().map(|width| int(i64::from(*width))).collect();
                         cell_el.insert_attribute(txn, "colwidth", Any::Array(widths.into()));
+                    }
+                    if let Some(color) = cell.background {
+                        cell_el.insert_attribute(txn, "background", Any::from(color.css()));
                     }
                     insert_blocks(txn, &cell_el, 0, &cell.content);
                 }

@@ -389,6 +389,23 @@ pub fn image_hashes(blocks: &[Block]) -> Vec<String> {
     out
 }
 
+/// Whether any table cell in `blocks`, or in a table inside one, has a
+/// color.
+pub fn any_cell_color(blocks: &[Block]) -> bool {
+    blocks.iter().any(|block| match block {
+        Block::Quote(blocks) => any_cell_color(blocks),
+        Block::Bullets(_, items) | Block::Numbers(_, _, items) => {
+            items.iter().any(|item| any_cell_color(item))
+        }
+        Block::Checks(items) => items.iter().any(|(_, item)| any_cell_color(item)),
+        Block::Table(rows) => rows
+            .iter()
+            .flatten()
+            .any(|cell| cell.background.is_some() || any_cell_color(&cell.content)),
+        _ => false,
+    })
+}
+
 /// Whether any run of text in `blocks` has marks that `test` picks.
 pub fn any_marks(blocks: &[Block], test: &dyn Fn(&Marks) -> bool) -> bool {
     let inlines = |inlines: &[Inline]| {
@@ -420,6 +437,8 @@ pub struct Cell {
     /// Column widths in pixels, one for each column the cell spans, once
     /// someone has dragged a column's edge.
     pub colwidth: Option<Vec<u32>>,
+    /// The cell's color, as Google Docs' cell background.
+    pub background: Option<Color>,
     pub content: Vec<Block>,
 }
 
@@ -673,6 +692,7 @@ fn cell(cell: Cell) -> Cell {
         colspan,
         rowspan: cell.rowspan.clamp(1, MAX_SPAN),
         colwidth,
+        background: cell.background,
         content: at_least_a_paragraph(cell.content),
     }
 }
@@ -823,6 +843,7 @@ mod tests {
             colspan: 2,
             rowspan: 0,
             colwidth: Some(vec![100]),
+            background: None,
             content: Vec::new(),
         }]]))
         .unwrap();

@@ -264,6 +264,9 @@ struct Writer<'a> {
     paras: BTreeMap<(String, String), String>,
     /// Table, column, and cell styles, written as tables are.
     styles: String,
+    /// Each colored cell style used, by whether it's a heading cell and
+    /// its color, and its style's name.
+    cells: BTreeMap<(bool, Color), String>,
     tables: usize,
     deepest_quote: usize,
     /// Whether the text written next starts a line, where a space would
@@ -272,6 +275,30 @@ struct Writer<'a> {
 }
 
 impl Writer<'_> {
+    /// A cell's style: the plain or heading cell's, or one of its own
+    /// with its color.
+    fn cell_style(&mut self, cell: &Cell) -> String {
+        let base = if cell.header { "HeadingCell" } else { "Cell" };
+        let Some(color) = cell.background else {
+            return base.to_owned();
+        };
+        let count = self.cells.len();
+        let styles = &mut self.styles;
+        self.cells
+            .entry((cell.header, color))
+            .or_insert_with(|| {
+                let name = format!("{base}{}", count + 1);
+                let _ = write!(
+                    styles,
+                    "<style:style style:name=\"{name}\" style:family=\"table-cell\">\
+                     <style:table-cell-properties fo:background-color=\"{}\" fo:padding=\"4pt\" fo:border=\"0.75pt solid #c4c7c5\"/></style:style>",
+                    color.css()
+                );
+                name
+            })
+            .clone()
+    }
+
     fn blocks(&mut self, blocks: &[Block], context: &Context) {
         for block in blocks {
             self.block(block, context);
@@ -636,7 +663,7 @@ impl Writer<'_> {
             for slot in row {
                 match slot {
                     Slot::Cell { cell, span, rows } => {
-                        let style = if cell.header { "HeadingCell" } else { "Cell" };
+                        let style = self.cell_style(cell);
                         let _ = write!(
                             self.out,
                             "<table:table-cell table:style-name=\"{style}\" office:value-type=\"string\""
@@ -948,6 +975,24 @@ mod tests {
         );
         assert!(content.contains("<svg:desc>Dot</svg:desc>"), "{content}");
         assert!(part(&file, "META-INF/manifest.xml").contains(&path));
+    }
+
+    #[test]
+    fn writes_cell_colors() {
+        let file = write(
+            &crate::html::tests::colored_cells(),
+            None,
+            "Cells",
+            &Pictures::new(),
+        );
+        let content = part(&file, "content.xml");
+        assert!(content.contains(
+            "<style:style style:name=\"HeadingCell1\" style:family=\"table-cell\">\
+             <style:table-cell-properties fo:background-color=\"#fce5cd\""
+        ));
+        assert!(content.contains("<table:table-cell table:style-name=\"HeadingCell1\""));
+        assert!(content.contains("<table:table-cell table:style-name=\"HeadingCell\""));
+        assert!(content.contains("<table:table-cell table:style-name=\"Cell2\""));
     }
 
     #[test]

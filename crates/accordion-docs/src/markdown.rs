@@ -200,8 +200,8 @@ fn prefix_lines(out: &mut String, text: &str, first: &str, rest: &str) {
     }
 }
 
-/// Whether a table fits Markdown's: no merged cells, and only text in each
-/// cell.
+/// Whether a table fits Markdown's: no merged or colored cells, and only
+/// text in each cell.
 fn is_plain_table(rows: &[Vec<Cell>]) -> bool {
     let columns = rows.first().map_or(0, Vec::len);
     columns > 0
@@ -210,6 +210,7 @@ fn is_plain_table(rows: &[Vec<Cell>]) -> bool {
                 && row.iter().all(|cell| {
                     cell.colspan == 1
                         && cell.rowspan == 1
+                        && cell.background.is_none()
                         && cell
                             .content
                             .iter()
@@ -607,6 +608,7 @@ mod tests {
             colspan,
             rowspan: 1,
             colwidth: None,
+            background: None,
             content: vec![paragraph(vec![text(text_)])],
         };
         let plain = Block::Table(vec![
@@ -624,6 +626,13 @@ mod tests {
         let written = write(&[merged], &Pictures::new());
         assert!(written.starts_with("<table>"), "{written}");
         assert!(written.contains("colspan=\"2\""), "{written}");
+    }
+
+    #[test]
+    fn colored_cells_make_an_html_table() {
+        let written = write(&crate::html::tests::colored_cells(), &Pictures::new());
+        assert!(written.starts_with("<table>"), "{written}");
+        assert!(written.contains("background-color:#fce5cd"), "{written}");
     }
 
     #[test]

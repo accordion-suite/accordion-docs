@@ -631,9 +631,16 @@ impl Writer<'_> {
                         if *rows > 1 {
                             self.out.push_str("<w:vMerge w:val=\"restart\"/>");
                         }
-                        if cell.header {
-                            self.out.push_str(
-                                "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F1F3F4\"/>",
+                        // A cell's own color, or a heading cell's gray.
+                        let fill = match cell.background {
+                            Some(color) => Some(color.hex_upper()),
+                            None if cell.header => Some("F1F3F4".to_owned()),
+                            None => None,
+                        };
+                        if let Some(fill) = fill {
+                            let _ = write!(
+                                self.out,
+                                "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{fill}\"/>"
                             );
                         }
                         self.out.push_str("</w:tcPr>");
@@ -881,6 +888,7 @@ mod tests {
                 colspan: 1,
                 rowspan: 1,
                 colwidth: None,
+                background: None,
                 content: vec![Block::Paragraph(
                     Para::default(),
                     vec![Inline::Text("Head".to_owned(), Marks::default())],
@@ -956,6 +964,23 @@ mod tests {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&file[..])).unwrap();
         assert!(zip.by_name("word/media/picture0.png").is_ok());
         assert!(zip.by_name("word/media/picture1.png").is_err());
+    }
+
+    #[test]
+    fn writes_cell_colors() {
+        let file = write(
+            &crate::html::tests::colored_cells(),
+            None,
+            "Cells",
+            &Pictures::new(),
+        );
+        let document = part(&file, "word/document.xml");
+        assert!(document.contains("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"FCE5CD\"/>"));
+        // A heading cell without a color of its own is gray.
+        assert!(document.contains("w:fill=\"F1F3F4\""));
+        assert!(document.contains(
+            "<w:gridSpan w:val=\"2\"/><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"CFE2F3\"/>"
+        ));
     }
 
     #[test]
