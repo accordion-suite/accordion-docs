@@ -19,6 +19,13 @@
 //! | [`Block::Image`] | `image` (`src`, `alt`, `width`) | `<img>` |
 //! | [`Block::PageBreak`] | `page_break` | `<div class="page-break">` |
 //! | [`Inline::Break`] | `hard_break` | `<br>` |
+//! | [`Inline::Footnote`] | `footnote` (its text inside) | `<sup><a data-footnote-ref>` |
+//!
+//! A footnote holds its own text, so it moves, copies, and goes with its
+//! number. Files show the number where the footnote is, and the notes in a
+//! `<section data-footnotes>` at the end of `<main>`, as GitHub writes them.
+//! Footnotes are numbered in the order they come, and only the document's
+//! own text has them, not headers or footers.
 //!
 //! Headers and footers ([`Parts`]) are fragments of their own beside the
 //! document's, `header`, `footer`, `first_header`, and `first_footer`, and
@@ -111,7 +118,7 @@ impl Parts {
     /// nothing for a part with no text or pictures in it.
     pub fn normalized(self) -> Self {
         let part = |blocks: Vec<Block>| {
-            let blocks = normalize_blocks(blocks);
+            let blocks = without_footnotes(normalize_blocks(blocks));
             if blank(&blocks) { Vec::new() } else { blocks }
         };
         let different_first = self.different_first;
@@ -148,6 +155,96 @@ impl Parts {
             ("first_header", &self.first_header),
             ("first_footer", &self.first_footer),
         ]
+    }
+}
+
+/// `blocks` with their footnotes left out, for headers and footers.
+fn without_footnotes(blocks: Vec<Block>) -> Vec<Block> {
+    let inlines = |inlines: Vec<Inline>| {
+        inlines
+            .into_iter()
+            .filter(|inline| !matches!(inline, Inline::Footnote(_)))
+            .collect()
+    };
+    blocks
+        .into_iter()
+        .map(|block| match block {
+            Block::Paragraph(para, runs) => Block::Paragraph(para, inlines(runs)),
+            Block::Heading(level, para, runs) => Block::Heading(level, para, inlines(runs)),
+            Block::Quote(blocks) => Block::Quote(without_footnotes(blocks)),
+            Block::Bullets(style, items) => {
+                Block::Bullets(style, items.into_iter().map(without_footnotes).collect())
+            }
+            Block::Numbers(start, style, items) => Block::Numbers(
+                start,
+                style,
+                items.into_iter().map(without_footnotes).collect(),
+            ),
+            Block::Checks(items) => Block::Checks(
+                items
+                    .into_iter()
+                    .map(|(checked, item)| (checked, without_footnotes(item)))
+                    .collect(),
+            ),
+            Block::Table(rows) => Block::Table(
+                rows.into_iter()
+                    .map(|row| Row {
+                        cells: row
+                            .cells
+                            .into_iter()
+                            .map(|cell| Cell {
+                                content: without_footnotes(cell.content),
+                                ..cell
+                            })
+                            .collect(),
+                        ..row
+                    })
+                    .collect(),
+            ),
+            other => other,
+        })
+        .collect()
+}
+
+/// Each footnote's text in `blocks`, in the order they're numbered.
+pub fn footnotes(blocks: &[Block]) -> Vec<&[Inline]> {
+    let mut out = Vec::new();
+    for_inlines(blocks, &mut |inlines| {
+        for inline in inlines {
+            if let Inline::Footnote(text) = inline {
+                out.push(text.as_slice());
+            }
+        }
+    });
+    out
+}
+
+/// Calls `visit` with each paragraph's and heading's text in `blocks`, in
+/// order.
+fn for_inlines<'a>(blocks: &'a [Block], visit: &mut dyn FnMut(&'a [Inline])) {
+    for block in blocks {
+        match block {
+            Block::Paragraph(_, inlines) | Block::Heading(_, _, inlines) => visit(inlines),
+            Block::Quote(blocks) => for_inlines(blocks, visit),
+            Block::Bullets(_, items) | Block::Numbers(_, _, items) => {
+                for item in items {
+                    for_inlines(item, visit);
+                }
+            }
+            Block::Checks(items) => {
+                for (_, item) in items {
+                    for_inlines(item, visit);
+                }
+            }
+            Block::Table(rows) => {
+                for row in rows {
+                    for cell in &row.cells {
+                        for_inlines(&cell.content, visit);
+                    }
+                }
+            }
+            Block::Code(_) | Block::Rule(_) | Block::Image(_) | Block::PageBreak => {}
+        }
     }
 }
 
@@ -195,6 +292,9 @@ pub enum Inline {
     Text(String, Marks),
     /// A line break inside a paragraph.
     Break,
+    /// A footnote: its number where it stands, and its text, which has no
+    /// footnotes of its own, at the bottom of the page.
+    Footnote(Vec<Inline>),
 }
 
 /// How a paragraph's lines line up.
@@ -502,9 +602,13 @@ pub fn any_block_color(blocks: &[Block]) -> bool {
 /// Whether any run of text in `blocks` has marks that `test` picks.
 pub fn any_marks(blocks: &[Block], test: &dyn Fn(&Marks) -> bool) -> bool {
     let inlines = |inlines: &[Inline]| {
-        inlines
-            .iter()
-            .any(|inline| matches!(inline, Inline::Text(_, marks) if test(marks)))
+        inlines.iter().any(|inline| match inline {
+            Inline::Text(_, marks) => test(marks),
+            Inline::Footnote(text) => text
+                .iter()
+                .any(|inline| matches!(inline, Inline::Text(_, marks) if test(marks))),
+            Inline::Break => false,
+        })
     };
     blocks.iter().any(|block| match block {
         Block::Paragraph(_, runs) | Block::Heading(_, _, runs) => inlines(runs),
@@ -894,9 +998,30 @@ pub fn normalize_inlines(inlines: Vec<Inline>) -> Vec<Inline> {
                 }
             }
             Inline::Break => out.push(Inline::Break),
+            Inline::Footnote(text) => out.push(Inline::Footnote(footnote_text(text))),
         }
     }
     out
+}
+
+/// A footnote's text as the editor keeps it: text and line breaks, with no
+/// footnotes or page numbers in it.
+fn footnote_text(text: Vec<Inline>) -> Vec<Inline> {
+    normalize_inlines(
+        text.into_iter()
+            .filter_map(|inline| match inline {
+                Inline::Footnote(_) => None,
+                Inline::Text(text, marks) => Some(Inline::Text(
+                    text,
+                    Marks {
+                        field: None,
+                        ..marks
+                    },
+                )),
+                Inline::Break => Some(Inline::Break),
+            })
+            .collect(),
+    )
 }
 
 /// A link's address if it's one people can follow safely: a web page or an
@@ -945,6 +1070,7 @@ fn plain(inlines: &[Inline]) -> String {
         .map(|inline| match inline {
             Inline::Text(text, _) => text.as_str(),
             Inline::Break => " ",
+            Inline::Footnote(_) => "",
         })
         .collect()
 }
@@ -1008,6 +1134,37 @@ mod tests {
                 Inline::Text("c".into(), bold.clone()),
             ]),
             vec![text("ab"), Inline::Text("c".into(), bold)]
+        );
+    }
+
+    #[test]
+    fn footnotes_hold_only_text() {
+        let note = Inline::Footnote(vec![
+            text("See "),
+            text("page"),
+            Inline::Footnote(vec![text("nested")]),
+            Inline::Text(
+                "#".into(),
+                Marks {
+                    field: Some(Field::PageNumber),
+                    ..Marks::default()
+                },
+            ),
+        ]);
+        let blocks = normalize(vec![Block::Paragraph(
+            Para::default(),
+            vec![text("Claim"), note],
+        )]);
+        assert_eq!(footnotes(&blocks), vec![&[text("See page#")][..]]);
+        // Headers and footers have none.
+        let parts = Parts {
+            header: blocks.clone(),
+            ..Parts::default()
+        }
+        .normalized();
+        assert_eq!(
+            parts.header,
+            vec![Block::Paragraph(Para::default(), vec![text("Claim")])]
         );
     }
 

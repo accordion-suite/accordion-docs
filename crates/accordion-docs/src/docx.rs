@@ -6,7 +6,7 @@
 //! cells and column widths. The page setup becomes the section's paper and
 //! margins. Text is Arial 11 point, as in Google Docs. Headers and footers,
 //! the first page's own too, are Word's, with page numbers and counts as
-//! Word's fields.
+//! Word's fields. Footnotes are Word's, numbered by Word.
 
 use std::fmt::Write as _;
 
@@ -34,10 +34,12 @@ pub fn write(
         pictures,
         media: Vec::new(),
         drawings: 0,
+        notes: Vec::new(),
     };
     let room = office::text_width(&page);
     writer.blocks(blocks, &Context::top(room));
     let body = std::mem::take(&mut writer.out);
+    let notes = std::mem::take(&mut writer.notes);
     // Each header and footer is a part of its own, with Word's name for
     // where it goes.
     let mut margins: Vec<(String, &str, &str, String)> = Vec::new();
@@ -134,7 +136,24 @@ pub fn write(
              Target=\"{name}.xml\"/>"
         );
     }
+    if !notes.is_empty() {
+        extra.push_str(
+            "<Relationship Id=\"rIdFootnotes\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes\" \
+             Target=\"footnotes.xml\"/>",
+        );
+    }
     relations = relations.replace("</Relationships>", &format!("{extra}</Relationships>"));
+    // Word's own separator line and its continuation come first, by the
+    // numbers Word gives them.
+    let footnotes = format!(
+        "{XML}<w:footnotes xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+         <w:footnote w:type=\"separator\" w:id=\"-1\"><w:p><w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>\
+         <w:r><w:separator/></w:r></w:p></w:footnote>\
+         <w:footnote w:type=\"continuationSeparator\" w:id=\"0\"><w:p><w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>\
+         <w:r><w:continuationSeparator/></w:r></w:p></w:footnote>{}</w:footnotes>",
+        notes.concat()
+    );
 
     let core = format!(
         "{XML}<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
@@ -176,6 +195,13 @@ pub fn write(
         })
         .collect();
     content_types = content_types.replace("</Types>", &format!("{overrides}</Types>"));
+    if !notes.is_empty() {
+        content_types = content_types.replace(
+            "</Types>",
+            "<Override PartName=\"/word/footnotes.xml\" \
+             ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml\"/></Types>",
+        );
+    }
     let margin_paths: Vec<(String, String)> = margins
         .iter()
         .map(|(name, _, _, _)| {
@@ -236,6 +262,18 @@ pub fn write(
         });
         parts.push(Part {
             path: relations_path,
+            contents: part_relations.as_bytes(),
+            stored: false,
+        });
+    }
+    if !notes.is_empty() {
+        parts.push(Part {
+            path: "word/footnotes.xml",
+            contents: footnotes.as_bytes(),
+            stored: false,
+        });
+        parts.push(Part {
+            path: "word/_rels/footnotes.xml.rels",
             contents: part_relations.as_bytes(),
             stored: false,
         });
@@ -329,6 +367,8 @@ struct Writer<'a> {
     media: Vec<Picture>,
     /// How many pictures are drawn, for their IDs.
     drawings: usize,
+    /// Each footnote, as Word's `<w:footnote>`, numbered from 1.
+    notes: Vec<String>,
 }
 
 impl Writer<'_> {
@@ -565,7 +605,7 @@ impl Writer<'_> {
         for inline in inlines {
             let marks = match inline {
                 Inline::Text(_, marks) => Some(marks),
-                Inline::Break => None,
+                Inline::Break | Inline::Footnote(_) => None,
             };
             let href = marks.and_then(|marks| marks.link.as_deref());
             if link.is_some() && href != link {
@@ -582,11 +622,32 @@ impl Writer<'_> {
                 Inline::Text(_, marks) if marks.field.is_some() => self.field(marks, context),
                 Inline::Text(text, marks) => self.run(text, marks, context),
                 Inline::Break => self.out.push_str("<w:r><w:br/></w:r>"),
+                Inline::Footnote(text) => self.footnote(text, context),
             }
         }
         if link.is_some() {
             self.out.push_str("</w:hyperlink>");
         }
+    }
+
+    /// A footnote's number here, and its text in the footnotes part.
+    fn footnote(&mut self, text: &[Inline], context: &Context) {
+        let id = self.notes.len() + 1;
+        let _ = write!(
+            self.out,
+            "<w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr><w:footnoteReference w:id=\"{id}\"/></w:r>"
+        );
+        let body = std::mem::take(&mut self.out);
+        let _ = write!(
+            self.out,
+            "<w:footnote w:id=\"{id}\"><w:p><w:pPr><w:pStyle w:val=\"FootnoteText\"/></w:pPr>\
+             <w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr><w:footnoteRef/></w:r>\
+             <w:r><w:t xml:space=\"preserve\"> </w:t></w:r>"
+        );
+        self.runs(text, &Context::top(context.room));
+        self.out.push_str("</w:p></w:footnote>");
+        let note = std::mem::replace(&mut self.out, body);
+        self.notes.push(note);
     }
 
     /// A page number or count, as Word's field, with a number in it until
@@ -969,6 +1030,10 @@ const STYLES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\
 <w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"240\" w:after=\"80\"/><w:outlineLvl w:val=\"4\"/></w:pPr><w:rPr><w:color w:val=\"666666\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Heading6\"><w:name w:val=\"heading 6\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
 <w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"240\" w:after=\"80\"/><w:outlineLvl w:val=\"5\"/></w:pPr><w:rPr><w:i/><w:color w:val=\"666666\"/></w:rPr></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"FootnoteText\"><w:name w:val=\"footnote text\"/><w:basedOn w:val=\"Normal\"/>\
+<w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr><w:rPr><w:sz w:val=\"20\"/><w:szCs w:val=\"20\"/></w:rPr></w:style>\
+<w:style w:type=\"character\" w:styleId=\"FootnoteReference\"><w:name w:val=\"footnote reference\"/>\
+<w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/><w:basedOn w:val=\"Normal\"/><w:qFormat/>\
 <w:pPr><w:pBdr><w:left w:val=\"single\" w:sz=\"18\" w:space=\"8\" w:color=\"DADCE0\"/></w:pBdr></w:pPr><w:rPr><w:color w:val=\"444746\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Code\"><w:name w:val=\"Code\"/><w:basedOn w:val=\"Normal\"/>\
@@ -1001,6 +1066,45 @@ mod tests {
             .read_to_string(&mut text)
             .unwrap();
         text
+    }
+
+    #[test]
+    fn writes_footnotes() {
+        let blocks = crate::html::tests::noted();
+        let file = write(&blocks, &Parts::default(), None, "Notes", &Pictures::new());
+        let document = crate::office::tests::unzip(&file, "word/document.xml");
+        assert!(
+            document.contains("<w:footnoteReference w:id=\"1\"/>")
+                && document.contains("<w:footnoteReference w:id=\"2\"/>"),
+            "{document}"
+        );
+        let notes = crate::office::tests::unzip(&file, "word/footnotes.xml");
+        assert!(
+            notes.contains("<w:footnote w:type=\"separator\" w:id=\"-1\">"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("<w:footnote w:id=\"1\"><w:p><w:pPr><w:pStyle w:val=\"FootnoteText\"/>"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("<w:b/>") && notes.contains(">Two</w:t>"),
+            "{notes}"
+        );
+        let relations = crate::office::tests::unzip(&file, "word/_rels/document.xml.rels");
+        assert!(
+            relations.contains("Target=\"footnotes.xml\""),
+            "{relations}"
+        );
+        let types = crate::office::tests::unzip(&file, "[Content_Types].xml");
+        assert!(types.contains("/word/footnotes.xml"), "{types}");
+        assert!(
+            crate::office::tests::unzip(&file, "word/styles.xml").contains("FootnoteReference")
+        );
+        // A document without footnotes has no footnotes part.
+        let plain = write(&[], &Parts::default(), None, "Plain", &Pictures::new());
+        let types = crate::office::tests::unzip(&plain, "[Content_Types].xml");
+        assert!(!types.contains("footnotes"), "{types}");
     }
 
     #[test]

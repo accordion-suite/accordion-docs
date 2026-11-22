@@ -2,7 +2,7 @@
 //! (decision 30), with the same look as the Word file: Arial 11 point,
 //! the document's paper and margins, and everything the editor has, its
 //! headers and footers too, in the page style, with page numbers and
-//! counts as OpenDocument's fields.
+//! counts as OpenDocument's fields. Footnotes are OpenDocument's.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -336,6 +336,8 @@ struct Writer<'a> {
     /// Whether the text written next starts a line, where a space would
     /// be dropped.
     line_start: bool,
+    /// How many footnotes so far, for their numbers.
+    notes: usize,
 }
 
 impl Writer<'_> {
@@ -642,7 +644,7 @@ impl Writer<'_> {
             let marks = match inline {
                 Inline::Text(text, marks) if !text.is_empty() => Some(marks),
                 Inline::Text(..) => continue,
-                Inline::Break => None,
+                Inline::Break | Inline::Footnote(_) => None,
             };
             let href = marks.and_then(|marks| marks.link.as_deref());
             if link.is_some() && href != link {
@@ -660,11 +662,28 @@ impl Writer<'_> {
             match inline {
                 Inline::Text(text, marks) => self.span(text, marks, context),
                 Inline::Break => self.open("<text:line-break/>"),
+                Inline::Footnote(text) => self.footnote(text, context),
             }
         }
         if link.is_some() {
             self.out.push_str("</text:a>");
         }
+    }
+
+    /// A footnote, with its text, where its number goes.
+    fn footnote(&mut self, text: &[Inline], context: &Context) {
+        self.notes += 1;
+        let number = self.notes;
+        let line_start = self.line_start;
+        let _ = write!(
+            self.out,
+            "<text:note text:id=\"ftn{number}\" text:note-class=\"footnote\">\
+             <text:note-citation>{number}</text:note-citation><text:note-body>"
+        );
+        self.open("<text:p text:style-name=\"Footnote\">");
+        self.runs(text, &Context::top(context.room));
+        self.out.push_str("</text:p></text:note-body></text:note>");
+        self.line_start = line_start;
     }
 
     fn span(&mut self, text: &str, marks: &Marks, context: &Context) {
@@ -876,6 +895,9 @@ const CONTENT_STYLES: &str = "<style:style style:name=\"Cell\" style:family=\"ta
 <style:table-cell-properties fo:background-color=\"#f1f3f4\" fo:padding=\"4pt\" fo:border=\"0.75pt solid #c4c7c5\"/></style:style>\
 <style:style style:name=\"ListText\" style:family=\"paragraph\" style:parent-style-name=\"Standard\">\
 <style:paragraph-properties fo:margin-bottom=\"2pt\"/></style:style>\
+<style:style style:name=\"Footnote\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"extra\">\
+<style:paragraph-properties fo:margin-top=\"0pt\" fo:margin-bottom=\"0pt\" fo:line-height=\"100%\"/>\
+<style:text-properties fo:font-size=\"10pt\"/></style:style>\
 <style:style style:name=\"PageBreak\" style:family=\"paragraph\" style:parent-style-name=\"Standard\">\
 <style:paragraph-properties fo:break-after=\"page\" fo:margin-top=\"0pt\" fo:margin-bottom=\"0pt\" fo:line-height=\"100%\"/>\
 <style:text-properties fo:font-size=\"1pt\"/></style:style>";
@@ -1031,6 +1053,24 @@ mod tests {
 
     fn text(text: &str) -> Inline {
         Inline::Text(text.to_owned(), Marks::default())
+    }
+
+    #[test]
+    fn writes_footnotes() {
+        let blocks = crate::html::tests::noted();
+        let file = write(&blocks, &Parts::default(), None, "Notes", &Pictures::new());
+        let content = part(&file, "content.xml");
+        assert!(
+            content.contains(
+                "Claim<text:note text:id=\"ftn1\" text:note-class=\"footnote\"><text:note-citation>1</text:note-citation>\
+                 <text:note-body><text:p text:style-name=\"Footnote\">See "
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("<text:note-citation>2</text:note-citation><text:note-body><text:p text:style-name=\"Footnote\">Two</text:p>"),
+            "{content}"
+        );
     }
 
     #[test]

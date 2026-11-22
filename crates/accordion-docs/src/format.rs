@@ -223,7 +223,10 @@ mod tests {
                     ],
                 ),
                 Block::Checks(vec![(true, vec![paragraph("Milk")])]),
-            ],
+            ]
+            .into_iter()
+            .chain(html::tests::noted())
+            .collect::<Vec<_>>(),
             &crate::model::Parts::default(),
             Some(&PageSetup::new(PageSize::A4)),
             None,

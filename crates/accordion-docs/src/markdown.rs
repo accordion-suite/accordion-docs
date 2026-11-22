@@ -9,6 +9,7 @@
 //! the `<div>` that Markdown-to-PDF tools break pages at. The page setup,
 //! colors, sizes, fonts, indents, and spacing have no place in Markdown and
 //! are left out, since GitHub drops the styles that would carry them.
+//! Footnotes are GitHub's `[^1]`, with their text at the end of the file.
 
 use crate::html;
 use crate::model::{Align, Block, Image, Inline, Marks, Para, Row, Script};
@@ -16,9 +17,21 @@ use crate::picture::Pictures;
 
 /// `blocks` as a Markdown file, with `pictures` in it.
 pub fn write(blocks: &[Block], pictures: &Pictures) -> String {
-    let mut writer = Writer { pictures };
+    let mut writer = Writer {
+        pictures,
+        notes: html::Notes::default(),
+    };
     let mut out = String::new();
     writer.blocks(&mut out, blocks);
+    for (index, text) in writer.notes.texts.iter().enumerate() {
+        if !out.ends_with("\n\n") {
+            out.push_str(if out.ends_with('\n') { "\n" } else { "\n\n" });
+        }
+        out.push_str(&format!("[^{}]: ", index + 1));
+        // A note has no footnotes of its own.
+        write_inlines(&mut out, text, true, &mut html::Notes::default());
+        out.push('\n');
+    }
     let trimmed = out.trim_end_matches('\n').len();
     out.truncate(trimmed);
     out.push('\n');
@@ -27,6 +40,8 @@ pub fn write(blocks: &[Block], pictures: &Pictures) -> String {
 
 struct Writer<'a> {
     pictures: &'a Pictures,
+    /// The footnotes so far, numbered in order.
+    notes: html::Notes,
 }
 
 impl Writer<'_> {
@@ -54,19 +69,19 @@ impl Writer<'_> {
     fn block(&mut self, out: &mut String, block: &Block, other_marker: bool) {
         match block {
             Block::Paragraph(para, inlines) if para.align != Align::Left => {
-                aligned(out, "p", para, inlines);
+                aligned(out, "p", para, inlines, &mut self.notes);
             }
             Block::Heading(level, para, inlines) if para.align != Align::Left => {
-                aligned(out, &format!("h{level}"), para, inlines);
+                aligned(out, &format!("h{level}"), para, inlines, &mut self.notes);
             }
             Block::PageBreak => out.push_str("<div style=\"page-break-after: always;\"></div>"),
-            Block::Paragraph(_, inlines) => write_inlines(out, inlines, false),
+            Block::Paragraph(_, inlines) => write_inlines(out, inlines, false, &mut self.notes),
             Block::Heading(level, _, inlines) => {
                 for _ in 0..*level {
                     out.push('#');
                 }
                 out.push(' ');
-                write_inlines(out, inlines, true);
+                write_inlines(out, inlines, true, &mut self.notes);
             }
             Block::Quote(blocks) => {
                 let mut inner = String::new();
@@ -110,10 +125,11 @@ impl Writer<'_> {
             }
             Block::Table(rows) => {
                 if is_plain_table(rows) {
-                    write_table(out, rows);
+                    write_table(out, rows, &mut self.notes);
                 } else {
                     out.push_str(&without_blank_lines(
-                        html::fragment(std::slice::from_ref(block), self.pictures).trim_end(),
+                        html::fragment(std::slice::from_ref(block), self.pictures, &mut self.notes)
+                            .trim_end(),
                     ));
                 }
             }
@@ -173,9 +189,9 @@ impl Writer<'_> {
 /// A paragraph with nothing in it, which Markdown has no way to keep.
 /// A centered, right-aligned, or justified paragraph or heading, as HTML
 /// with the `align` that GitHub keeps.
-fn aligned(out: &mut String, tag: &str, para: &Para, inlines: &[Inline]) {
+fn aligned(out: &mut String, tag: &str, para: &Para, inlines: &[Inline], notes: &mut html::Notes) {
     out.push_str(&format!("<{tag} align=\"{}\">", para.align.name()));
-    out.push_str(&html::inline_fragment(inlines));
+    out.push_str(&html::inline_fragment(inlines, notes));
     out.push_str(&format!("</{tag}>"));
 }
 
@@ -221,7 +237,7 @@ fn is_plain_table(rows: &[Row]) -> bool {
 
 /// A table as Markdown's: the first row is its heading, and each cell's
 /// paragraphs are joined by line breaks.
-fn write_table(out: &mut String, rows: &[Row]) {
+fn write_table(out: &mut String, rows: &[Row], notes: &mut html::Notes) {
     for (index, row) in rows.iter().enumerate() {
         if index > 0 {
             out.push('\n');
@@ -234,7 +250,7 @@ fn write_table(out: &mut String, rows: &[Row]) {
                     text.push_str("<br>");
                 }
                 if let Block::Paragraph(_, inlines) | Block::Heading(_, _, inlines) = block {
-                    write_inlines(&mut text, inlines, true);
+                    write_inlines(&mut text, inlines, true, notes);
                 }
             }
             out.push(' ');
@@ -347,7 +363,7 @@ fn link_target(href: &str) -> String {
 /// Spaces at a run's edges go outside its marks, since Markdown doesn't
 /// read `** bold**` as bold. `one_line` turns line breaks into spaces, for
 /// headings and table cells.
-fn write_inlines(out: &mut String, inlines: &[Inline], one_line: bool) {
+fn write_inlines(out: &mut String, inlines: &[Inline], one_line: bool, notes: &mut html::Notes) {
     let mut open: Vec<Mark> = Vec::new();
     let mut link: Option<String> = None;
     // Spaces held back until it's known whether marks close before them.
@@ -359,6 +375,14 @@ fn write_inlines(out: &mut String, inlines: &[Inline], one_line: bool) {
             Inline::Text(_, marks) if marks.field.is_some() => continue,
             Inline::Text(text, marks) if !text.is_empty() => (text.as_str(), marks.clone()),
             Inline::Text(..) => continue,
+            Inline::Footnote(text) => {
+                close_marks(out, &mut open, link.as_deref(), 0);
+                out.push_str(&pending);
+                pending.clear();
+                out.push_str(&format!("[^{}]", notes.add(text)));
+                line_start = false;
+                continue;
+            }
             Inline::Break => {
                 close_marks(out, &mut open, link.as_deref(), 0);
                 out.push_str(&pending);
@@ -637,6 +661,15 @@ mod tests {
         let written = write(&crate::html::tests::colored_cells(), &Pictures::new());
         assert!(written.starts_with("<table>"), "{written}");
         assert!(written.contains("background-color:#fce5cd"), "{written}");
+    }
+
+    #[test]
+    fn footnotes_are_githubs() {
+        let markdown = write(&crate::html::tests::noted(), &Pictures::new());
+        assert_eq!(
+            markdown,
+            "Claim[^1] and more[^2]\n\n[^1]: See **page 4** Second line\n\n[^2]: Two\n"
+        );
     }
 
     #[test]

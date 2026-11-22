@@ -5,7 +5,8 @@
 //! element named after its editor node, with the node's attributes as the
 //! element's. A run of text is an XML text whose formatting attributes are
 //! its marks, each a map of the mark's attributes, such as `{}` for bold and
-//! `{href}` for a link. A line break is a `hard_break` element.
+//! `{href}` for a link. A line break is a `hard_break` element, and a
+//! footnote a `footnote` element with its text inside, as a paragraph has.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -243,6 +244,7 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
                 .map(|inline| match inline {
                     Inline::Text(text, _) => text,
                     Inline::Break => "\n".to_owned(),
+                    Inline::Footnote(_) => String::new(),
                 })
                 .collect(),
         ),
@@ -386,6 +388,9 @@ fn read_inlines<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Vec<Inline> {
             }
             XmlOut::Element(inline) if inline.tag().as_ref() == "hard_break" => {
                 inlines.push(Inline::Break);
+            }
+            XmlOut::Element(inline) if inline.tag().as_ref() == "footnote" => {
+                inlines.push(Inline::Footnote(read_inlines(txn, &inline)));
             }
             _ => {}
         }
@@ -738,6 +743,12 @@ fn insert_inlines(txn: &mut TransactionMut, element: &XmlElementRef, inlines: &[
             }
             Inline::Break => {
                 element.insert(txn, index, XmlElementPrelim::empty("hard_break"));
+                index += 1;
+                run = None;
+            }
+            Inline::Footnote(text) => {
+                let note = element.insert(txn, index, XmlElementPrelim::empty("footnote"));
+                insert_inlines(txn, &note, text);
                 index += 1;
                 run = None;
             }

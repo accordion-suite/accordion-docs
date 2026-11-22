@@ -1,6 +1,6 @@
 # Accordion Docs
 
-Docs for Accordion: documents edited together, live, as in Google Docs. Each document is an HTML file in Drive that any browser opens. It has fonts, colors, headings, lists, checklists, tables, pictures, and page breaks, prints on the paper size you choose, and downloads as a web page, Word, OpenDocument, or Markdown file. Opening Word files, comments, version history, and templates are planned.
+Docs for Accordion: documents edited together, live, as in Google Docs. Each document is an HTML file in Drive that any browser opens. It has fonts, colors, headings, lists, checklists, tables, pictures, page breaks, headers, footers, page numbers, and footnotes, prints on the paper size you choose, and downloads as a web page, Word, OpenDocument, or Markdown file. Opening Word files, comments, version history, and templates are planned.
 
 This repo is part of [Accordion](https://github.com/accordion-suite/accordion), a self-hosted, zero-telemetry replacement for Google Workspace. Please open issues in the [main repo](https://github.com/accordion-suite/accordion/issues).
 
@@ -14,16 +14,16 @@ Each document is an HTML file in its owner's Docs place, which Drive shows as a 
 - **It carries its own co-editing state** in a data block, `<script type="application/x-accordion-docs">`, which browsers neither run nor show. A document copied, synced, or restored from a backup still opens in Docs with its edits.
 - **Docs knows a document by how it starts:** `<!DOCTYPE html>` then `<html data-accordion-docs="1"`. Other HTML files stay web pages.
 - **The server writes the body from the schema** in `src/model.rs`, so only its elements and attributes reach the file: never a script or an event handler. Styles reach it only as the schema writes them, from values `src/style.rs` checks first, such as a color of six hex digits. HTML from other programs, such as what's pasted from Google Docs or Word, is read through the same schema.
-- **Page setup is part of the document:** the paper size, orientation, and margins are on the file's `<main>` element and in its `@page` style.
+- **Page setup is part of the document:** the paper size, orientation, and margins are on the file's `<main>` element and in its `@page` style. Headers and footers are `<header data-part>` and `<footer data-part>` in `<main>`.
+- **Footnotes are in the text they belong to:** in the editor and in Yjs, a footnote holds its note, so it moves and copies with its number. The file shows each number as a link, and the notes in a `<section data-footnotes>` at the end of `<main>`, as GitHub writes them, and reads GitHub's footnotes the same way.
 - **Pictures are in the file,** as `data:` addresses, so the file stays whole on its own. The server shrinks each picture people add to 2,560 pixels on its longer side, in the sandbox, and leaves out its metadata. While documents are open, Docs keeps pictures in its `docs_images` table by their SHA-256 hash (`src/images.rs`).
 - **Editing together** uses core's co-editing service ([decision 30](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0030-documents-and-co-editing.md)). The document is the Yjs XML fragment that y-prosemirror binds the editor to, laid out the way y-prosemirror lays it out (`src/yjs.rs`), with page setup in a Yjs map beside it. When the file changes outside Docs, only the blocks that differ change, so people typing elsewhere keep their typing.
-- **Downloads are written straight from the schema** (`src/docx.rs`, `src/odt.rs`, and `src/markdown.rs`), with the document's paper and margins, so they don't need LibreOffice. PDF comes from the browser, which prints the print page.
+- **Downloads are written straight from the schema** (`src/docx.rs`, `src/odt.rs`, and `src/markdown.rs`), with the document's paper and margins, so they don't need LibreOffice. Footnotes are each format's own. PDF comes from the browser, which prints the editor's own pages.
 
 | Path | What it's for | How it signs in |
 |---|---|---|
 | `/api/docs/` | The JSON API, described in `src/api.rs`: listing, making, opening, and copying documents | Session cookie or bearer token |
 | `/api/docs/documents/{id}/live` | A WebSocket for editing a document together, with Yjs's sync and awareness messages | Session cookie or bearer token, and a matching `Origin` from a browser |
-| `/api/docs/documents/{id}/print` | The document as a page to print or save as PDF, with everyone's latest edits, and a security policy that allows no scripts | Session cookie or bearer token |
 | `/api/docs/documents/{id}/download?as=` | The document as `html`, `docx`, `odt`, or `md` | Session cookie or bearer token |
 | `/api/docs/documents/{id}/images` | Adding a picture, up to 40 MB, for editors | Session cookie or bearer token |
 

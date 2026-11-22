@@ -13,6 +13,7 @@
 //! tabs in it, which is how other programs lay out their HTML, has its
 //! whitespace folded, as a browser shows it.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use scraper::{Html, Node};
@@ -78,6 +79,9 @@ ul.checklist{list-style:none;padding-left:4px}\
 ul.checklist>li>input{float:left;margin:6px 8px 0 0}\
 ul.checklist>li[data-checked=true]>p{text-decoration:line-through;color:#5f6368}\
 header[data-part]{margin-bottom:18pt}footer[data-part]{margin-top:18pt}\
+a[data-footnote-ref]{text-decoration:none;color:inherit}\
+section[data-footnotes]{margin-top:18pt;padding-top:6pt;border-top:1px solid #c4c7c5;font-size:10pt}\
+section[data-footnotes]>ol{margin:0;padding-left:2em}section[data-footnotes] p{margin:0}\
 main[data-first-page=different]>header[data-part=header],footer[data-part=first-footer]{display:none}\
 @media (max-width:860px){main{margin:0;padding:24px 16px;box-shadow:none}}\
 @media print{body{background:none}main{max-width:none;margin:0;padding:0;box-shadow:none}}";
@@ -86,7 +90,7 @@ main[data-first-page=different]>header[data-part=header],footer[data-part=first-
 /// highlights stays as it was written, dark on white, so its colors still
 /// read.
 const DARK_STYLE: &str = "@media screen and (prefers-color-scheme:dark){body{background:#131314;color:#e3e3e3}\
-main{background:#1f1f1f}pre,th{background:#2d2f31}td,th,hr{border-color:#444746}h3{color:#c4c7c5}\
+main{background:#1f1f1f}pre,th{background:#2d2f31}td,th,hr,section[data-footnotes]{border-color:#444746}h3{color:#c4c7c5}\
 h4,h5,h6,p.subtitle{color:#9aa0a6}\
 blockquote{border-color:#444746;color:#c4c7c5}}";
 
@@ -172,12 +176,15 @@ fn write_page(
             return;
         }
         let _ = writeln!(out, "<{tag} data-part=\"{}\">", name.replace('_', "-"));
-        write_blocks(out, blocks, pictures);
+        // Headers and footers have no footnotes.
+        write_blocks(out, blocks, pictures, &mut Notes::default());
         let _ = writeln!(out, "</{tag}>");
     };
     part(&mut out, "header", "first_header", &parts.first_header);
     part(&mut out, "header", "header", &parts.header);
-    write_blocks(&mut out, blocks, pictures);
+    let mut notes = Notes::default();
+    write_blocks(&mut out, blocks, pictures, &mut notes);
+    notes.write_section(&mut out);
     part(&mut out, "footer", "footer", &parts.footer);
     part(&mut out, "footer", "first_footer", &parts.first_footer);
     out.push_str("</main>\n");
@@ -229,15 +236,45 @@ pub fn state_in(contents: &[u8]) -> Option<Vec<u8>> {
 
 /// `blocks` as HTML on their own, without a page around them, as Markdown
 /// carries what it has no syntax for.
-pub fn fragment(blocks: &[Block], pictures: &Pictures) -> String {
+pub(crate) fn fragment(blocks: &[Block], pictures: &Pictures, notes: &mut Notes) -> String {
     let mut out = String::new();
-    write_blocks(&mut out, blocks, pictures);
+    write_blocks(&mut out, blocks, pictures, notes);
     out
 }
 
-fn write_blocks(out: &mut String, blocks: &[Block], pictures: &Pictures) {
+/// The footnotes written so far, each one's text in the order they're
+/// numbered.
+#[derive(Default)]
+pub(crate) struct Notes {
+    pub(crate) texts: Vec<Vec<Inline>>,
+}
+
+impl Notes {
+    /// Takes in a footnote's text, and returns its number.
+    pub(crate) fn add(&mut self, text: &[Inline]) -> usize {
+        self.texts.push(text.to_vec());
+        self.texts.len()
+    }
+
+    /// The notes at the end of the text, as GitHub writes them, so pages
+    /// that know its footnotes read them as footnotes too.
+    fn write_section(&self, out: &mut String) {
+        if self.texts.is_empty() {
+            return;
+        }
+        out.push_str("<section class=\"footnotes\" data-footnotes>\n<ol>\n");
+        for (index, text) in self.texts.iter().enumerate() {
+            let _ = write!(out, "<li id=\"fn-{}\"><p>", index + 1);
+            write_inlines(out, text, &mut Notes::default());
+            out.push_str("</p></li>\n");
+        }
+        out.push_str("</ol>\n</section>\n");
+    }
+}
+
+fn write_blocks(out: &mut String, blocks: &[Block], pictures: &Pictures, notes: &mut Notes) {
     for block in blocks {
-        write_block(out, block, pictures);
+        write_block(out, block, pictures, notes);
     }
 }
 
@@ -319,22 +356,22 @@ fn open_list(out: &mut String, tag: &str, style: Option<ListStyle>, start: Optio
     out.push_str(">\n");
 }
 
-fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
+fn write_block(out: &mut String, block: &Block, pictures: &Pictures, notes: &mut Notes) {
     match block {
         Block::Paragraph(para, inlines) => {
             open_para(out, "p", para);
-            write_inlines(out, inlines);
+            write_inlines(out, inlines, notes);
             out.push_str("</p>\n");
         }
         Block::Heading(level, para, inlines) => {
             open_para(out, &format!("h{level}"), para);
-            write_inlines(out, inlines);
+            write_inlines(out, inlines, notes);
             let _ = writeln!(out, "</h{level}>");
         }
         Block::PageBreak => out.push_str("<div class=\"page-break\"></div>\n"),
         Block::Quote(blocks) => {
             out.push_str("<blockquote>\n");
-            write_blocks(out, blocks, pictures);
+            write_blocks(out, blocks, pictures, notes);
             out.push_str("</blockquote>\n");
         }
         Block::Code(text) => {
@@ -352,7 +389,7 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
             open_list(out, "ul", *style, None);
             for blocks in items {
                 out.push_str("<li>\n");
-                write_blocks(out, blocks, pictures);
+                write_blocks(out, blocks, pictures, notes);
                 out.push_str("</li>\n");
             }
             out.push_str("</ul>\n");
@@ -361,7 +398,7 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
             open_list(out, "ol", *style, Some(*start));
             for blocks in items {
                 out.push_str("<li>\n");
-                write_blocks(out, blocks, pictures);
+                write_blocks(out, blocks, pictures, notes);
                 out.push_str("</li>\n");
             }
             out.push_str("</ol>\n");
@@ -376,7 +413,7 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
                 } else {
                     out.push_str("<li data-checked=\"false\"><input type=\"checkbox\" disabled>\n");
                 }
-                write_blocks(out, blocks, pictures);
+                write_blocks(out, blocks, pictures, notes);
                 out.push_str("</li>\n");
             }
             out.push_str("</ul>\n");
@@ -412,7 +449,7 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
                         let _ = write!(out, " style=\"{css}\"");
                     }
                     out.push_str(">\n");
-                    write_blocks(out, &cell.content, pictures);
+                    write_blocks(out, &cell.content, pictures, notes);
                     let _ = writeln!(out, "</{tag}>");
                 }
                 out.push_str("</tr>\n");
@@ -581,14 +618,14 @@ impl Tag {
 }
 
 /// Text with its marks as HTML, without a block around it.
-pub(crate) fn inline_fragment(inlines: &[Inline]) -> String {
+pub(crate) fn inline_fragment(inlines: &[Inline], notes: &mut Notes) -> String {
     let mut out = String::new();
-    write_inlines(&mut out, inlines);
+    write_inlines(&mut out, inlines, notes);
     out
 }
 
 /// Text with its marks, keeping tags open across runs that share them.
-fn write_inlines(out: &mut String, inlines: &[Inline]) {
+fn write_inlines(out: &mut String, inlines: &[Inline], notes: &mut Notes) {
     let mut open: Vec<Tag> = Vec::new();
     for inline in inlines {
         match inline {
@@ -609,6 +646,18 @@ fn write_inlines(out: &mut String, inlines: &[Inline]) {
                 out.push_str(&escape_text(text));
             }
             Inline::Break => out.push_str("<br>"),
+            Inline::Footnote(text) => {
+                // A link can't hold the footnote's own link, so marks close
+                // around it.
+                while let Some(tag) = open.pop() {
+                    tag.close(out);
+                }
+                let number = notes.add(text);
+                let _ = write!(
+                    out,
+                    "<sup><a href=\"#fn-{number}\" id=\"fnref-{number}\" data-footnote-ref>{number}</a></sup>"
+                );
+            }
         }
     }
     while let Some(tag) = open.pop() {
@@ -665,11 +714,12 @@ pub fn read_document(contents: &[u8]) -> Document {
         .find(|node| matches!(node.value(), Node::Element(el) if el.name() == "main"));
     let mut blocks = Vec::new();
     let mut pictures = Pictures::new();
+    let notes = note_texts(*root);
     let setup = main.and_then(|main| read_setup(&main));
     let mut parts = Parts::default();
     match main {
         Some(main) => {
-            read_blocks(main, &mut blocks, &mut pictures);
+            read_blocks(main, &mut blocks, &mut pictures, &notes);
             parts.different_first = attribute(&main, "data-first-page") == Some("different");
             for child in main.children() {
                 let Some(name) = part_name(&child) else {
@@ -682,10 +732,10 @@ pub fn read_document(contents: &[u8]) -> Document {
                     "first-footer" => &mut parts.first_footer,
                     _ => continue,
                 };
-                read_blocks(child, part, &mut pictures);
+                read_blocks(child, part, &mut pictures, &notes);
             }
         }
-        None => read_blocks(*root, &mut blocks, &mut pictures),
+        None => read_blocks(*root, &mut blocks, &mut pictures, &notes),
     }
     let blocks = model::normalize(blocks);
     let parts = parts.normalized();
@@ -761,13 +811,14 @@ enum Run {
         folded: bool,
     },
     Break,
+    Note(Vec<Inline>),
 }
 
 impl Runs {
     fn is_blank(&self) -> bool {
         self.runs.iter().all(|run| match run {
             Run::Text { text, folded, .. } => *folded && text.trim().is_empty(),
-            Run::Break => false,
+            Run::Break | Run::Note(_) => false,
         })
     }
 
@@ -808,10 +859,72 @@ impl Runs {
                 .map(|run| match run {
                     Run::Text { text, marks, .. } => Inline::Text(text, marks),
                     Run::Break => Inline::Break,
+                    Run::Note(text) => Inline::Footnote(text),
                 })
                 .collect(),
         )
     }
+}
+
+/// Footnotes' text, by the `id` their numbers link to.
+type NoteTexts = HashMap<String, Vec<Inline>>;
+
+/// Whether `node` is the notes at the end of a page, as Docs and GitHub
+/// write them.
+fn is_notes(node: &NodeRef) -> bool {
+    attribute(node, "data-footnotes").is_some()
+}
+
+/// The text of each note in a page's notes, by its `id`. Each paragraph in a
+/// note is a line of its own.
+fn note_texts(root: NodeRef) -> NoteTexts {
+    let mut notes = NoteTexts::new();
+    let empty = NoteTexts::new();
+    for section in root.descendants().filter(is_notes) {
+        for item in section.descendants() {
+            if element(&item) != Some("li") {
+                continue;
+            }
+            let Some(id) = attribute(&item, "id") else {
+                continue;
+            };
+            let mut text = Vec::new();
+            let mut runs = Runs::default();
+            for child in item.children() {
+                if matches!(element(&child), Some("p" | "div")) {
+                    let mut line = inlines_of(child, &empty);
+                    // The space before a link back to the number, which
+                    // is left out.
+                    if let Some(Inline::Text(last, _)) = line.last_mut() {
+                        last.truncate(last.trim_end().len());
+                    }
+                    line = model::normalize_inlines(line);
+                    if !text.is_empty() && !line.is_empty() {
+                        text.push(Inline::Break);
+                    }
+                    text.extend(line);
+                } else {
+                    read_inline(child, &Marks::default(), &mut runs, &empty);
+                }
+            }
+            let loose = runs.finish();
+            if !text.is_empty() && !loose.is_empty() {
+                text.push(Inline::Break);
+            }
+            text.extend(loose);
+            notes.entry(id.to_owned()).or_insert(text);
+        }
+    }
+    notes
+}
+
+/// The note a footnote's number links to: its own `href`, or a link's
+/// inside it.
+fn note_of<'a>(node: NodeRef, notes: &'a NoteTexts) -> Option<&'a Vec<Inline>> {
+    std::iter::once(node)
+        .chain(node.descendants())
+        .filter_map(|node| attribute(&node, "href"))
+        .find_map(|href| notes.get(href.strip_prefix('#')?))
 }
 
 fn element(node: &NodeRef) -> Option<&'static str> {
@@ -903,7 +1016,7 @@ fn attribute<'a>(node: &NodeRef<'a>, name: &str) -> Option<&'a str> {
 }
 
 /// Reads the children of `parent` as blocks.
-fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
+fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures, notes: &NoteTexts) {
     let mut runs = Runs::default();
     let flush = |runs: &mut Runs, out: &mut Vec<Block>| {
         let taken = std::mem::take(runs);
@@ -917,7 +1030,7 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
                 add_text(&mut runs, &text[..], &Marks::default());
                 continue;
             }
-            Node::Element(_) if part_name(&child).is_some() => continue,
+            Node::Element(_) if part_name(&child).is_some() || is_notes(&child) => continue,
             Node::Element(_) => element(&child).unwrap_or("other"),
             _ => continue,
         };
@@ -937,7 +1050,7 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
         match name {
             "p" => {
                 flush(&mut runs, out);
-                let inlines = inlines_of(child);
+                let inlines = inlines_of(child, notes);
                 // Google Docs' line is a picture in a paragraph of its own,
                 // which becomes the line alone.
                 if !(inlines.is_empty() && has_line(child)) {
@@ -948,7 +1061,7 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 flush(&mut runs, out);
                 let level = name[1..].parse().unwrap_or(1);
-                let inlines = inlines_of(child);
+                let inlines = inlines_of(child, notes);
                 if !(inlines.is_empty() && has_line(child)) {
                     out.push(Block::Heading(level, para_of(&child), inlines));
                 }
@@ -967,7 +1080,7 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
             "blockquote" => {
                 flush(&mut runs, out);
                 let mut blocks = Vec::new();
-                read_blocks(child, &mut blocks, pictures);
+                read_blocks(child, &mut blocks, pictures, notes);
                 out.push(Block::Quote(blocks));
             }
             "pre" => {
@@ -980,11 +1093,11 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
             }
             "ul" | "ol" => {
                 flush(&mut runs, out);
-                out.push(list(child, name == "ol", pictures));
+                out.push(list(child, name == "ol", pictures, notes));
             }
             "table" => {
                 flush(&mut runs, out);
-                out.push(table(child, pictures));
+                out.push(table(child, pictures, notes));
             }
             "br" => runs.runs.push(Run::Break),
             "div" | "section" | "article" | "main" | "header" | "footer" | "nav" | "aside"
@@ -992,16 +1105,16 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
             | "details" | "summary" | "address" | "dl" | "dd" | "dt" | "li" | "thead" | "tbody"
             | "tfoot" | "tr" | "td" | "th" | "caption" => {
                 flush(&mut runs, out);
-                read_blocks(child, out, pictures);
+                read_blocks(child, out, pictures, notes);
             }
             "colgroup" | "col" => {}
             // Text elements around blocks, as Google Docs wraps what it
             // copies in a <b>, are read as a <div> would be.
             _ if holds_blocks(&child) => {
                 flush(&mut runs, out);
-                read_blocks(child, out, pictures);
+                read_blocks(child, out, pictures, notes);
             }
-            _ => read_inline(child, &Marks::default(), &mut runs),
+            _ => read_inline(child, &Marks::default(), &mut runs, notes),
         }
         if break_after {
             flush(&mut runs, out);
@@ -1289,12 +1402,12 @@ fn border_of(value: &str) -> (Option<model::Twips>, Option<Color>) {
 
 /// The inline contents of a paragraph or heading, with the text styles
 /// the block itself sets, as Word's web pages often do.
-fn inlines_of(node: NodeRef) -> Vec<Inline> {
+fn inlines_of(node: NodeRef, notes: &NoteTexts) -> Vec<Inline> {
     let mut runs = Runs::default();
     let mut marks = Marks::default();
     apply_style(&node, &mut marks, true);
     for child in node.children() {
-        read_inline(child, &marks, &mut runs);
+        read_inline(child, &marks, &mut runs, notes);
     }
     runs.finish()
 }
@@ -1416,7 +1529,7 @@ fn fold(text: &str) -> String {
     out
 }
 
-fn read_inline(node: NodeRef, marks: &Marks, runs: &mut Runs) {
+fn read_inline(node: NodeRef, marks: &Marks, runs: &mut Runs, notes: &NoteTexts) {
     let name = match node.value() {
         Node::Text(text) => {
             add_text(runs, &text[..], marks);
@@ -1425,7 +1538,13 @@ fn read_inline(node: NodeRef, marks: &Marks, runs: &mut Runs) {
         Node::Element(_) => element(&node).unwrap_or("other"),
         _ => return,
     };
-    if SKIPPED.contains(&name) {
+    if SKIPPED.contains(&name) || attribute(&node, "data-footnote-backref").is_some() {
+        return;
+    }
+    if attribute(&node, "data-footnote-ref").is_some() {
+        if let Some(text) = note_of(node, notes) {
+            runs.runs.push(Run::Note(text.clone()));
+        }
         return;
     }
     let mut marks = marks.clone();
@@ -1454,7 +1573,7 @@ fn read_inline(node: NodeRef, marks: &Marks, runs: &mut Runs) {
     }
     apply_style(&node, &mut marks, false);
     for child in node.children() {
-        read_inline(child, &marks, runs);
+        read_inline(child, &marks, runs, notes);
     }
 }
 
@@ -1471,7 +1590,7 @@ fn text_of(node: NodeRef) -> String {
     out
 }
 
-fn list(node: NodeRef, numbered: bool, pictures: &mut Pictures) -> Block {
+fn list(node: NodeRef, numbered: bool, pictures: &mut Pictures, notes: &NoteTexts) -> Block {
     let checklist = attribute(&node, "class")
         .is_some_and(|class| class.split_ascii_whitespace().any(|c| c == "checklist"))
         || attribute(&node, "data-type") == Some("checklist")
@@ -1483,13 +1602,13 @@ fn list(node: NodeRef, numbered: bool, pictures: &mut Pictures) -> Block {
         match element(&child) {
             Some("li") => {
                 let mut blocks = Vec::new();
-                read_blocks(child, &mut blocks, pictures);
+                read_blocks(child, &mut blocks, pictures, notes);
                 items.push((is_checked(&child), blocks));
             }
             // A list right inside a list, which some programs write, goes
             // with the item before it.
             Some("ul" | "ol") => {
-                let nested = list(child, element(&child) == Some("ol"), pictures);
+                let nested = list(child, element(&child) == Some("ol"), pictures, notes);
                 match items.last_mut() {
                     Some((_, blocks)) => blocks.push(nested),
                     None => items.push((false, vec![nested])),
@@ -1528,7 +1647,7 @@ fn is_checked(item: &NodeRef) -> bool {
             .any(|child| element(&child) == Some("input") && attribute(&child, "checked").is_some())
 }
 
-fn table(node: NodeRef, pictures: &mut Pictures) -> Block {
+fn table(node: NodeRef, pictures: &mut Pictures, notes: &NoteTexts) -> Block {
     // Google Docs and Word name a table without lines `border:none` and
     // leave its cells' borders out.
     let lineless = attribute(&node, "border").is_some_and(|border| border.trim() == "0")
@@ -1539,7 +1658,7 @@ fn table(node: NodeRef, pictures: &mut Pictures) -> Block {
         });
     let mut columns = Vec::new();
     let mut rows = Vec::new();
-    collect_rows(node, &mut rows, &mut columns, lineless, pictures);
+    collect_rows(node, &mut rows, &mut columns, lineless, pictures, notes);
     if columns.iter().any(Option::is_some) {
         widths_from_columns(&mut rows, &columns);
     }
@@ -1575,11 +1694,12 @@ fn collect_rows(
     columns: &mut Vec<Option<u32>>,
     lineless: bool,
     pictures: &mut Pictures,
+    notes: &NoteTexts,
 ) {
     for child in node.children() {
         match element(&child) {
             Some("thead" | "tbody" | "tfoot") => {
-                collect_rows(child, rows, columns, lineless, pictures);
+                collect_rows(child, rows, columns, lineless, pictures, notes);
             }
             // Google Docs gives each column's width in pixels.
             Some("colgroup") => {
@@ -1647,7 +1767,7 @@ fn collect_rows(
                         });
                     let (borders, border_color, padding) = cell_box(&cell, lineless);
                     let mut content = Vec::new();
-                    read_blocks(cell, &mut content, pictures);
+                    read_blocks(cell, &mut content, pictures, notes);
                     cells.push(Cell {
                         header,
                         colspan,
@@ -1964,6 +2084,80 @@ pub(crate) mod tests {
 
     /// Blocks with every part of a paragraph's layout, list styles, and a
     /// page break.
+    /// A paragraph with two footnotes, one with marks and a line break.
+    pub(crate) fn noted() -> Vec<Block> {
+        let bold = Marks {
+            bold: true,
+            ..Marks::default()
+        };
+        vec![Block::Paragraph(
+            Para::default(),
+            vec![
+                text("Claim"),
+                Inline::Footnote(vec![
+                    text("See "),
+                    marked("page 4", bold),
+                    Inline::Break,
+                    text("Second line"),
+                ]),
+                text(" and more"),
+                Inline::Footnote(vec![text("Two")]),
+            ],
+        )]
+    }
+
+    #[test]
+    fn footnotes_survive_the_file() {
+        let file = page(&noted(), &Parts::default(), None, None, &Pictures::new());
+        assert!(
+            file.contains(
+                "Claim<sup><a href=\"#fn-1\" id=\"fnref-1\" data-footnote-ref>1</a></sup> and more"
+            ),
+            "{file}"
+        );
+        assert!(
+            file.contains("<li id=\"fn-2\"><p>Two</p></li>\n</ol>\n</section>\n</main>"),
+            "{file}"
+        );
+        assert_eq!(read(file.as_bytes()), noted());
+    }
+
+    #[test]
+    fn reads_footnotes_as_github_writes_them() {
+        let page = "<p>Claim<sup><a href=\"#user-content-fn-x\" id=\"user-content-fnref-x\" \
+            data-footnote-ref>1</a></sup> and a <sup>2</sup></p>\
+            <section data-footnotes class=\"footnotes\"><h2 id=\"footnote-label\">Footnotes</h2><ol>\
+            <li id=\"user-content-fn-x\"><p>First <em>note</em> \
+            <a href=\"#user-content-fnref-x\" data-footnote-backref>↩</a></p><p>More</p></li></ol></section>";
+        let italic = Marks {
+            italic: true,
+            ..Marks::default()
+        };
+        assert_eq!(
+            read(page.as_bytes()),
+            vec![Block::Paragraph(
+                Para::default(),
+                vec![
+                    text("Claim"),
+                    Inline::Footnote(vec![
+                        text("First "),
+                        marked("note", italic),
+                        Inline::Break,
+                        text("More"),
+                    ]),
+                    text(" and a "),
+                    marked(
+                        "2",
+                        Marks {
+                            script: Some(Script::Super),
+                            ..Marks::default()
+                        }
+                    ),
+                ],
+            )]
+        );
+    }
+
     pub(crate) fn laid_out() -> Vec<Block> {
         vec![
             Block::Paragraph(
