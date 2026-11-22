@@ -18,8 +18,8 @@ use yrs::{
 };
 
 use crate::model::{
-    self, Align, Block, Cell, Image, Inline, Kind, ListStyle, Marks, PageSetup, PageSize, Para,
-    Script,
+    self, Align, Block, Cell, Field, Image, Inline, Kind, ListStyle, Marks, PageSetup, PageSize,
+    Para, Parts, Script,
 };
 use crate::style::{self, Color};
 
@@ -32,6 +32,64 @@ pub const FRAGMENT: &str = "prosemirror";
 pub const PAGE: &str = "page";
 
 const MARGIN_KEYS: [&str; 4] = ["top", "right", "bottom", "left"];
+
+/// The page map's key for whether the first page has a header and footer
+/// of its own.
+const DIFFERENT_FIRST: &str = "different_first";
+
+/// The headers and footers, each in a fragment named as [`Parts::each`]
+/// names it, and whether the first page has its own.
+pub fn read_parts<T: ReadTxn>(txn: &T, page: &MapRef) -> Parts {
+    let part = |name: &str| {
+        txn.get_xml_fragment(name)
+            .map(|fragment| model::normalize_blocks(read_children(txn, &fragment)))
+            .unwrap_or_default()
+    };
+    Parts {
+        header: part("header"),
+        footer: part("footer"),
+        first_header: part("first_header"),
+        first_footer: part("first_footer"),
+        different_first: matches!(
+            page.get(txn, DIFFERENT_FIRST),
+            Some(Out::Any(Any::Bool(true)))
+        ),
+    }
+    .normalized()
+}
+
+/// Makes the document's headers and footers `parts`, changing only the
+/// ones that differ.
+pub fn write_parts(doc: &yrs::Doc, parts: &Parts) {
+    use yrs::Transact as _;
+    let page = doc.get_or_insert_map(PAGE);
+    let fragments = parts
+        .each()
+        .map(|(name, _)| doc.get_or_insert_xml_fragment(name));
+    let mut txn = doc.transact_mut();
+    let have = read_parts(&txn, &page);
+    if have.different_first != parts.different_first {
+        if parts.different_first {
+            page.insert(&mut txn, DIFFERENT_FIRST, true);
+        } else {
+            page.remove(&mut txn, DIFFERENT_FIRST);
+        }
+    }
+    for ((_, wanted), (fragment, (_, had))) in parts
+        .each()
+        .into_iter()
+        .zip(fragments.iter().zip(have.each()))
+    {
+        if wanted == had {
+            continue;
+        }
+        let length = fragment.len(&txn);
+        if length > 0 {
+            fragment.remove_range(&mut txn, 0, length);
+        }
+        insert_blocks(&mut txn, fragment, 0, wanted);
+    }
+}
 
 /// The page setup in `page`, or `None` if nobody has set one.
 pub fn read_page<T: ReadTxn>(txn: &T, page: &MapRef) -> Option<PageSetup> {
@@ -61,7 +119,10 @@ pub fn read_page<T: ReadTxn>(txn: &T, page: &MapRef) -> Option<PageSetup> {
 /// differ.
 pub fn write_page(txn: &mut TransactionMut, page: &MapRef, setup: Option<&PageSetup>) {
     let Some(setup) = setup else {
-        page.clear(txn);
+        // Whether the first page differs stays, as it isn't the paper's.
+        for key in ["size", "orientation"].into_iter().chain(MARGIN_KEYS) {
+            page.remove(txn, key);
+        }
         return;
     };
     // Numbers compare by value, since the editor writes whole ones as
@@ -185,7 +246,10 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
                 })
                 .collect(),
         ),
-        "horizontal_rule" => Block::Rule,
+        "horizontal_rule" => Block::Rule(model::Rule {
+            thickness: float(txn, element, "thickness").and_then(model::twips),
+            color: string(txn, element, "color").and_then(|color| Color::from_hex(&color)),
+        }),
         "image" => {
             let text = |name| match element.get_attribute(txn, name) {
                 Some(Out::Any(Any::String(text))) => text.to_string(),
@@ -227,11 +291,13 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
             element
                 .children(txn)
                 .filter_map(|child| match child {
-                    XmlOut::Element(row) if row.tag().as_ref() == "table_row" => Some(
-                        row.children(txn)
+                    XmlOut::Element(row) if row.tag().as_ref() == "table_row" => Some(model::Row {
+                        height: float(txn, &row, "height").and_then(model::twips),
+                        cells: row
+                            .children(txn)
                             .filter_map(|cell| read_cell(txn, cell))
                             .collect(),
-                    ),
+                    }),
                     _ => None,
                 })
                 .collect(),
@@ -248,6 +314,9 @@ fn items<T: ReadTxn>(txn: &T, list: &XmlElementRef, tag: &str) -> Vec<Vec<Block>
         })
         .collect()
 }
+
+/// A cell's border attributes: top, right, bottom, and left, in points.
+const BORDERS: [&str; 4] = ["border_top", "border_right", "border_bottom", "border_left"];
 
 fn read_cell<T: ReadTxn>(txn: &T, cell: XmlOut) -> Option<Cell> {
     let XmlOut::Element(cell) = cell else {
@@ -273,12 +342,30 @@ fn read_cell<T: ReadTxn>(txn: &T, cell: XmlOut) -> Option<Cell> {
             .collect(),
         _ => None,
     };
+    let length = |name| float(txn, &cell, name).and_then(model::twips);
+    let padding = match cell.get_attribute(txn, "padding") {
+        Some(Out::Any(Any::Array(sides))) if sides.len() == 4 => {
+            let sides: Option<Vec<model::Twips>> = sides
+                .iter()
+                .map(|side| match side {
+                    Any::Number(number) => number.as_f64().and_then(model::twips),
+                    _ => None,
+                })
+                .collect();
+            sides.and_then(|sides| sides.try_into().ok())
+        }
+        _ => None,
+    };
+    let color = |name| string(txn, &cell, name).and_then(|color| Color::from_hex(&color));
     Some(Cell {
         header,
         colspan: span("colspan"),
         rowspan: span("rowspan"),
         colwidth,
-        background: string(txn, &cell, "background").and_then(|color| Color::from_hex(&color)),
+        background: color("background"),
+        borders: BORDERS.map(length),
+        border_color: color("border_color"),
+        padding,
         content: read_children(txn, &cell),
     })
 }
@@ -339,6 +426,7 @@ fn marks(attributes: Option<&Attrs>) -> Marks {
                     _ => None,
                 };
             }
+            "field" => marks.field = attr_text(value, "kind").and_then(Field::from_name),
             "link" => {
                 if let Any::Map(attrs) = value
                     && let Some(Any::String(href)) = attrs.get("href")
@@ -364,7 +452,7 @@ fn attr_text<'a>(value: &'a Any, name: &str) -> Option<&'a str> {
 }
 
 /// The marks y-prosemirror writes, so a run that hasn't one says so.
-const MARK_NAMES: [&str; 12] = [
+const MARK_NAMES: [&str; 13] = [
     "bold",
     "italic",
     "underline",
@@ -377,6 +465,7 @@ const MARK_NAMES: [&str; 12] = [
     "highlight",
     "font_size",
     "font_family",
+    "field",
 ];
 
 /// The formatting attributes for `marks`, as y-prosemirror writes them.
@@ -431,6 +520,9 @@ fn attributes(marks: &Marks) -> Attrs {
             "font_family".into(),
             with("family", Any::from(font.as_str())),
         );
+    }
+    if let Some(field) = marks.field {
+        attrs.insert("field".into(), with("kind", Any::from(field.name())));
     }
     attrs
 }
@@ -525,8 +617,14 @@ fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32
                 run.insert_with_attributes(txn, 0, text, HashMap::new());
             }
         }
-        Block::Rule => {
-            element(txn, parent, index, "horizontal_rule");
+        Block::Rule(rule) => {
+            let el = element(txn, parent, index, "horizontal_rule");
+            if let Some(thickness) = rule.thickness {
+                el.insert_attribute(txn, "thickness", points(thickness));
+            }
+            if let Some(color) = rule.color {
+                el.insert_attribute(txn, "color", Any::from(color.css()));
+            }
         }
         Block::Image(image) => {
             // The editor keeps the hash as the node's `src`, and turns it
@@ -563,9 +661,12 @@ fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32
         }
         Block::Table(rows) => {
             let el = element(txn, parent, index, "table");
-            for (at, cells) in rows.iter().enumerate() {
+            for (at, row_of) in rows.iter().enumerate() {
                 let row = element(txn, &el, at as u32, "table_row");
-                for (at, cell) in cells.iter().enumerate() {
+                if let Some(height) = row_of.height {
+                    row.insert_attribute(txn, "height", points(height));
+                }
+                for (at, cell) in row_of.cells.iter().enumerate() {
                     let tag = if cell.header {
                         "table_header"
                     } else {
@@ -581,6 +682,18 @@ fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32
                     }
                     if let Some(color) = cell.background {
                         cell_el.insert_attribute(txn, "background", Any::from(color.css()));
+                    }
+                    for (name, border) in BORDERS.iter().zip(cell.borders) {
+                        if let Some(border) = border {
+                            cell_el.insert_attribute(txn, *name, points(border));
+                        }
+                    }
+                    if let Some(color) = cell.border_color {
+                        cell_el.insert_attribute(txn, "border_color", Any::from(color.css()));
+                    }
+                    if let Some(padding) = cell.padding {
+                        let sides: Vec<Any> = padding.into_iter().map(points).collect();
+                        cell_el.insert_attribute(txn, "padding", Any::Array(sides.into()));
                     }
                     insert_blocks(txn, &cell_el, 0, &cell.content);
                 }

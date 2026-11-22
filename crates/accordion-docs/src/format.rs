@@ -38,8 +38,10 @@ impl Format for DocFormat {
             blocks: wanted,
             setup,
             pictures,
+            parts,
         } = html::read_document(contents);
         self.images.remember(pictures);
+        yjs::write_parts(doc, &parts);
         let fragment = doc.get_or_insert_xml_fragment(yjs::FRAGMENT);
         let page = doc.get_or_insert_map(yjs::PAGE);
         let mut txn = doc.transact_mut();
@@ -66,11 +68,16 @@ impl Format for DocFormat {
         let page = doc.get_or_insert_map(yjs::PAGE);
         let txn = doc.transact();
         let blocks = yjs::read(&txn, &fragment);
+        let parts = yjs::read_parts(&txn, &page);
         let setup = yjs::read_page(&txn, &page);
         let state = txn.encode_state_as_update_v1(&StateVector::default());
         drop(txn);
-        let pictures = self.images.for_saving(&model::image_hashes(&blocks));
-        Ok(html::page(&blocks, setup.as_ref(), Some(&state), &pictures).into_bytes())
+        let mut hashes = model::image_hashes(&blocks);
+        for (_, part) in parts.each() {
+            hashes.extend(model::image_hashes(part));
+        }
+        let pictures = self.images.for_saving(&hashes);
+        Ok(html::page(&blocks, &parts, setup.as_ref(), Some(&state), &pictures).into_bytes())
     }
 }
 
@@ -125,6 +132,7 @@ impl DocFormat {
 pub(crate) fn new_document(setup: &PageSetup) -> Vec<u8> {
     html::page(
         &[Block::Paragraph(model::Para::default(), Vec::new())],
+        &model::Parts::default(),
         Some(setup),
         None,
         &Pictures::new(),
@@ -216,6 +224,7 @@ mod tests {
                 ),
                 Block::Checks(vec![(true, vec![paragraph("Milk")])]),
             ],
+            &crate::model::Parts::default(),
             Some(&PageSetup::new(PageSize::A4)),
             None,
             &Pictures::new(),
@@ -243,7 +252,13 @@ mod tests {
     fn layout_survives_the_editor_and_the_file() {
         let doc = doc();
         let blocks = html::tests::laid_out();
-        let file = html::page(&blocks, None, None, &Pictures::new());
+        let file = html::page(
+            &blocks,
+            &crate::model::Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
         format().absorb(&doc, file.as_bytes()).unwrap();
         assert_eq!(self::blocks(&doc), blocks);
         let written = format().write(&doc).unwrap();
@@ -251,10 +266,55 @@ mod tests {
     }
 
     #[test]
+    fn headers_and_footers_survive_the_editor_and_the_file() {
+        let doc = doc();
+        let blocks = html::tests::laid_out();
+        let parts = html::tests::parts();
+        let file = html::page(&blocks, &parts, None, None, &Pictures::new());
+        format().absorb(&doc, file.as_bytes()).unwrap();
+        let written = format().write(&doc).unwrap();
+        let read = html::read_document(&written);
+        assert_eq!((read.blocks, read.parts), (blocks.clone(), parts));
+        // A file changed elsewhere without them takes them away.
+        let file = html::page(
+            &blocks,
+            &model::Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
+        format().absorb(&doc, file.as_bytes()).unwrap();
+        let read = html::read_document(&format().write(&doc).unwrap());
+        assert_eq!(read.parts, model::Parts::default());
+    }
+
+    #[test]
     fn cell_colors_survive_the_editor_and_the_file() {
         let doc = doc();
         let blocks = html::tests::colored_cells();
-        let file = html::page(&blocks, None, None, &Pictures::new());
+        let file = html::page(
+            &blocks,
+            &crate::model::Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
+        format().absorb(&doc, file.as_bytes()).unwrap();
+        assert_eq!(self::blocks(&doc), blocks);
+        assert_eq!(html::read(&format().write(&doc).unwrap()), blocks);
+    }
+
+    #[test]
+    fn borders_rows_and_lines_survive_the_editor_and_the_file() {
+        let doc = doc();
+        let blocks = html::tests::google_layout();
+        let file = html::page(
+            &blocks,
+            &crate::model::Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
         format().absorb(&doc, file.as_bytes()).unwrap();
         assert_eq!(self::blocks(&doc), blocks);
         assert_eq!(html::read(&format().write(&doc).unwrap()), blocks);
@@ -357,7 +417,14 @@ mod tests {
         format()
             .absorb(
                 &doc,
-                html::page(&blocks, Some(&a4), None, &Pictures::new()).as_bytes(),
+                html::page(
+                    &blocks,
+                    &crate::model::Parts::default(),
+                    Some(&a4),
+                    None,
+                    &Pictures::new(),
+                )
+                .as_bytes(),
             )
             .unwrap();
         let mut sideways = a4;
@@ -366,7 +433,14 @@ mod tests {
         format()
             .absorb(
                 &doc,
-                html::page(&blocks, Some(&sideways), None, &Pictures::new()).as_bytes(),
+                html::page(
+                    &blocks,
+                    &crate::model::Parts::default(),
+                    Some(&sideways),
+                    None,
+                    &Pictures::new(),
+                )
+                .as_bytes(),
             )
             .unwrap();
         assert_eq!(page(&doc), Some(sideways));
@@ -374,7 +448,14 @@ mod tests {
         format()
             .absorb(
                 &doc,
-                html::page(&blocks, None, None, &Pictures::new()).as_bytes(),
+                html::page(
+                    &blocks,
+                    &crate::model::Parts::default(),
+                    None,
+                    None,
+                    &Pictures::new(),
+                )
+                .as_bytes(),
             )
             .unwrap();
         assert_eq!(page(&doc), None);
@@ -390,6 +471,7 @@ mod tests {
         let doc = doc();
         let first = html::page(
             &[paragraph("One"), paragraph("Two"), paragraph("Three")],
+            &crate::model::Parts::default(),
             None,
             None,
             &Pictures::new(),
@@ -401,6 +483,7 @@ mod tests {
 
         let changed = html::page(
             &[paragraph("One"), paragraph("2"), paragraph("Three")],
+            &crate::model::Parts::default(),
             None,
             None,
             &Pictures::new(),

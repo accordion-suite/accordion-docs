@@ -9,7 +9,7 @@ use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
-use crate::model::{Cell, MAX_SPAN, PageSetup, PageSize};
+use crate::model::{Cell, MAX_SPAN, PageSetup, PageSize, Row};
 
 /// Escapes `text` for XML, leaving out characters XML 1.0 can't hold, such
 /// as control characters, which would make Word refuse the whole file.
@@ -91,7 +91,7 @@ pub(crate) struct Grid<'a> {
 }
 
 impl<'a> Grid<'a> {
-    pub fn new(rows: &'a [Vec<Cell>], room: f64) -> Self {
+    pub fn new(rows: &'a [Row], room: f64) -> Self {
         // For each column, the last row a cell from above reaches down to,
         // and how wide that cell is, kept at its first column.
         let mut reach: Vec<Option<(usize, usize)>> = Vec::new();
@@ -100,7 +100,7 @@ impl<'a> Grid<'a> {
         for (index, row) in rows.iter().enumerate() {
             let mut slots = Vec::new();
             let mut column = 0;
-            let mut cells = row.iter();
+            let mut cells = row.cells.iter();
             loop {
                 if let Some(Some((last, span))) = reach.get(column).copied()
                     && last >= index
@@ -222,9 +222,21 @@ pub(crate) fn pack(parts: &[Part]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::Block;
+
+    /// The text of the part at `path` in a zipped file.
+    pub(crate) fn unzip(file: &[u8], path: &str) -> String {
+        use std::io::Read as _;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(file)).unwrap();
+        let mut text = String::new();
+        zip.by_name(path)
+            .unwrap_or_else(|_| panic!("no {path}"))
+            .read_to_string(&mut text)
+            .unwrap();
+        text
+    }
 
     fn cell(colspan: u32, rowspan: u32, colwidth: Option<Vec<u32>>) -> Cell {
         Cell {
@@ -232,8 +244,8 @@ mod tests {
             colspan,
             rowspan,
             colwidth,
-            background: None,
             content: vec![Block::Paragraph(crate::model::Para::default(), Vec::new())],
+            ..Cell::default()
         }
     }
 
@@ -242,10 +254,14 @@ mod tests {
         // | a (2 tall) | b c (2 wide)  |
         // |            | d | e         |
         // | f | g |                    (short row)
+        let row = |cells| Row {
+            height: None,
+            cells,
+        };
         let rows = vec![
-            vec![cell(1, 2, Some(vec![100])), cell(2, 1, None)],
-            vec![cell(1, 1, None), cell(1, 1, None)],
-            vec![cell(1, 1, None)],
+            row(vec![cell(1, 2, Some(vec![100])), cell(2, 1, None)]),
+            row(vec![cell(1, 1, None), cell(1, 1, None)]),
+            row(vec![cell(1, 1, None)]),
         ];
         let grid = Grid::new(&rows, 400.0);
         assert_eq!(grid.columns, 3);

@@ -320,6 +320,7 @@ async fn adds_pictures_to_documents() {
     });
     let file = html::page(
         &[paragraph("Look"), image],
+        &accordion_docs::model::Parts::default(),
         None,
         None,
         &[(picture.hash.clone(), picture.clone())]
@@ -392,7 +393,14 @@ async fn makes_documents_in_the_docs_place() {
         .create_file(
             my_drive,
             "Elsewhere.html",
-            html::page(&[paragraph("Hi")], None, None, &Default::default()).as_bytes(),
+            html::page(
+                &[paragraph("Hi")],
+                &accordion_docs::model::Parts::default(),
+                None,
+                None,
+                &Default::default(),
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
@@ -416,7 +424,7 @@ async fn makes_documents_in_the_docs_place() {
 }
 
 #[tokio::test]
-async fn prints_a_document_on_its_paper() {
+async fn downloads_a_document_in_each_format() {
     let server = start().await;
     let (status, made) = server
         .api(
@@ -431,7 +439,7 @@ async fn prints_a_document_on_its_paper() {
     assert!(server.file_text(&id).await.contains("data-page=\"a4\""));
 
     // Someone changes the file outside Docs, with a script and the
-    // co-editing state in it. The print page has neither.
+    // co-editing state in it. Only the file itself keeps them.
     let file = server.file_text(&id).await;
     let changed = file.replace(
         "<p></p>",
@@ -451,36 +459,6 @@ async fn prints_a_document_on_its_paper() {
         .write_file(top, made["name"].as_str().unwrap(), changed.as_bytes())
         .await
         .unwrap();
-
-    let response = server
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/docs/documents/{id}/print"))
-                .header("authorization", &server.alex.bearer)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let policy = response.headers()["content-security-policy"]
-        .to_str()
-        .unwrap()
-        .to_owned();
-    assert!(policy.starts_with("default-src 'none'"), "{policy}");
-    assert!(policy.contains("frame-ancestors 'self'"), "{policy}");
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let page = String::from_utf8(bytes.to_vec()).unwrap();
-    assert!(
-        page.contains("@page{size:210mm 297mm;margin:72pt 72pt 72pt 72pt}"),
-        "{page}"
-    );
-    assert!(page.contains("<p>Hello</p>"), "{page}");
-    assert!(!page.contains("steal"), "{page}");
-    assert!(!page.contains("application/x-accordion-docs"), "{page}");
-    assert!(page.contains("<title>Untitled document</title>"), "{page}");
 
     // Downloading gives the file itself, data block and all, to keep.
     let response = server
@@ -547,9 +525,14 @@ async fn prints_a_document_on_its_paper() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    // Only people who can open the document can print it.
+    // Only people who can open the document can download it.
     let (status, _) = server
-        .api(&server.sam, "GET", &format!("/documents/{id}/print"), None)
+        .api(
+            &server.sam,
+            "GET",
+            &format!("/documents/{id}/download?as=docx"),
+            None,
+        )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }

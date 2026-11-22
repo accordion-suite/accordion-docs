@@ -11,7 +11,7 @@
 //! are left out, since GitHub drops the styles that would carry them.
 
 use crate::html;
-use crate::model::{Align, Block, Cell, Image, Inline, Marks, Para, Script};
+use crate::model::{Align, Block, Image, Inline, Marks, Para, Row, Script};
 use crate::picture::Pictures;
 
 /// `blocks` as a Markdown file, with `pictures` in it.
@@ -83,7 +83,7 @@ impl Writer<'_> {
                 }
                 out.push_str(&fence);
             }
-            Block::Rule => out.push_str("---"),
+            Block::Rule(_) => out.push_str("---"),
             Block::Image(image) => self.image(out, image),
             Block::Bullets(_, items) => {
                 let marker = if other_marker { "* " } else { "- " };
@@ -202,12 +202,12 @@ fn prefix_lines(out: &mut String, text: &str, first: &str, rest: &str) {
 
 /// Whether a table fits Markdown's: no merged or colored cells, and only
 /// text in each cell.
-fn is_plain_table(rows: &[Vec<Cell>]) -> bool {
-    let columns = rows.first().map_or(0, Vec::len);
+fn is_plain_table(rows: &[Row]) -> bool {
+    let columns = rows.first().map_or(0, |row| row.cells.len());
     columns > 0
         && rows.iter().all(|row| {
-            row.len() == columns
-                && row.iter().all(|cell| {
+            row.cells.len() == columns
+                && row.cells.iter().all(|cell| {
                     cell.colspan == 1
                         && cell.rowspan == 1
                         && cell.background.is_none()
@@ -221,13 +221,13 @@ fn is_plain_table(rows: &[Vec<Cell>]) -> bool {
 
 /// A table as Markdown's: the first row is its heading, and each cell's
 /// paragraphs are joined by line breaks.
-fn write_table(out: &mut String, rows: &[Vec<Cell>]) {
+fn write_table(out: &mut String, rows: &[Row]) {
     for (index, row) in rows.iter().enumerate() {
         if index > 0 {
             out.push('\n');
         }
         out.push('|');
-        for cell in row {
+        for cell in &row.cells {
             let mut text = String::new();
             for (index, block) in cell.content.iter().enumerate() {
                 if index > 0 {
@@ -243,7 +243,7 @@ fn write_table(out: &mut String, rows: &[Vec<Cell>]) {
         }
         if index == 0 {
             out.push_str("\n|");
-            for _ in row {
+            for _ in &row.cells {
                 out.push_str(" --- |");
             }
         }
@@ -355,6 +355,8 @@ fn write_inlines(out: &mut String, inlines: &[Inline], one_line: bool) {
     let mut line_start = true;
     for inline in inlines {
         let (text, marks) = match inline {
+            // Markdown has no pages to number.
+            Inline::Text(_, marks) if marks.field.is_some() => continue,
             Inline::Text(text, marks) if !text.is_empty() => (text.as_str(), marks.clone()),
             Inline::Text(..) => continue,
             Inline::Break => {
@@ -485,6 +487,7 @@ fn escape_list_number(out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Cell;
 
     fn text(text: &str) -> Inline {
         Inline::Text(text.to_owned(), Marks::default())
@@ -548,7 +551,7 @@ mod tests {
                 text("twice"),
             ])]),
             Block::Code("let a = `b`;\n".to_owned()),
-            Block::Rule,
+            Block::Rule(crate::model::Rule::default()),
         ];
         assert_eq!(
             write(&blocks, &Pictures::new()),
@@ -610,8 +613,9 @@ mod tests {
             colwidth: None,
             background: None,
             content: vec![paragraph(vec![text(text_)])],
+            ..Cell::default()
         };
-        let plain = Block::Table(vec![
+        let plain = crate::model::table(vec![
             vec![cell("a", 1), cell("b|c", 1)],
             vec![cell("d", 1), cell("e", 1)],
         ]);
@@ -619,7 +623,7 @@ mod tests {
             write(&[plain], &Pictures::new()),
             "| a | b\\|c |\n| --- | --- |\n| d | e |\n"
         );
-        let merged = Block::Table(vec![
+        let merged = crate::model::table(vec![
             vec![cell("wide", 2)],
             vec![cell("d", 1), cell("e", 1)],
         ]);

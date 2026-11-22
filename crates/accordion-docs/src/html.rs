@@ -18,8 +18,8 @@ use std::fmt::Write as _;
 use scraper::{Html, Node};
 
 use crate::model::{
-    self, Align, Block, Cell, Image, Inline, Kind, ListStyle, Marks, PageSetup, PageSize, Para,
-    Script,
+    self, Align, Block, Cell, Field, Image, Inline, Kind, ListStyle, Marks, PageSetup, PageSize,
+    Para, Parts, Row, SIDES, Script,
 };
 use crate::office::number;
 use crate::picture::{self, Picture, Pictures};
@@ -42,15 +42,18 @@ pub const DATA_VERSION: u32 = 1;
 /// Docs and the Word download, or the fonts made to match it. Lines and
 /// paragraphs are spaced as the Word download spaces them: 1.15 lines, 6
 /// points after each paragraph, and Google Docs' space around headings.
+/// Headings have Google Docs' look too: regular weight, the smaller ones
+/// gray.
 const STYLE: &str = "\
 body{margin:0;background:#f8f9fa;color:#1f1f1f;font:11pt/1.3225 Arial,Arimo,'Liberation Sans',sans-serif}\
 main{box-sizing:border-box;max-width:816px;margin:24px auto;padding:72px 96px;background:#fff;\
 box-shadow:0 1px 3px rgba(0,0,0,.15)}\
 p,h1,h2,h3,h4,h5,h6{white-space:pre-wrap}\
 p{margin:0 0 6pt}\
-h1,h2,h3,h4,h5,h6{font-weight:700}\
-h1{font-size:20pt;margin:20pt 0 6pt}h2{font-size:16pt;margin:18pt 0 6pt}h3{font-size:14pt;margin:16pt 0 4pt}\
-h4{font-size:12pt;margin:14pt 0 4pt}h5{font-size:11pt;margin:12pt 0 4pt}h6{font-size:11pt;font-style:italic;margin:12pt 0 4pt}\
+h1,h2,h3,h4,h5,h6{font-weight:400}\
+h1{font-size:20pt;margin:20pt 0 6pt}h2{font-size:16pt;margin:18pt 0 6pt}h3{font-size:14pt;color:#434343;margin:16pt 0 4pt}\
+h4{font-size:12pt;color:#666;margin:14pt 0 4pt}h5{font-size:11pt;color:#666;margin:12pt 0 4pt}\
+h6{font-size:11pt;color:#666;font-style:italic;margin:12pt 0 4pt}\
 p.title{font-size:26pt;margin:0 0 3pt}p.subtitle{font-size:15pt;color:#666;margin:0 0 16pt}\
 main>:first-child{margin-top:0}\
 ul[data-list=disc]{list-style-type:disc}ul[data-list=circle]{list-style-type:circle}\
@@ -66,6 +69,7 @@ pre{background:#f1f3f4;padding:12px;border-radius:4px;overflow-x:auto;white-spac
 code{font-family:ui-monospace,monospace;font-size:.9em}\
 img{display:block;max-width:100%;height:auto;margin:0 0 .6em}\
 blockquote{margin:0 0 .6em;padding-left:16px;border-left:3px solid #dadce0;color:#444746}\
+hr{margin:.5em 0;border:none;border-top:1px solid #c4c7c5}\
 table{border-collapse:collapse;margin:0 0 .6em}\
 td,th{border:1px solid #c4c7c5;padding:4px 8px;vertical-align:top;min-width:40px}\
 th{background:#f1f3f4;text-align:left}\
@@ -73,6 +77,8 @@ td>p:last-child,th>p:last-child,li>p:last-child{margin:0}\
 ul.checklist{list-style:none;padding-left:4px}\
 ul.checklist>li>input{float:left;margin:6px 8px 0 0}\
 ul.checklist>li[data-checked=true]>p{text-decoration:line-through;color:#5f6368}\
+header[data-part]{margin-bottom:18pt}footer[data-part]{margin-top:18pt}\
+main[data-first-page=different]>header[data-part=header],footer[data-part=first-footer]{display:none}\
 @media (max-width:860px){main{margin:0;padding:24px 16px;box-shadow:none}}\
 @media print{body{background:none}main{max-width:none;margin:0;padding:0;box-shadow:none}}";
 
@@ -80,13 +86,15 @@ ul.checklist>li[data-checked=true]>p{text-decoration:line-through;color:#5f6368}
 /// highlights stays as it was written, dark on white, so its colors still
 /// read.
 const DARK_STYLE: &str = "@media screen and (prefers-color-scheme:dark){body{background:#131314;color:#e3e3e3}\
-main{background:#1f1f1f}pre,th{background:#2d2f31}td,th{border-color:#444746}p.subtitle{color:#9aa0a6}\
+main{background:#1f1f1f}pre,th{background:#2d2f31}td,th,hr{border-color:#444746}h3{color:#c4c7c5}\
+h4,h5,h6,p.subtitle{color:#9aa0a6}\
 blockquote{border-color:#444746;color:#c4c7c5}}";
 
 /// The whole file for `blocks` on the page `setup`, with `state`, the
 /// co-editing state, in its data block when there is one.
 pub fn page(
     blocks: &[Block],
+    parts: &Parts,
     setup: Option<&PageSetup>,
     state: Option<&[u8]>,
     pictures: &Pictures,
@@ -94,22 +102,12 @@ pub fn page(
     let title = model::first_text(blocks)
         .map(|text| text.chars().take(100).collect::<String>())
         .unwrap_or_else(|| "Untitled document".to_owned());
-    write_page(blocks, setup, state, &title, pictures)
-}
-
-/// The page to print `blocks` on `setup`'s paper, titled `title`, which
-/// browsers offer as the PDF's name. It has no data block.
-pub fn print_page(
-    blocks: &[Block],
-    setup: Option<&PageSetup>,
-    title: &str,
-    pictures: &Pictures,
-) -> String {
-    write_page(blocks, setup, None, title, pictures)
+    write_page(blocks, parts, setup, state, &title, pictures)
 }
 
 fn write_page(
     blocks: &[Block],
+    parts: &Parts,
     setup: Option<&PageSetup>,
     state: Option<&[u8]>,
     title: &str,
@@ -125,21 +123,30 @@ fn write_page(
     out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
     out.push_str("<meta name=\"generator\" content=\"Accordion Docs\">\n");
     let _ = writeln!(out, "<title>{}</title>", escape_text(title));
-    let colored = model::any_marks(blocks, &|marks| {
-        marks.color.is_some() || marks.highlight.is_some()
-    }) || model::any_cell_color(blocks);
+    let colored = std::iter::once(blocks)
+        .chain(parts.each().map(|(_, part)| part))
+        .any(|blocks| {
+            model::any_marks(blocks, &|marks| {
+                marks.color.is_some() || marks.highlight.is_some()
+            }) || model::any_block_color(blocks)
+        });
     let _ = writeln!(
         out,
         "<style>{STYLE}{}</style>",
         if colored { "" } else { DARK_STYLE }
     );
+    let first = if parts.different_first {
+        " data-first-page=\"different\""
+    } else {
+        ""
+    };
     match setup {
         Some(setup) => {
             let _ = writeln!(out, "<style>{}</style>", page_style(setup));
             out.push_str("</head>\n<body>\n");
             let _ = writeln!(
                 out,
-                "<main data-page=\"{}\" data-orientation=\"{}\" data-margins=\"{}\">",
+                "<main data-page=\"{}\" data-orientation=\"{}\" data-margins=\"{}\"{first}>",
                 setup.size.name(),
                 if setup.landscape {
                     "landscape"
@@ -154,9 +161,25 @@ fn write_page(
                     .join(" "),
             );
         }
-        None => out.push_str("</head>\n<body>\n<main>\n"),
+        None => {
+            let _ = writeln!(out, "</head>\n<body>\n<main{first}>");
+        }
     }
+    // Headers before the text and footers after it, as a browser shows the
+    // file on screen. Printing from Docs puts them on every page.
+    let part = |out: &mut String, tag: &str, name: &str, blocks: &[Block]| {
+        if blocks.is_empty() {
+            return;
+        }
+        let _ = writeln!(out, "<{tag} data-part=\"{}\">", name.replace('_', "-"));
+        write_blocks(out, blocks, pictures);
+        let _ = writeln!(out, "</{tag}>");
+    };
+    part(&mut out, "header", "first_header", &parts.first_header);
+    part(&mut out, "header", "header", &parts.header);
     write_blocks(&mut out, blocks, pictures);
+    part(&mut out, "footer", "footer", &parts.footer);
+    part(&mut out, "footer", "first_footer", &parts.first_footer);
     out.push_str("</main>\n");
     if let Some(state) = state {
         use base64::Engine as _;
@@ -317,7 +340,13 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
         Block::Code(text) => {
             let _ = writeln!(out, "<pre><code>{}</code></pre>", escape_text(text));
         }
-        Block::Rule => out.push_str("<hr>\n"),
+        Block::Rule(rule) => {
+            if rule.thickness.is_none() && rule.color.is_none() {
+                out.push_str("<hr>\n");
+            } else {
+                let _ = writeln!(out, "<hr style=\"{}\">", rule_style(rule));
+            }
+        }
         Block::Image(image) => write_image(out, image, pictures.get(&image.hash)),
         Block::Bullets(style, items) => {
             open_list(out, "ul", *style, None);
@@ -355,8 +384,17 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
         Block::Table(rows) => {
             out.push_str("<table>\n<tbody>\n");
             for row in rows {
-                out.push_str("<tr>\n");
-                for cell in row {
+                match row.height {
+                    Some(height) => {
+                        let _ = writeln!(
+                            out,
+                            "<tr style=\"height:{}pt\">",
+                            number(model::points(height))
+                        );
+                    }
+                    None => out.push_str("<tr>\n"),
+                }
+                for cell in &row.cells {
                     let tag = if cell.header { "th" } else { "td" };
                     let _ = write!(out, "<{tag}");
                     if cell.colspan != 1 {
@@ -369,8 +407,9 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
                         let widths: Vec<String> = widths.iter().map(u32::to_string).collect();
                         let _ = write!(out, " data-colwidth=\"{}\"", widths.join(","));
                     }
-                    if let Some(color) = cell.background {
-                        let _ = write!(out, " style=\"background-color:{}\"", color.css());
+                    let css = cell_style(cell);
+                    if !css.is_empty() {
+                        let _ = write!(out, " style=\"{css}\"");
                     }
                     out.push_str(">\n");
                     write_blocks(out, &cell.content, pictures);
@@ -381,6 +420,43 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures) {
             out.push_str("</tbody>\n</table>\n");
         }
     }
+}
+
+/// The CSS for a line with a thickness or color of its own.
+fn rule_style(rule: &model::Rule) -> String {
+    let thickness = rule.thickness.map_or("1px".to_owned(), |thickness| {
+        format!("{}pt", number(model::points(thickness)))
+    });
+    let color = rule.color.map_or("#c4c7c5".to_owned(), Color::css);
+    format!("border:none;border-top:{thickness} solid {color}")
+}
+
+/// The CSS for a cell's color, borders, and padding. Each part is a number
+/// or a color from the schema, so none can end the attribute.
+fn cell_style(cell: &Cell) -> String {
+    let mut parts = Vec::new();
+    if let Some(color) = cell.background {
+        parts.push(format!("background-color:{}", color.css()));
+    }
+    let color = cell.border_color.unwrap_or(Color::BLACK).css();
+    for (side, border) in SIDES.iter().zip(cell.borders) {
+        match border {
+            Some(0) => parts.push(format!("border-{side}:none")),
+            Some(border) => parts.push(format!(
+                "border-{side}:{}pt solid {color}",
+                number(model::points(border))
+            )),
+            None => {}
+        }
+    }
+    if let Some(padding) = cell.padding {
+        let sides: Vec<String> = padding
+            .iter()
+            .map(|side| format!("{}pt", number(model::points(*side))))
+            .collect();
+        parts.push(format!("padding:{}", sides.join(" ")));
+    }
+    parts.join(";")
 }
 
 /// A picture, with its contents in its `src`. One whose contents are
@@ -415,6 +491,8 @@ enum Tag {
     Code,
     Super,
     Sub,
+    /// A page number or count, around its stand-in text.
+    Field(Field),
 }
 
 /// The CSS for a run's styles, such as `color:#ff0000;font-size:12pt`.
@@ -459,6 +537,9 @@ impl Tag {
                 tags.push(tag);
             }
         }
+        if let Some(field) = marks.field {
+            tags.push(Tag::Field(field));
+        }
         tags
     }
 
@@ -477,6 +558,9 @@ impl Tag {
             Tag::Code => out.push_str("<code>"),
             Tag::Super => out.push_str("<sup>"),
             Tag::Sub => out.push_str("<sub>"),
+            Tag::Field(field) => {
+                let _ = write!(out, "<span data-field=\"{}\">", field.name());
+            }
         }
     }
 
@@ -491,6 +575,7 @@ impl Tag {
             Tag::Code => "</code>",
             Tag::Super => "</sup>",
             Tag::Sub => "</sub>",
+            Tag::Field(_) => "</span>",
         });
     }
 }
@@ -564,6 +649,8 @@ pub struct Document {
     pub setup: Option<PageSetup>,
     /// The pictures in its body, by their hash.
     pub pictures: Pictures,
+    /// Its headers and footers.
+    pub parts: Parts,
 }
 
 /// The blocks of an HTML page, as [`read`] reads them, with its page setup
@@ -579,18 +666,49 @@ pub fn read_document(contents: &[u8]) -> Document {
     let mut blocks = Vec::new();
     let mut pictures = Pictures::new();
     let setup = main.and_then(|main| read_setup(&main));
+    let mut parts = Parts::default();
     match main {
-        Some(main) => read_blocks(main, &mut blocks, &mut pictures),
+        Some(main) => {
+            read_blocks(main, &mut blocks, &mut pictures);
+            parts.different_first = attribute(&main, "data-first-page") == Some("different");
+            for child in main.children() {
+                let Some(name) = part_name(&child) else {
+                    continue;
+                };
+                let part = match name {
+                    "header" => &mut parts.header,
+                    "footer" => &mut parts.footer,
+                    "first-header" => &mut parts.first_header,
+                    "first-footer" => &mut parts.first_footer,
+                    _ => continue,
+                };
+                read_blocks(child, part, &mut pictures);
+            }
+        }
         None => read_blocks(*root, &mut blocks, &mut pictures),
     }
     let blocks = model::normalize(blocks);
+    let parts = parts.normalized();
     // Only pictures the document shows.
-    let shown = model::image_hashes(&blocks);
+    let mut shown = model::image_hashes(&blocks);
+    for (_, part) in parts.each() {
+        shown.extend(model::image_hashes(part));
+    }
     pictures.retain(|hash, _| shown.contains(hash));
     Document {
         blocks,
         setup,
         pictures,
+        parts,
+    }
+}
+
+/// The part a `<header data-part>` or `<footer data-part>` holds, such as
+/// `first-header`.
+fn part_name<'a>(node: &NodeRef<'a>) -> Option<&'a str> {
+    match node.value() {
+        Node::Element(el) if matches!(el.name(), "header" | "footer") => el.attr("data-part"),
+        _ => None,
     }
 }
 
@@ -799,6 +917,7 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
                 add_text(&mut runs, &text[..], &Marks::default());
                 continue;
             }
+            Node::Element(_) if part_name(&child).is_some() => continue,
             Node::Element(_) => element(&child).unwrap_or("other"),
             _ => continue,
         };
@@ -818,13 +937,21 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
         match name {
             "p" => {
                 flush(&mut runs, out);
-                out.push(Block::Paragraph(para_of(&child), inlines_of(child)));
+                let inlines = inlines_of(child);
+                // Google Docs' line is a picture in a paragraph of its own,
+                // which becomes the line alone.
+                if !(inlines.is_empty() && has_line(child)) {
+                    out.push(Block::Paragraph(para_of(&child), inlines));
+                }
                 images_in(child, out, pictures);
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 flush(&mut runs, out);
                 let level = name[1..].parse().unwrap_or(1);
-                out.push(Block::Heading(level, para_of(&child), inlines_of(child)));
+                let inlines = inlines_of(child);
+                if !(inlines.is_empty() && has_line(child)) {
+                    out.push(Block::Heading(level, para_of(&child), inlines));
+                }
                 images_in(child, out, pictures);
             }
             "div" if has_class(&child, "page-break") => {
@@ -835,7 +962,7 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
             }
             "img" => {
                 flush(&mut runs, out);
-                out.extend(image(child, pictures));
+                out.extend(google_line(child).or_else(|| image(child, pictures)));
             }
             "blockquote" => {
                 flush(&mut runs, out);
@@ -849,7 +976,7 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
             }
             "hr" => {
                 flush(&mut runs, out);
-                out.push(Block::Rule);
+                out.push(Block::Rule(rule_of(&child)));
             }
             "ul" | "ol" => {
                 flush(&mut runs, out);
@@ -1067,9 +1194,97 @@ fn image(node: NodeRef, pictures: &mut Pictures) -> Option<Block> {
 fn images_in(node: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures) {
     for child in node.descendants() {
         if element(&child) == Some("img") {
-            out.extend(image(child, pictures));
+            out.extend(google_line(child).or_else(|| image(child, pictures)));
         }
     }
+}
+
+/// Whether a paragraph holds one of Google Docs' lines.
+fn has_line(node: NodeRef) -> bool {
+    node.descendants().any(|child| google_line(child).is_some())
+}
+
+/// Google Docs' horizontal line, which it copies as a picture of the line
+/// named "horizontal line", as thick as the picture is tall, in the color
+/// of the text around it.
+fn google_line(node: NodeRef) -> Option<Block> {
+    if element(&node) != Some("img")
+        || !attribute(&node, "title")
+            .is_some_and(|title| title.trim().eq_ignore_ascii_case("horizontal line"))
+    {
+        return None;
+    }
+    let thickness = attribute(&node, "height")
+        .and_then(|height| height.trim().parse::<f64>().ok())
+        .filter(|height| *height > 0.0)
+        .and_then(|height| model::twips(height * 0.75));
+    let color = node
+        .ancestors()
+        .take_while(|ancestor| !matches!(element(ancestor), Some("p" | "td" | "th" | "li")))
+        .find_map(|ancestor| {
+            attribute(&ancestor, "style").and_then(|css| {
+                style::declarations(css)
+                    .into_iter()
+                    .rev()
+                    .find_map(|(name, value)| {
+                        (name == "color").then(|| Color::from_css(&value)).flatten()
+                    })
+            })
+        })
+        .or(Some(Color::BLACK));
+    Some(Block::Rule(model::Rule { thickness, color }))
+}
+
+/// A line's thickness and color, from the style Docs writes on it.
+fn rule_of(node: &NodeRef) -> model::Rule {
+    let mut rule = model::Rule::default();
+    if let Some(css) = attribute(node, "style") {
+        for (name, value) in style::declarations(css) {
+            if matches!(name.as_str(), "border-top" | "border") {
+                let (thickness, color) = border_of(&value);
+                rule.thickness = thickness
+                    .filter(|thickness| *thickness > 0)
+                    .or(rule.thickness);
+                rule.color = color.or(rule.color);
+            }
+        }
+    }
+    rule
+}
+
+/// A border's thickness and color from CSS such as `solid #000000 1pt`,
+/// as Google Docs writes it, `1.0pt solid windowtext`, as Word does, or
+/// `none`. A style with no thickness is CSS's medium, 3 pixels.
+fn border_of(value: &str) -> (Option<model::Twips>, Option<Color>) {
+    let mut thickness = None;
+    let mut color = None;
+    let mut styled = false;
+    for word in value.split_ascii_whitespace() {
+        let word = word.to_ascii_lowercase();
+        match word.as_str() {
+            "none" | "hidden" => return (Some(0), None),
+            "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset" => {
+                styled = true;
+            }
+            "thin" => thickness = Some(0.75),
+            "medium" => thickness = Some(2.25),
+            "thick" => thickness = Some(3.75),
+            "windowtext" => color = Some(Color::BLACK),
+            _ => {
+                if let Some(points) = style::length_from_css(&word) {
+                    thickness = Some(points.max(0.0));
+                } else if let Some(found) = Color::from_css(&word) {
+                    color = Some(found);
+                }
+            }
+        }
+    }
+    let thickness = match thickness {
+        Some(points) => model::twips(points),
+        None if styled => model::twips(2.25),
+        None => None,
+    };
+    (thickness, color)
 }
 
 /// The inline contents of a paragraph or heading, with the text styles
@@ -1234,6 +1449,9 @@ fn read_inline(node: NodeRef, marks: &Marks, runs: &mut Runs) {
         }
         _ => {}
     }
+    if let Some(field) = attribute(&node, "data-field").and_then(Field::from_name) {
+        marks.field = Some(field);
+    }
     apply_style(&node, &mut marks, false);
     for child in node.children() {
         read_inline(child, &marks, runs);
@@ -1311,16 +1529,95 @@ fn is_checked(item: &NodeRef) -> bool {
 }
 
 fn table(node: NodeRef, pictures: &mut Pictures) -> Block {
+    // Google Docs and Word name a table without lines `border:none` and
+    // leave its cells' borders out.
+    let lineless = attribute(&node, "border").is_some_and(|border| border.trim() == "0")
+        || attribute(&node, "style").is_some_and(|css| {
+            style::declarations(css)
+                .into_iter()
+                .any(|(name, value)| name == "border" && border_of(&value).0 == Some(0))
+        });
+    let mut columns = Vec::new();
     let mut rows = Vec::new();
-    collect_rows(node, &mut rows, pictures);
+    collect_rows(node, &mut rows, &mut columns, lineless, pictures);
+    if columns.iter().any(Option::is_some) {
+        widths_from_columns(&mut rows, &columns);
+    }
     Block::Table(rows)
 }
 
-fn collect_rows(node: NodeRef, rows: &mut Vec<Vec<Cell>>, pictures: &mut Pictures) {
+/// A length in pixels from an HTML `width` or `height`, or a CSS length.
+fn pixels(text: &str) -> Option<u32> {
+    let text = text.trim();
+    let pixels = match text.parse::<f64>() {
+        Ok(pixels) => pixels,
+        Err(_) => style::length_from_css(text)? / 0.75,
+    };
+    (1.0..100_000.0)
+        .contains(&pixels)
+        .then(|| pixels.round() as u32)
+}
+
+/// An element's width from its `width` or its style's, in pixels.
+fn width_of(node: &NodeRef) -> Option<u32> {
+    let from_style = attribute(node, "style").and_then(|css| {
+        style::declarations(css)
+            .into_iter()
+            .rev()
+            .find_map(|(name, value)| (name == "width").then(|| pixels(&value)).flatten())
+    });
+    from_style.or_else(|| attribute(node, "width").and_then(pixels))
+}
+
+fn collect_rows(
+    node: NodeRef,
+    rows: &mut Vec<Row>,
+    columns: &mut Vec<Option<u32>>,
+    lineless: bool,
+    pictures: &mut Pictures,
+) {
     for child in node.children() {
         match element(&child) {
-            Some("thead" | "tbody" | "tfoot") => collect_rows(child, rows, pictures),
+            Some("thead" | "tbody" | "tfoot") => {
+                collect_rows(child, rows, columns, lineless, pictures);
+            }
+            // Google Docs gives each column's width in pixels.
+            Some("colgroup") => {
+                let cols: Vec<NodeRef> = child
+                    .children()
+                    .filter(|col| element(col) == Some("col"))
+                    .collect();
+                if cols.is_empty() {
+                    columns.push(width_of(&child));
+                }
+                for col in cols {
+                    let span = attribute(&col, "span")
+                        .and_then(|span| span.trim().parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .clamp(1, model::MAX_SPAN as usize);
+                    columns.extend(std::iter::repeat_n(width_of(&col), span));
+                }
+            }
+            Some("col") => columns.push(width_of(&child)),
             Some("tr") => {
+                let height = attribute(&child, "style")
+                    .and_then(|css| {
+                        style::declarations(css)
+                            .into_iter()
+                            .rev()
+                            .find_map(|(name, value)| {
+                                (name == "height")
+                                    .then(|| style::length_from_css(&value))
+                                    .flatten()
+                            })
+                    })
+                    .or_else(|| {
+                        attribute(&child, "height")
+                            .and_then(pixels)
+                            .map(|px| f64::from(px) * 0.75)
+                    })
+                    .and_then(model::twips)
+                    .filter(|height| *height > 0);
                 let mut cells = Vec::new();
                 for cell in child.children() {
                     let header = match element(&cell) {
@@ -1333,28 +1630,187 @@ fn collect_rows(node: NodeRef, rows: &mut Vec<Vec<Cell>>, pictures: &mut Picture
                             .and_then(|value| value.trim().parse().ok())
                             .unwrap_or(1)
                     };
-                    let colwidth = attribute(&cell, "data-colwidth").and_then(|widths| {
-                        widths
-                            .split(',')
-                            .map(|width| width.trim().parse().ok())
-                            .collect::<Option<Vec<u32>>>()
-                    });
+                    let colspan = span("colspan");
+                    let colwidth = attribute(&cell, "data-colwidth")
+                        .and_then(|widths| {
+                            widths
+                                .split(',')
+                                .map(|width| width.trim().parse().ok())
+                                .collect::<Option<Vec<u32>>>()
+                        })
+                        // Word gives each cell its width.
+                        .or_else(|| {
+                            (colspan == 1)
+                                .then(|| width_of(&cell))
+                                .flatten()
+                                .map(|width| vec![width])
+                        });
+                    let (borders, border_color, padding) = cell_box(&cell, lineless);
                     let mut content = Vec::new();
                     read_blocks(cell, &mut content, pictures);
                     cells.push(Cell {
                         header,
-                        colspan: span("colspan"),
+                        colspan,
                         rowspan: span("rowspan"),
                         colwidth,
                         background: cell_color(cell),
+                        borders,
+                        border_color,
+                        padding,
                         content,
                     });
                 }
-                rows.push(cells);
+                rows.push(Row { height, cells });
             }
             _ => {}
         }
     }
+}
+
+/// Gives each cell without widths of its own the widths of the columns
+/// it's in, from the table's `<col>`s.
+fn widths_from_columns(rows: &mut [Row], columns: &[Option<u32>]) {
+    // How many more rows each column is taken by a cell from a row above.
+    let mut taken: Vec<u32> = Vec::new();
+    for row in rows {
+        let mut column = 0;
+        for cell in &mut row.cells {
+            while taken.get(column).is_some_and(|rows| *rows > 0) {
+                column += 1;
+            }
+            let span = cell.colspan.clamp(1, model::MAX_SPAN) as usize;
+            if taken.len() < column + span {
+                taken.resize(column + span, 0);
+            }
+            for rows in &mut taken[column..column + span] {
+                *rows = cell.rowspan.clamp(1, model::MAX_SPAN);
+            }
+            if cell.colwidth.is_none() {
+                cell.colwidth = columns
+                    .get(column..column + span)
+                    .and_then(|widths| widths.iter().copied().collect::<Option<Vec<u32>>>());
+            }
+            column += span;
+        }
+        for rows in &mut taken {
+            *rows = rows.saturating_sub(1);
+        }
+    }
+}
+
+/// A cell's borders, their color, and its padding, from its style. A cell
+/// that names any border has none on the sides it leaves out, as CSS
+/// draws it; one that names none has the usual lines, or none in a table
+/// without lines.
+type CellBox = (
+    [Option<model::Twips>; 4],
+    Option<Color>,
+    Option<[model::Twips; 4]>,
+);
+
+fn cell_box(cell: &NodeRef, lineless: bool) -> CellBox {
+    let mut borders: [Option<model::Twips>; 4] = [None; 4];
+    let mut colors: [Option<Color>; 4] = [None; 4];
+    let mut padding: [Option<model::Twips>; 4] = [None; 4];
+    let mut named = false;
+    let side = |name: &str| SIDES.iter().position(|side| *side == name);
+    let four = |value: &str| -> Vec<String> {
+        let parts: Vec<String> = value.split_ascii_whitespace().map(str::to_owned).collect();
+        match parts.as_slice() {
+            [all] => vec![all.clone(); 4],
+            [vertical, across] => vec![
+                vertical.clone(),
+                across.clone(),
+                vertical.clone(),
+                across.clone(),
+            ],
+            [top, across, bottom] => {
+                vec![top.clone(), across.clone(), bottom.clone(), across.clone()]
+            }
+            [_, _, _, _] => parts,
+            _ => Vec::new(),
+        }
+    };
+    let length = |text: &str| style::length_from_css(text).and_then(model::twips);
+    for (name, value) in attribute(cell, "style")
+        .map(style::declarations)
+        .unwrap_or_default()
+    {
+        let name = name.as_str();
+        if name == "border" {
+            named = true;
+            let (thickness, color) = border_of(&value);
+            borders = [thickness.or(Some(0)); 4];
+            colors = [color; 4];
+        } else if let Some(at) = name.strip_prefix("border-").and_then(side) {
+            named = true;
+            let (thickness, color) = border_of(&value);
+            borders[at] = thickness.or(Some(0));
+            colors[at] = color;
+        } else if name == "border-width" {
+            named = true;
+            for (at, part) in four(&value).iter().enumerate() {
+                borders[at] = border_of(part).0.or(borders[at]);
+            }
+        } else if name == "border-style" {
+            named = true;
+            for (at, part) in four(&value).iter().enumerate() {
+                if matches!(part.to_ascii_lowercase().as_str(), "none" | "hidden") {
+                    borders[at] = Some(0);
+                } else if borders[at].is_none() {
+                    borders[at] = model::twips(2.25);
+                }
+            }
+        } else if name == "border-color" {
+            for (at, part) in four(&value).iter().enumerate() {
+                colors[at] = border_of(part).1.or(colors[at]);
+            }
+        } else if let Some((at, part)) = name
+            .strip_prefix("border-")
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(at, part)| Some((side(at)?, part)))
+            .filter(|(_, part)| matches!(*part, "width" | "style" | "color"))
+        {
+            named = true;
+            match part {
+                "width" => borders[at] = border_of(&value).0.or(borders[at]),
+                "style"
+                    if matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "none" | "hidden"
+                    ) =>
+                {
+                    borders[at] = Some(0);
+                }
+                "style" if borders[at].is_none() => borders[at] = model::twips(2.25),
+                "color" => colors[at] = border_of(&value).1.or(colors[at]),
+                _ => {}
+            }
+        } else if name == "padding" {
+            for (at, part) in four(&value).iter().enumerate() {
+                padding[at] = length(part).or(padding[at]);
+            }
+        } else if let Some(at) = name.strip_prefix("padding-").and_then(side) {
+            padding[at] = length(&value).or(padding[at]);
+        }
+    }
+    let borders = if named {
+        borders.map(|border| Some(border.unwrap_or(0)))
+    } else if lineless {
+        [Some(0); 4]
+    } else {
+        [None; 4]
+    };
+    // One color for the cell: the first a visible border has.
+    let color = (0..4)
+        .find(|at| borders[*at].is_some_and(|border| border > 0) && colors[*at].is_some())
+        .and_then(|at| colors[at])
+        .filter(|color| *color != Color::BLACK);
+    let padding = padding
+        .iter()
+        .any(Option::is_some)
+        .then(|| padding.map(|side| side.unwrap_or(0).max(0)));
+    (borders, color, padding)
 }
 
 /// A cell's color from its style, as Google Docs and Word write it, or from
@@ -1447,7 +1903,7 @@ pub(crate) mod tests {
                 vec![text("Quoted")],
             )]),
             Block::Code("fn main() {\n    println!(\"<hi>\");\n}\n".into()),
-            Block::Rule,
+            Block::Rule(crate::model::Rule::default()),
             Block::Bullets(
                 None,
                 vec![
@@ -1472,7 +1928,7 @@ pub(crate) mod tests {
                     vec![Block::Paragraph(Para::default(), vec![text("Bread")])],
                 ),
             ]),
-            Block::Table(vec![
+            crate::model::table(vec![
                 vec![Cell {
                     header: true,
                     colspan: 2,
@@ -1480,6 +1936,7 @@ pub(crate) mod tests {
                     colwidth: Some(vec![120, 80]),
                     background: None,
                     content: vec![Block::Paragraph(Para::default(), vec![text("Head")])],
+                    ..Cell::default()
                 }],
                 vec![
                     Cell {
@@ -1489,6 +1946,7 @@ pub(crate) mod tests {
                         colwidth: None,
                         background: Some(Color([252, 229, 205])),
                         content: vec![Block::Paragraph(Para::default(), vec![text("A")])],
+                        ..Cell::default()
                     },
                     Cell {
                         header: false,
@@ -1497,6 +1955,7 @@ pub(crate) mod tests {
                         colwidth: None,
                         background: None,
                         content: vec![Block::Paragraph(Para::default(), Vec::new())],
+                        ..Cell::default()
                     },
                 ],
             ]),
@@ -1574,8 +2033,9 @@ pub(crate) mod tests {
             colwidth: None,
             background,
             content: vec![Block::Paragraph(Para::default(), vec![text(words)])],
+            ..Cell::default()
         };
-        vec![Block::Table(vec![
+        vec![crate::model::table(vec![
             vec![
                 cell(true, 1, Some(Color([252, 229, 205])), "Head"),
                 cell(true, 1, None, "Plain"),
@@ -1584,10 +2044,99 @@ pub(crate) mod tests {
         ])]
     }
 
+    /// A table laid out as Google Docs' resume templates are, as Google
+    /// Docs copies it: no lines, columns of their own widths, rows of a
+    /// least height, padding, a red top border, and a line in a cell.
+    pub(crate) fn google_layout() -> Vec<Block> {
+        let html = r#"<meta charset="utf-8"><div dir="ltr" style="margin-left:0pt;" align="left"><table style="border:none;border-collapse:collapse;"><colgroup><col width="235" /><col width="437" /></colgroup><tbody><tr style="height:120pt"><td style="vertical-align:top;padding:3.6pt 3.6pt 3.6pt 3.6pt;overflow:hidden;overflow-wrap:break-word;"><h2 dir="ltr" style="line-height:1.38;margin-top:6pt;margin-bottom:0pt;"><span style="font-size:11pt;color:#000000;font-weight:700;">Company / </span><span style="font-size:11pt;color:#000000;font-weight:400;">Job</span></h2></td><td style="vertical-align:top;padding:5pt 5pt 5pt 5pt;border-top:solid #ff0000 1pt;overflow:hidden;"><p dir="ltr" style="line-height:1.2;margin-top:0pt;margin-bottom:0pt;"><span style="font-size:10pt;color:#000000;font-weight:400;"><img title="horizontal line" src="data:image/png;base64,iVBORw0KGgo=" width="418" height="3" style="border:none;" /></span></p><p dir="ltr" style="line-height:1.2;margin-top:0pt;margin-bottom:0pt;"><span style="font-size:10pt;">Street</span></p></td></tr><tr style="height:0pt"><td><p>a</p></td><td><p>b</p></td></tr></tbody></table></div><br />"#;
+        read(html.as_bytes())
+    }
+
+    #[test]
+    fn reads_google_docs_layout_tables() {
+        let blocks = google_layout();
+        let Block::Table(rows) = &blocks[0] else {
+            panic!("not a table: {blocks:?}");
+        };
+        assert_eq!(rows[0].height, Some(2400));
+        assert_eq!(rows[1].height, None);
+        let [first, second] = &rows[0].cells[..] else {
+            panic!("not two cells");
+        };
+        assert_eq!(first.borders, [Some(0); 4]);
+        assert_eq!(first.padding, Some([72; 4]));
+        assert_eq!(first.colwidth, Some(vec![235]));
+        // "Job" isn't bold, and a heading isn't bold on its own.
+        let Block::Heading(2, _, runs) = &first.content[0] else {
+            panic!("not a heading");
+        };
+        assert!(
+            matches!(&runs[..], [Inline::Text(_, bold), Inline::Text(_, plain)] if bold.bold && !plain.bold)
+        );
+        assert_eq!(second.borders, [Some(20), Some(0), Some(0), Some(0)]);
+        assert_eq!(second.border_color, Some(Color([255, 0, 0])));
+        assert_eq!(second.padding, Some([100; 4]));
+        assert_eq!(second.colwidth, Some(vec![437]));
+        // The line is a line, without the paragraph it was in.
+        assert_eq!(
+            second.content[0],
+            Block::Rule(model::Rule {
+                thickness: Some(45),
+                color: Some(Color::BLACK),
+            })
+        );
+        assert!(matches!(&second.content[1], Block::Paragraph(_, runs) if !runs.is_empty()));
+        // Cells in a table without lines have none, and the columns' widths.
+        assert_eq!(rows[1].cells[1].borders, [Some(0); 4]);
+        assert_eq!(rows[1].cells[1].colwidth, Some(vec![437]));
+        // Docs' own file keeps all of it, and stays light, since the
+        // border has a color.
+        let page = page(
+            &blocks,
+            &model::Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
+        assert_eq!(read(page.as_bytes()), blocks);
+        assert!(!page.contains("prefers-color-scheme"));
+    }
+
+    #[test]
+    fn reads_borders_word_writes() {
+        let html = r#"<table class=MsoTableGrid border=1 cellspacing=0 cellpadding=0 style='border-collapse:collapse;border:none'>
+            <tr style='height:20.0pt'><td width=208 valign=top style='width:155.8pt;border:solid windowtext 1.0pt;border-left:none;padding:0in 5.4pt 0in 5.4pt'><p>One</p></td>
+            <td style='border:none;border-bottom:dashed #2F5496 1.5pt'><p>Two</p></td></tr></table>"#;
+        let [Block::Table(rows)] = &read(html.as_bytes())[..] else {
+            panic!("not one table");
+        };
+        assert_eq!(rows[0].height, Some(400));
+        let [one, two] = &rows[0].cells[..] else {
+            panic!("not two cells");
+        };
+        assert_eq!(one.borders, [Some(20), Some(20), Some(20), Some(0)]);
+        assert_eq!(one.border_color, None);
+        assert_eq!(one.padding, Some([0, 108, 0, 108]));
+        assert_eq!(one.colwidth, Some(vec![208]));
+        assert_eq!(two.borders, [Some(0), Some(0), Some(30), Some(0)]);
+        assert_eq!(two.border_color, Some(Color([0x2f, 0x54, 0x96])));
+        // A table with no styles has the usual lines.
+        let [Block::Table(rows)] = &read(b"<table><tr><td>a</td></tr></table>")[..] else {
+            panic!("not one table");
+        };
+        assert_eq!(rows[0].cells[0].borders, [None; 4]);
+    }
+
     #[test]
     fn keeps_cell_colors_and_leaves_out_dark_mode() {
         let blocks = colored_cells();
-        let page = page(&blocks, None, None, &Pictures::new());
+        let page = page(
+            &blocks,
+            &crate::model::Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
         assert_eq!(read(page.as_bytes()), blocks);
         assert!(page.contains("<th style=\"background-color:#fce5cd\">"));
         assert!(page.contains("<td colspan=\"2\" style=\"background-color:#cfe2f3\">"));
@@ -1607,7 +2156,7 @@ pub(crate) mod tests {
         let [Block::Table(rows)] = &read(html.as_bytes())[..] else {
             panic!("not one table");
         };
-        let colors: Vec<_> = rows[0].iter().map(|cell| cell.background).collect();
+        let colors: Vec<_> = rows[0].cells.iter().map(|cell| cell.background).collect();
         assert_eq!(
             colors,
             [
@@ -1623,7 +2172,13 @@ pub(crate) mod tests {
     #[test]
     fn keeps_paragraph_layout_lists_and_page_breaks() {
         let blocks = laid_out();
-        let page = page(&blocks, None, None, &Pictures::new());
+        let page = page(
+            &blocks,
+            &crate::model::Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
         assert_eq!(read(page.as_bytes()), blocks);
         assert!(page.contains(
             "<p style=\"text-align:justify;margin-left:36pt;margin-right:18pt;text-indent:-18pt;\
@@ -1685,11 +2240,86 @@ pub(crate) mod tests {
     #[test]
     fn reads_back_what_it_wrote() {
         let blocks = sample();
-        let page = page(&blocks, None, Some(b"state"), &Pictures::new());
+        let page = page(
+            &blocks,
+            &crate::model::Parts::default(),
+            None,
+            Some(b"state"),
+            &Pictures::new(),
+        );
         assert!(is_document(page.as_bytes()));
         assert_eq!(read(page.as_bytes()), blocks);
         assert_eq!(state_in(page.as_bytes()), Some(b"state".to_vec()));
         assert!(page.contains("<title>Trip &lt;plan&gt; &amp; more</title>"));
+    }
+
+    /// A header with a page number in it, a footer, and a first page with
+    /// only a footer of its own.
+    pub(crate) fn parts() -> Parts {
+        let small = Marks {
+            size: style::half_points(9.0),
+            ..Marks::default()
+        };
+        let number = Marks {
+            field: Some(Field::PageNumber),
+            ..small.clone()
+        };
+        let count = Marks {
+            field: Some(Field::PageCount),
+            ..small.clone()
+        };
+        Parts {
+            header: vec![Block::Paragraph(
+                Para::default(),
+                vec![
+                    marked("Page ", small.clone()),
+                    marked("#", number),
+                    marked(" of ", small),
+                    marked("#", count),
+                ],
+            )],
+            footer: vec![Block::Paragraph(Para::default(), vec![text("Trip plan")])],
+            first_header: Vec::new(),
+            first_footer: vec![Block::Paragraph(Para::default(), vec![text("Draft")])],
+            different_first: true,
+        }
+    }
+
+    #[test]
+    fn keeps_headers_footers_and_page_numbers() {
+        let blocks = sample();
+        let written = page(&blocks, &parts(), None, None, &Pictures::new());
+        assert!(
+            written.contains("<main data-first-page=\"different\">"),
+            "{written}"
+        );
+        assert!(
+            written.contains("<header data-part=\"header\">"),
+            "{written}"
+        );
+        assert!(
+            written.contains("<span data-field=\"page\">#</span>"),
+            "{written}"
+        );
+        assert!(
+            written.contains("<footer data-part=\"first-footer\">"),
+            "{written}"
+        );
+        let read = read_document(written.as_bytes());
+        assert_eq!(read.blocks, blocks);
+        assert_eq!(read.parts, parts());
+        // Parts with nothing in them are none, and the first page's own go
+        // when it no longer differs.
+        let mut cleared = parts();
+        cleared.header = vec![Block::Paragraph(Para::default(), Vec::new())];
+        cleared.different_first = false;
+        let cleared = cleared.normalized();
+        assert!(cleared.header.is_empty() && cleared.first_footer.is_empty());
+        let written = page(&blocks, &cleared, None, None, &Pictures::new());
+        assert!(
+            !written.contains("<header data-part") && written.contains("<main>"),
+            "{written}"
+        );
     }
 
     #[test]
@@ -1700,12 +2330,24 @@ pub(crate) mod tests {
             landscape: true,
             margins: [36.0, 72.0, 56.69, 144.0],
         };
-        let written = page(&blocks, Some(&setup), None, &Pictures::new());
+        let written = page(
+            &blocks,
+            &crate::model::Parts::default(),
+            Some(&setup),
+            None,
+            &Pictures::new(),
+        );
         assert!(written.contains("@page{size:297mm 210mm;margin:36pt 72pt 56.69pt 144pt}"));
         let read = read_document(written.as_bytes());
         assert_eq!((read.blocks, read.setup), (blocks.clone(), Some(setup)));
         // Without one, there's none to read.
-        let plain = page(&blocks, None, None, &Pictures::new());
+        let plain = page(
+            &blocks,
+            &crate::model::Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
         assert!(!plain.contains("@page"));
         assert_eq!(read_document(plain.as_bytes()).setup, None);
         // A size Docs doesn't know is no setup, and odd margins are fixed.
@@ -1795,6 +2437,7 @@ pub(crate) mod tests {
             colwidth: None,
             background: None,
             content: vec![Block::Paragraph(Para::default(), vec![text(text_)])],
+            ..Cell::default()
         };
         assert_eq!(
             read(html.as_bytes()),
@@ -1841,7 +2484,7 @@ pub(crate) mod tests {
                         vec![Block::Paragraph(Para::default(), vec![text("Two")])],
                     ]
                 ),
-                Block::Table(vec![vec![cell(true, "H")], vec![cell(false, "C")]]),
+                crate::model::table(vec![vec![cell(true, "H")], vec![cell(false, "C")]]),
             ]
         );
     }
@@ -1920,6 +2563,7 @@ pub(crate) mod tests {
     fn colored_documents_stay_light() {
         let plain = page(
             &[Block::Paragraph(Para::default(), vec![text("a")])],
+            &crate::model::Parts::default(),
             None,
             None,
             &Pictures::new(),
@@ -1931,6 +2575,7 @@ pub(crate) mod tests {
         };
         let colored = page(
             &[Block::Paragraph(Para::default(), vec![marked("a", red)])],
+            &crate::model::Parts::default(),
             None,
             None,
             &Pictures::new(),

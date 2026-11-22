@@ -35,7 +35,6 @@ pub(crate) fn routes(state: DocsState) -> Router {
         .route("/documents/{id}", get(open))
         .route("/documents/{id}/copy", post(copy))
         .route("/documents/{id}/live", get(live))
-        .route("/documents/{id}/print", get(print))
         .route("/documents/{id}/download", get(download))
         .route(
             "/documents/{id}/images",
@@ -465,12 +464,6 @@ async fn live(
     Ok(coedit::upgrade(socket, connection))
 }
 
-/// What a document's print page may do: show its own styles and pictures,
-/// and nothing else. It runs no scripts, and only Accordion's own pages can
-/// show it in a frame.
-const PRINT_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src 'self'; \
-     form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
-
 /// A document's file with everyone's latest edits in it: an open
 /// document is saved first.
 async fn current_contents(
@@ -654,48 +647,6 @@ fn stem(name: &str) -> &str {
     name.rsplit_once('.').map_or(name, |(stem, _)| stem).trim()
 }
 
-/// `GET /documents/{id}/print`: the document as a page to print or save as
-/// PDF, with everyone's latest edits, on its own paper size and margins
-/// (decision 30). The web app prints it in a hidden frame. Its title is
-/// the document's name, which browsers offer as the PDF's name.
-///
-/// The page is written again from the document's blocks, so whatever the
-/// file holds, only the schema's elements reach it.
-async fn print(
-    State(state): State<DocsState>,
-    Authenticated(me): Authenticated,
-    Path(id): Path<ItemId>,
-) -> Result<Response, ApiError> {
-    let (item, _) = reach(&state, &me, id).await?;
-    let (item, contents) = current_contents(&state, id, item).await?;
-    let document = html::read_document(&contents);
-    let page = html::print_page(
-        &document.blocks,
-        document.setup.as_ref(),
-        stem(&item.name),
-        &document.pictures,
-    );
-    Ok((
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/html; charset=utf-8"),
-            ),
-            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
-            (
-                header::X_CONTENT_TYPE_OPTIONS,
-                HeaderValue::from_static("nosniff"),
-            ),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_static(PRINT_POLICY),
-            ),
-        ],
-        page,
-    )
-        .into_response())
-}
-
 #[derive(Deserialize)]
 struct DownloadQuery {
     /// The format, by its file name extension: "html" (the file itself),
@@ -740,11 +691,12 @@ async fn download(
                 blocks,
                 setup,
                 pictures,
+                parts,
             } = html::read_document(&contents);
             match format.as_str() {
                 "md" => markdown::write(&blocks, &pictures).into_bytes(),
-                "docx" => docx::write(&blocks, setup.as_ref(), &title, &pictures),
-                _ => odt::write(&blocks, setup.as_ref(), &title, &pictures),
+                "docx" => docx::write(&blocks, &parts, setup.as_ref(), &title, &pictures),
+                _ => odt::write(&blocks, &parts, setup.as_ref(), &title, &pictures),
             }
         })
         .await

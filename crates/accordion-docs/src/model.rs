@@ -11,21 +11,27 @@
 //! | [`Block::Heading`] | `heading` (`level` and [`Para`]'s) | `<h1>` to `<h6>` |
 //! | [`Block::Quote`] | `blockquote` | `<blockquote>` |
 //! | [`Block::Code`] | `code_block` | `<pre><code>` |
-//! | [`Block::Rule`] | `horizontal_rule` | `<hr>` |
+//! | [`Block::Rule`] | `horizontal_rule` (`thickness`, `color`) | `<hr>` |
 //! | [`Block::Bullets`] | `bullet_list` (`style`), `list_item` | `<ul>`, `<li>` |
 //! | [`Block::Numbers`] | `ordered_list` (`order`, `style`), `list_item` | `<ol>`, `<li>` |
 //! | [`Block::Checks`] | `check_list`, `check_item` (`checked`) | `<ul class="checklist">`, `<li>` |
-//! | [`Block::Table`] | `table`, `table_row`, `table_cell`, `table_header` | `<table>`, `<tr>`, `<td>`, `<th>` |
+//! | [`Block::Table`] | `table`, `table_row` (`height`), `table_cell`, `table_header` | `<table>`, `<tr>`, `<td>`, `<th>` |
 //! | [`Block::Image`] | `image` (`src`, `alt`, `width`) | `<img>` |
 //! | [`Block::PageBreak`] | `page_break` | `<div class="page-break">` |
 //! | [`Inline::Break`] | `hard_break` | `<br>` |
+//!
+//! Headers and footers ([`Parts`]) are fragments of their own beside the
+//! document's, `header`, `footer`, `first_header`, and `first_footer`, and
+//! `<header data-part>` and `<footer data-part>` in the file's `<main>`.
 //!
 //! Marks: `bold` (`<strong>`), `italic` (`<em>`), `underline` (`<u>`),
 //! `strike` (`<s>`), `code` (`<code>`), `link` (`<a href>`),
 //! `superscript` (`<sup>`), and `subscript` (`<sub>`). The styles
 //! `text_color` (`color`), `highlight` (`color`), `font_size` (`size`, in
 //! points), and `font_family` (`family`) are marks too, written as one
-//! `<span style>` around the text.
+//! `<span style>` around the text. A page number or count is a `field`
+//! mark (`kind`) on a stand-in character, `<span data-field>`, which each
+//! page shows as its own number.
 //!
 //! A paragraph's or heading's layout ([`Para`]) is the node's attributes
 //! `align`, `indent`, `indent_right`, `first_line`, `line_height`,
@@ -59,6 +65,97 @@ pub struct Marks {
     pub size: Option<HalfPoints>,
     /// The font's name, once [`style::font_name`] has checked it.
     pub font: Option<String>,
+    /// The text stands for the page's number or the number of pages.
+    pub field: Option<Field>,
+}
+
+/// A number each page fills in, in a header or footer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Field {
+    PageNumber,
+    PageCount,
+}
+
+impl Field {
+    /// The name in the editor and in files.
+    pub fn name(self) -> &'static str {
+        match self {
+            Field::PageNumber => "page",
+            Field::PageCount => "pages",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "page" => Some(Field::PageNumber),
+            "pages" => Some(Field::PageCount),
+            _ => None,
+        }
+    }
+}
+
+/// What each page shows in its top and bottom margins. An empty list is no
+/// header or footer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Parts {
+    pub header: Vec<Block>,
+    pub footer: Vec<Block>,
+    /// The first page's own, when [`Parts::different_first`] is set.
+    pub first_header: Vec<Block>,
+    pub first_footer: Vec<Block>,
+    pub different_first: bool,
+}
+
+impl Parts {
+    /// The same parts as the editor keeps them: blocks it accepts, and
+    /// nothing for a part with no text or pictures in it.
+    pub fn normalized(self) -> Self {
+        let part = |blocks: Vec<Block>| {
+            let blocks = normalize_blocks(blocks);
+            if blank(&blocks) { Vec::new() } else { blocks }
+        };
+        let different_first = self.different_first;
+        Parts {
+            header: part(self.header),
+            footer: part(self.footer),
+            first_header: if different_first {
+                part(self.first_header)
+            } else {
+                Vec::new()
+            },
+            first_footer: if different_first {
+                part(self.first_footer)
+            } else {
+                Vec::new()
+            },
+            different_first,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.header.is_empty()
+            && self.footer.is_empty()
+            && self.first_header.is_empty()
+            && self.first_footer.is_empty()
+            && !self.different_first
+    }
+
+    /// Each part's blocks, with its name.
+    pub fn each(&self) -> [(&'static str, &[Block]); 4] {
+        [
+            ("header", &self.header),
+            ("footer", &self.footer),
+            ("first_header", &self.first_header),
+            ("first_footer", &self.first_footer),
+        ]
+    }
+}
+
+/// Whether `blocks` are only empty paragraphs.
+pub fn blank(blocks: &[Block]) -> bool {
+    blocks
+        .iter()
+        .all(|block| matches!(block, Block::Paragraph(_, inlines) if inlines.is_empty()))
 }
 
 impl Marks {
@@ -322,15 +419,14 @@ pub enum Block {
     Quote(Vec<Block>),
     /// Plain text, without marks.
     Code(String),
-    Rule,
+    Rule(Rule),
     /// Each item is a list of blocks that starts with a paragraph.
     Bullets(Option<ListStyle>, Vec<Vec<Block>>),
     /// The number the list starts at, and its items.
     Numbers(u32, Option<ListStyle>, Vec<Vec<Block>>),
     /// Whether each item is checked, and its blocks.
     Checks(Vec<(bool, Vec<Block>)>),
-    /// Rows of cells.
-    Table(Vec<Vec<Cell>>),
+    Table(Vec<Row>),
     /// A picture, on a line of its own.
     Image(Image),
     /// Where a new page starts in print.
@@ -372,14 +468,11 @@ pub fn image_hashes(blocks: &[Block]) -> Vec<String> {
                     items.iter().for_each(|item| walk(item, out));
                 }
                 Block::Checks(items) => items.iter().for_each(|(_, item)| walk(item, out)),
-                Block::Table(rows) => rows
-                    .iter()
-                    .flatten()
-                    .for_each(|cell| walk(&cell.content, out)),
+                Block::Table(rows) => cells(rows).for_each(|cell| walk(&cell.content, out)),
                 Block::Paragraph(..)
                 | Block::Heading(..)
                 | Block::Code(_)
-                | Block::Rule
+                | Block::Rule(_)
                 | Block::PageBreak => {}
             }
         }
@@ -389,19 +482,19 @@ pub fn image_hashes(blocks: &[Block]) -> Vec<String> {
     out
 }
 
-/// Whether any table cell in `blocks`, or in a table inside one, has a
-/// color.
-pub fn any_cell_color(blocks: &[Block]) -> bool {
+/// Whether any table cell or line in `blocks`, or inside one, has a color
+/// of its own: a cell's color or borders, or a line's color.
+pub fn any_block_color(blocks: &[Block]) -> bool {
     blocks.iter().any(|block| match block {
-        Block::Quote(blocks) => any_cell_color(blocks),
+        Block::Quote(blocks) => any_block_color(blocks),
         Block::Bullets(_, items) | Block::Numbers(_, _, items) => {
-            items.iter().any(|item| any_cell_color(item))
+            items.iter().any(|item| any_block_color(item))
         }
-        Block::Checks(items) => items.iter().any(|(_, item)| any_cell_color(item)),
-        Block::Table(rows) => rows
-            .iter()
-            .flatten()
-            .any(|cell| cell.background.is_some() || any_cell_color(&cell.content)),
+        Block::Checks(items) => items.iter().any(|(_, item)| any_block_color(item)),
+        Block::Table(rows) => cells(rows).any(|cell| {
+            cell.background.is_some() || cell.has_lines() || any_block_color(&cell.content)
+        }),
+        Block::Rule(rule) => rule.color.is_some(),
         _ => false,
     })
 }
@@ -420,15 +513,59 @@ pub fn any_marks(blocks: &[Block], test: &dyn Fn(&Marks) -> bool) -> bool {
             items.iter().any(|item| any_marks(item, test))
         }
         Block::Checks(items) => items.iter().any(|(_, item)| any_marks(item, test)),
-        Block::Table(rows) => rows
-            .iter()
-            .flatten()
-            .any(|cell| any_marks(&cell.content, test)),
-        Block::Code(_) | Block::Rule | Block::Image(_) | Block::PageBreak => false,
+        Block::Table(rows) => cells(rows).any(|cell| any_marks(&cell.content, test)),
+        Block::Code(_) | Block::Rule(_) | Block::Image(_) | Block::PageBreak => false,
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A horizontal line across the page. One with neither part set is a thin
+/// gray line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rule {
+    /// How thick it is, as Google Docs' lines have.
+    pub thickness: Option<Twips>,
+    pub color: Option<Color>,
+}
+
+/// The thickest line or cell border kept: 12 points, twice Google Docs'
+/// thickest.
+pub const MAX_LINE: Twips = 240;
+
+/// The most padding a cell keeps: an inch.
+pub const MAX_PADDING: Twips = 1440;
+
+/// The tallest a row's least height can be: 20 inches, taller than any
+/// page.
+pub const MAX_ROW_HEIGHT: Twips = 28_800;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Row {
+    /// The least the row is tall, as Google Docs' minimum row height.
+    pub height: Option<Twips>,
+    pub cells: Vec<Cell>,
+}
+
+/// The sides of a box, in the order CSS and [`Cell`] list them.
+pub const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
+
+/// A table of `rows` with no heights of their own.
+pub fn table(rows: Vec<Vec<Cell>>) -> Block {
+    Block::Table(
+        rows.into_iter()
+            .map(|cells| Row {
+                height: None,
+                cells,
+            })
+            .collect(),
+    )
+}
+
+/// Every cell of a table's rows, in order.
+pub fn cells(rows: &[Row]) -> impl Iterator<Item = &Cell> {
+    rows.iter().flat_map(|row| &row.cells)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cell {
     /// A heading cell, `<th>`.
     pub header: bool,
@@ -439,7 +576,26 @@ pub struct Cell {
     pub colwidth: Option<Vec<u32>>,
     /// The cell's color, as Google Docs' cell background.
     pub background: Option<Color>,
+    /// How thick each border is, top, right, bottom, and left. `None` is
+    /// the usual thin gray line, and zero is none, as a Google Docs
+    /// table laid out without lines has.
+    pub borders: [Option<Twips>; 4],
+    /// The borders' color, black when not set. Only borders with a
+    /// thickness use it.
+    pub border_color: Option<Color>,
+    /// The room around the cell's text, top, right, bottom, and left.
+    pub padding: Option<[Twips; 4]>,
     pub content: Vec<Block>,
+}
+
+impl Cell {
+    /// Whether any border is a line of its own, rather than the usual
+    /// line or none.
+    pub fn has_lines(&self) -> bool {
+        self.borders
+            .iter()
+            .any(|border| border.is_some_and(|border| border > 0))
+    }
 }
 
 /// A page size people can choose, as in Google Docs and Word.
@@ -617,7 +773,10 @@ pub fn normalize_block(block: Block) -> Option<Block> {
         ),
         Block::Quote(blocks) => Block::Quote(at_least_a_paragraph(blocks)),
         Block::Code(text) => Block::Code(text),
-        Block::Rule => Block::Rule,
+        Block::Rule(rule) => Block::Rule(Rule {
+            thickness: rule.thickness.filter(|t| (1..=MAX_LINE).contains(t)),
+            color: rule.color,
+        }),
         Block::PageBreak => Block::PageBreak,
         Block::Image(image) => {
             if !crate::picture::is_hash(&image.hash) {
@@ -660,10 +819,15 @@ pub fn normalize_block(block: Block) -> Option<Block> {
             Block::Checks(items)
         }
         Block::Table(rows) => {
-            let rows: Vec<Vec<Cell>> = rows
+            let rows: Vec<Row> = rows
                 .into_iter()
-                .map(|row| row.into_iter().map(cell).collect::<Vec<_>>())
-                .filter(|row| !row.is_empty())
+                .map(|row| Row {
+                    height: row
+                        .height
+                        .filter(|height| (1..=MAX_ROW_HEIGHT).contains(height)),
+                    cells: row.cells.into_iter().map(cell).collect(),
+                })
+                .filter(|row| !row.cells.is_empty())
                 .collect();
             if rows.is_empty() {
                 return None;
@@ -693,6 +857,13 @@ fn cell(cell: Cell) -> Cell {
         rowspan: cell.rowspan.clamp(1, MAX_SPAN),
         colwidth,
         background: cell.background,
+        borders: cell
+            .borders
+            .map(|border| border.map(|border| border.clamp(0, MAX_LINE))),
+        border_color: cell.border_color,
+        padding: cell
+            .padding
+            .map(|sides| sides.map(|side| side.clamp(0, MAX_PADDING))),
         content: at_least_a_paragraph(cell.content),
     }
 }
@@ -755,12 +926,10 @@ pub fn first_text(blocks: &[Block]) -> Option<String> {
                 .iter()
                 .find_map(|(_, blocks)| first_text(blocks))
                 .unwrap_or_default(),
-            Block::Table(rows) => rows
-                .iter()
-                .flatten()
+            Block::Table(rows) => cells(rows)
                 .find_map(|cell| first_text(&cell.content))
                 .unwrap_or_default(),
-            Block::Rule | Block::Image(_) | Block::PageBreak => String::new(),
+            Block::Rule(_) | Block::Image(_) | Block::PageBreak => String::new(),
         };
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         if !text.is_empty() {
@@ -800,22 +969,28 @@ mod tests {
     fn list_items_start_with_a_paragraph() {
         let fixed = normalize(vec![Block::Bullets(
             None,
-            vec![vec![Block::Rule], Vec::new()],
+            vec![vec![Block::Rule(Rule::default())], Vec::new()],
         )]);
         assert_eq!(
             fixed,
             vec![Block::Bullets(
                 None,
                 vec![
-                    vec![Block::Paragraph(Para::default(), Vec::new()), Block::Rule],
+                    vec![
+                        Block::Paragraph(Para::default(), Vec::new()),
+                        Block::Rule(Rule::default())
+                    ],
                     vec![Block::Paragraph(Para::default(), Vec::new())],
                 ]
             )]
         );
         // A list with no items goes.
         assert_eq!(
-            normalize(vec![Block::Numbers(1, None, Vec::new()), Block::Rule]),
-            vec![Block::Rule]
+            normalize(vec![
+                Block::Numbers(1, None, Vec::new()),
+                Block::Rule(Rule::default())
+            ]),
+            vec![Block::Rule(Rule::default())]
         );
     }
 
@@ -838,20 +1013,26 @@ mod tests {
 
     #[test]
     fn cells_keep_widths_only_when_they_fit() {
-        let fixed = normalize_block(Block::Table(vec![vec![Cell {
-            header: false,
-            colspan: 2,
-            rowspan: 0,
-            colwidth: Some(vec![100]),
-            background: None,
-            content: Vec::new(),
-        }]]))
+        let fixed = normalize_block(Block::Table(vec![Row {
+            height: Some(0),
+            cells: vec![Cell {
+                colspan: 2,
+                colwidth: Some(vec![100]),
+                borders: [Some(-5), Some(1000), None, Some(20)],
+                padding: Some([-1, 100, 100, 100]),
+                ..Cell::default()
+            }],
+        }]))
         .unwrap();
         let Block::Table(rows) = fixed else { panic!() };
-        assert_eq!(rows[0][0].colwidth, None);
-        assert_eq!(rows[0][0].rowspan, 1);
+        assert_eq!(rows[0].height, None);
+        let cell = &rows[0].cells[0];
+        assert_eq!(cell.colwidth, None);
+        assert_eq!(cell.rowspan, 1);
+        assert_eq!(cell.borders, [Some(0), Some(MAX_LINE), None, Some(20)]);
+        assert_eq!(cell.padding, Some([0, 100, 100, 100]));
         assert_eq!(
-            rows[0][0].content,
+            cell.content,
             vec![Block::Paragraph(Para::default(), Vec::new())]
         );
     }
@@ -893,7 +1074,7 @@ mod tests {
     #[test]
     fn the_title_is_the_first_words() {
         let blocks = vec![
-            Block::Rule,
+            Block::Rule(Rule::default()),
             Block::Paragraph(Para::default(), vec![text("  ")]),
             Block::Heading(
                 1,

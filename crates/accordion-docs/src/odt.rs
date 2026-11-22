@@ -1,12 +1,15 @@
 //! A document as an OpenDocument text file (`.odt`), for **Download as**
 //! (decision 30), with the same look as the Word file: Arial 11 point,
-//! the document's paper and margins, and everything the editor has.
+//! the document's paper and margins, and everything the editor has, its
+//! headers and footers too, in the page style, with page numbers and
+//! counts as OpenDocument's fields.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::model::{
-    self, Align, Block, Cell, Image, Inline, Kind, ListStyle, Marks, PageSetup, Para, Script,
+    self, Align, Block, Cell, Field, Image, Inline, Kind, ListStyle, Marks, PageSetup, Para, Parts,
+    Row, SIDES, Script,
 };
 use crate::office::{self, Grid, Part, Slot, escape, escaped};
 use crate::picture::{Picture, Pictures};
@@ -16,6 +19,7 @@ use crate::style::{self, Color, HalfPoints};
 /// it and `title` in its properties.
 pub fn write(
     blocks: &[Block],
+    parts: &Parts,
     setup: Option<&PageSetup>,
     title: &str,
     pictures: &Pictures,
@@ -25,24 +29,30 @@ pub fn write(
         pictures: Some(pictures),
         ..Writer::default()
     };
-    writer.blocks(blocks, &Context::top(office::text_width(&page)));
-
-    let mut content = String::from(XML);
-    let _ = write!(
-        content,
-        "<office:document-content {NAMESPACES} office:version=\"1.3\">{FONTS}<office:automatic-styles>{CONTENT_STYLES}{}",
-        lists()
-    );
+    let room = office::text_width(&page);
+    writer.blocks(blocks, &Context::top(room));
+    let body = std::mem::take(&mut writer.out);
+    // Headers and footers come from the same writer, so their styles have
+    // names of their own, and go in the styles file too.
+    let mut margins = BTreeMap::new();
+    for (name, blocks) in parts.each() {
+        if !blocks.is_empty() {
+            writer.blocks(blocks, &Context::top(room));
+            margins.insert(name, std::mem::take(&mut writer.out));
+        }
+    }
+    let mut automatic = String::new();
+    let _ = write!(automatic, "{CONTENT_STYLES}{}", lists());
     for (key, name) in &writer.spans {
         let _ = write!(
-            content,
+            automatic,
             "<style:style style:name=\"{name}\" style:family=\"text\"><style:text-properties{}/></style:style>",
             key.properties()
         );
     }
     for depth in 1..=writer.deepest_quote {
         let _ = write!(
-            content,
+            automatic,
             "<style:style style:name=\"Quote{depth}\" style:family=\"paragraph\" style:parent-style-name=\"Quotations\">\
              <style:paragraph-properties fo:margin-left=\"{}pt\"/></style:style>",
             depth * 18
@@ -50,27 +60,75 @@ pub fn write(
     }
     for (key, name) in &writer.paras {
         let _ = write!(
-            content,
+            automatic,
             "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"{}\">\
              <style:paragraph-properties{}/></style:style>",
             key.0, key.1
         );
     }
-    content.push_str(&writer.styles);
-    content.push_str("</office:automatic-styles><office:body><office:text>");
-    content.push_str(&writer.out);
-    content.push_str("</office:text></office:body></office:document-content>");
+    automatic.push_str(&writer.styles);
+    let mut content = String::from(XML);
+    let _ = write!(
+        content,
+        "<office:document-content {NAMESPACES} office:version=\"1.3\">{FONTS}<office:automatic-styles>{automatic}\
+         </office:automatic-styles><office:body><office:text>{body}</office:text></office:body></office:document-content>"
+    );
 
     let (width, height) = page.points();
-    let [top, right, bottom, left] = page.margins.map(office::number);
+    // A header sits half an inch from the paper's top, as in Google Docs
+    // and Word, and the text starts at the margin below it unless the
+    // header is taller. OpenDocument puts headers inside the margins, so
+    // the margin becomes the half inch and the header takes the rest.
+    let has = |a: &str, b: &str| margins.contains_key(a) || margins.contains_key(b);
+    let [mut top, right, mut bottom, left] = page.margins;
+    let mut header_style = String::new();
+    let mut footer_style = String::new();
+    if has("header", "first_header") && top > HEADER_FROM {
+        let _ = write!(
+            header_style,
+            "<style:header-style><style:header-footer-properties fo:min-height=\"{}pt\" fo:margin-bottom=\"0pt\" \
+             style:dynamic-spacing=\"true\"/></style:header-style>",
+            office::number(top - HEADER_FROM)
+        );
+        top = HEADER_FROM;
+    }
+    if has("footer", "first_footer") && bottom > HEADER_FROM {
+        let _ = write!(
+            footer_style,
+            "<style:footer-style><style:header-footer-properties fo:min-height=\"{}pt\" fo:margin-top=\"0pt\" \
+             style:dynamic-spacing=\"true\"/></style:footer-style>",
+            office::number(bottom - HEADER_FROM)
+        );
+        bottom = HEADER_FROM;
+    }
+    let [top, right, bottom, left] = [top, right, bottom, left].map(office::number);
+    let mut master = String::new();
+    for (name, tag) in [
+        ("header", "header"),
+        ("first_header", "header-first"),
+        ("footer", "footer"),
+        ("first_footer", "footer-first"),
+    ] {
+        match margins.get(name) {
+            Some(xml) => {
+                let _ = write!(master, "<style:{tag}>{xml}</style:{tag}>");
+            }
+            // A first page without its own shows an empty one. LibreOffice
+            // hides every header for `style:display="false"`.
+            None if parts.different_first && tag.ends_with("first") => {
+                let _ = write!(master, "<style:{tag}><text:p/></style:{tag}>");
+            }
+            None => {}
+        }
+    }
     let styles = format!(
         "{XML}<office:document-styles {NAMESPACES} office:version=\"1.3\">{FONTS}{STYLES}\
-         <office:automatic-styles><style:page-layout style:name=\"Page\">\
+         <office:automatic-styles>{automatic}<style:page-layout style:name=\"Page\">\
          <style:page-layout-properties fo:page-width=\"{}pt\" fo:page-height=\"{}pt\" style:print-orientation=\"{}\" \
          fo:margin-top=\"{top}pt\" fo:margin-right=\"{right}pt\" fo:margin-bottom=\"{bottom}pt\" fo:margin-left=\"{left}pt\"/>\
-         </style:page-layout></office:automatic-styles>\
-         <office:master-styles><style:master-page style:name=\"Standard\" style:page-layout-name=\"Page\"/></office:master-styles>\
-         </office:document-styles>",
+         {header_style}{footer_style}</style:page-layout></office:automatic-styles>\
+         <office:master-styles><style:master-page style:name=\"Standard\" style:page-layout-name=\"Page\">{master}\
+         </style:master-page></office:master-styles></office:document-styles>",
         office::number(width),
         office::number(height),
         if page.landscape {
@@ -141,6 +199,9 @@ pub fn write(
 }
 
 /// Where a picture goes in the package, named by its hash.
+/// How far headers and footers are from the paper's edge, in points.
+const HEADER_FROM: f64 = 36.0;
+
 fn media_path(picture: &Picture) -> String {
     format!("Pictures/{}.{}", picture.hash, picture.extension())
 }
@@ -266,7 +327,10 @@ struct Writer<'a> {
     styles: String,
     /// Each colored cell style used, by whether it's a heading cell and
     /// its color, and its style's name.
-    cells: BTreeMap<(bool, Color), String>,
+    /// Styles of a document's own, by their properties: cells' and
+    /// lines'.
+    cells: BTreeMap<String, String>,
+    rules: BTreeMap<String, String>,
     tables: usize,
     deepest_quote: usize,
     /// Whether the text written next starts a line, where a space would
@@ -276,23 +340,85 @@ struct Writer<'a> {
 
 impl Writer<'_> {
     /// A cell's style: the plain or heading cell's, or one of its own
-    /// with its color.
+    /// with its color, borders, or padding.
     fn cell_style(&mut self, cell: &Cell) -> String {
         let base = if cell.header { "HeadingCell" } else { "Cell" };
-        let Some(color) = cell.background else {
+        if cell.background.is_none() && cell.borders == [None; 4] && cell.padding.is_none() {
             return base.to_owned();
+        }
+        let mut props = String::new();
+        let background = match cell.background {
+            Some(color) => Some(color.css()),
+            None if cell.header => Some("#f1f3f4".to_owned()),
+            None => None,
         };
+        if let Some(background) = background {
+            let _ = write!(props, " fo:background-color=\"{background}\"");
+        }
+        match cell.padding {
+            Some(padding) => {
+                for (side, length) in SIDES.iter().zip(padding) {
+                    let _ = write!(
+                        props,
+                        " fo:padding-{side}=\"{}pt\"",
+                        office::number(model::points(length))
+                    );
+                }
+            }
+            None => props.push_str(" fo:padding=\"4pt\""),
+        }
+        if cell.borders == [None; 4] {
+            props.push_str(" fo:border=\"0.75pt solid #c4c7c5\"");
+        } else {
+            let color = cell.border_color.unwrap_or(Color::BLACK).css();
+            for (side, border) in SIDES.iter().zip(cell.borders) {
+                let line = match border {
+                    None => "0.75pt solid #c4c7c5".to_owned(),
+                    Some(0) => "none".to_owned(),
+                    Some(border) => {
+                        format!("{}pt solid {color}", office::number(model::points(border)))
+                    }
+                };
+                let _ = write!(props, " fo:border-{side}=\"{line}\"");
+            }
+        }
         let count = self.cells.len();
         let styles = &mut self.styles;
         self.cells
-            .entry((cell.header, color))
+            .entry(format!("{base}{props}"))
             .or_insert_with(|| {
                 let name = format!("{base}{}", count + 1);
                 let _ = write!(
                     styles,
                     "<style:style style:name=\"{name}\" style:family=\"table-cell\">\
-                     <style:table-cell-properties fo:background-color=\"{}\" fo:padding=\"4pt\" fo:border=\"0.75pt solid #c4c7c5\"/></style:style>",
-                    color.css()
+                     <style:table-cell-properties{props}/></style:style>"
+                );
+                name
+            })
+            .clone()
+    }
+
+    /// A line's style: the usual one, or one of its own with its
+    /// thickness or color.
+    fn rule_style(&mut self, rule: &model::Rule) -> String {
+        if rule.thickness.is_none() && rule.color.is_none() {
+            return "Rule".to_owned();
+        }
+        let thickness = rule.thickness.map_or("0.75".to_owned(), |thickness| {
+            office::number(model::points(thickness))
+        });
+        let color = rule.color.map_or("#c4c7c5".to_owned(), Color::css);
+        let border = format!("{thickness}pt solid {color}");
+        let count = self.rules.len();
+        let styles = &mut self.styles;
+        self.rules
+            .entry(border.clone())
+            .or_insert_with(|| {
+                let name = format!("Rule{}", count + 1);
+                let _ = write!(
+                    styles,
+                    "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"Rule\">\
+                     <style:paragraph-properties fo:border-bottom=\"{border}\"/></style:style>"
                 );
                 name
             })
@@ -424,7 +550,10 @@ impl Writer<'_> {
                     self.out.push_str("</text:p>");
                 }
             }
-            Block::Rule => self.out.push_str("<text:p text:style-name=\"Rule\"/>"),
+            Block::Rule(rule) => {
+                let style = self.rule_style(rule);
+                let _ = write!(self.out, "<text:p text:style-name=\"{style}\"/>");
+            }
             Block::Bullets(style, items) => {
                 let name = style.map_or("Bullets".to_owned(), list_style_name);
                 let _ = write!(self.out, "<text:list text:style-name=\"{name}\">");
@@ -553,7 +682,7 @@ impl Writer<'_> {
             font: marks.font.clone(),
         };
         if key == SpanKey::default() {
-            self.text(text);
+            self.field_or_text(text, marks);
             return;
         }
         let count = self.spans.len();
@@ -563,8 +692,20 @@ impl Writer<'_> {
             .or_insert_with(|| format!("Span{}", count + 1))
             .clone();
         let _ = write!(self.out, "<text:span text:style-name=\"{name}\">");
-        self.text(text);
+        self.field_or_text(text, marks);
         self.out.push_str("</text:span>");
+    }
+
+    /// A page number or count as OpenDocument's field, or the text.
+    fn field_or_text(&mut self, text: &str, marks: &Marks) {
+        match marks.field {
+            Some(Field::PageNumber) => self
+                .out
+                .push_str("<text:page-number text:select-page=\"current\">1</text:page-number>"),
+            Some(Field::PageCount) => self.out.push_str("<text:page-count>1</text:page-count>"),
+            None => self.text(text),
+        }
+        self.line_start = false;
     }
 
     /// Writes text as OpenDocument keeps it. Spaces in the XML collapse
@@ -616,7 +757,7 @@ impl Writer<'_> {
         self.line_start = true;
     }
 
-    fn table(&mut self, rows: &[Vec<Cell>], context: &Context) {
+    fn table(&mut self, rows: &[Row], context: &Context) {
         let grid = Grid::new(
             rows,
             (context.room - context.quotes as f64 * 18.0).max(72.0),
@@ -651,14 +792,28 @@ impl Writer<'_> {
         // Rows of heading cells at the top repeat on each page.
         let heading_rows = rows
             .iter()
-            .take_while(|row| !row.is_empty() && row.iter().all(|cell| cell.header))
+            .take_while(|row| !row.cells.is_empty() && row.cells.iter().all(|cell| cell.header))
             .count()
             .min(rows.len().saturating_sub(1));
         for (index, row) in grid.rows.iter().enumerate() {
             if index == 0 && heading_rows > 0 {
                 self.out.push_str("<table:table-header-rows>");
             }
-            self.out.push_str("<table:table-row>");
+            match rows[index].height {
+                Some(height) => {
+                    let _ = write!(
+                        self.styles,
+                        "<style:style style:name=\"{name}.R{index}\" style:family=\"table-row\">\
+                         <style:table-row-properties style:min-row-height=\"{}pt\"/></style:style>",
+                        office::number(model::points(height))
+                    );
+                    let _ = write!(
+                        self.out,
+                        "<table:table-row table:style-name=\"{name}.R{index}\">"
+                    );
+                }
+                None => self.out.push_str("<table:table-row>"),
+            }
             let mut column = 0;
             for slot in row {
                 match slot {
@@ -675,7 +830,10 @@ impl Writer<'_> {
                             let _ = write!(self.out, " table:number-rows-spanned=\"{rows}\"");
                         }
                         self.out.push('>');
-                        let mut inner = Context::top(grid.width(column, *span) - 8.0);
+                        let across = cell.padding.map_or(8.0, |padding| {
+                            model::points(padding[1]) + model::points(padding[3])
+                        });
+                        let mut inner = Context::top(grid.width(column, *span) - across);
                         inner.cell = Some(cell.header);
                         if cell.content.is_empty() {
                             self.out.push_str("<text:p/>");
@@ -820,17 +978,17 @@ const STYLES: &str = "<office:styles>\
 <style:style style:name=\"Subtitle\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:class=\"chapter\">\
 <style:paragraph-properties fo:margin-top=\"0pt\" fo:margin-bottom=\"16pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"15pt\" fo:color=\"#666666\"/></style:style>\
 <style:style style:name=\"Heading_20_1\" style:display-name=\"Heading 1\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"1\" style:class=\"text\">\
-<style:paragraph-properties fo:margin-top=\"20pt\" fo:margin-bottom=\"6pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"20pt\" fo:font-weight=\"bold\"/></style:style>\
+<style:paragraph-properties fo:margin-top=\"20pt\" fo:margin-bottom=\"6pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"20pt\"/></style:style>\
 <style:style style:name=\"Heading_20_2\" style:display-name=\"Heading 2\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"2\" style:class=\"text\">\
-<style:paragraph-properties fo:margin-top=\"18pt\" fo:margin-bottom=\"6pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"16pt\" fo:font-weight=\"bold\"/></style:style>\
+<style:paragraph-properties fo:margin-top=\"18pt\" fo:margin-bottom=\"6pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"16pt\"/></style:style>\
 <style:style style:name=\"Heading_20_3\" style:display-name=\"Heading 3\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"3\" style:class=\"text\">\
-<style:paragraph-properties fo:margin-top=\"16pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"14pt\" fo:font-weight=\"bold\"/></style:style>\
+<style:paragraph-properties fo:margin-top=\"16pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"14pt\" fo:color=\"#434343\"/></style:style>\
 <style:style style:name=\"Heading_20_4\" style:display-name=\"Heading 4\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"4\" style:class=\"text\">\
-<style:paragraph-properties fo:margin-top=\"14pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"12pt\" fo:font-weight=\"bold\"/></style:style>\
+<style:paragraph-properties fo:margin-top=\"14pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"12pt\" fo:color=\"#666666\"/></style:style>\
 <style:style style:name=\"Heading_20_5\" style:display-name=\"Heading 5\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"5\" style:class=\"text\">\
-<style:paragraph-properties fo:margin-top=\"12pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-weight=\"bold\"/></style:style>\
+<style:paragraph-properties fo:margin-top=\"12pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:color=\"#666666\"/></style:style>\
 <style:style style:name=\"Heading_20_6\" style:display-name=\"Heading 6\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:default-outline-level=\"6\" style:class=\"text\">\
-<style:paragraph-properties fo:margin-top=\"12pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-weight=\"bold\" fo:font-style=\"italic\"/></style:style>\
+<style:paragraph-properties fo:margin-top=\"12pt\" fo:margin-bottom=\"4pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:color=\"#666666\" fo:font-style=\"italic\"/></style:style>\
 <style:style style:name=\"Quotations\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\">\
 <style:paragraph-properties fo:padding-left=\"8pt\" fo:border-left=\"2.25pt solid #dadce0\" fo:border-right=\"none\" fo:border-top=\"none\" fo:border-bottom=\"none\"/>\
 <style:text-properties fo:color=\"#444746\"/></style:style>\
@@ -876,6 +1034,33 @@ mod tests {
     }
 
     #[test]
+    fn writes_headers_footers_and_page_numbers() {
+        let parts = crate::html::tests::parts();
+        let blocks = vec![Block::Paragraph(Para::default(), Vec::new())];
+        let file = write(&blocks, &parts, None, "Parts", &Pictures::new());
+        let styles = crate::office::tests::unzip(&file, "styles.xml");
+        assert!(styles.contains("<style:header><text:p"), "{styles}");
+        assert!(
+            styles.contains("<text:page-number text:select-page=\"current\">1</text:page-number>"),
+            "{styles}"
+        );
+        assert!(
+            styles.contains("<text:page-count>1</text:page-count>"),
+            "{styles}"
+        );
+        assert!(
+            styles.contains("<style:header-first><text:p/></style:header-first>"),
+            "{styles}"
+        );
+        assert!(styles.contains("<style:footer-first><text:p"), "{styles}");
+        // The header's half inch from the top, and the text an inch down.
+        assert!(styles.contains("fo:margin-top=\"36pt\""), "{styles}");
+        assert!(styles.contains("fo:min-height=\"36pt\""), "{styles}");
+        // Its small text's style is in the styles file too.
+        assert!(styles.contains("fo:font-size=\"9pt\""), "{styles}");
+    }
+
+    #[test]
     fn writes_an_opendocument_file_on_the_documents_paper() {
         let bold = Marks {
             bold: true,
@@ -916,7 +1101,13 @@ mod tests {
             landscape: false,
             margins: [72.0, 36.0, 72.0, 36.0],
         };
-        let file = write(&blocks, Some(&setup), "Plan", &Pictures::new());
+        let file = write(
+            &blocks,
+            &crate::model::Parts::default(),
+            Some(&setup),
+            "Plan",
+            &Pictures::new(),
+        );
         // The mimetype comes first, stored as is, as OpenDocument asks.
         assert_eq!(&file[30..38], b"mimetype");
         assert_eq!(&file[38..38 + MIME_TYPE.len()], MIME_TYPE.as_bytes());
@@ -964,7 +1155,13 @@ mod tests {
         let pictures: Pictures = [(picture.hash.clone(), picture.clone())]
             .into_iter()
             .collect();
-        let file = write(&[image], Some(&setup), "Pictures", &pictures);
+        let file = write(
+            &[image],
+            &crate::model::Parts::default(),
+            Some(&setup),
+            "Pictures",
+            &pictures,
+        );
         let content = part(&file, "content.xml");
         let path = format!("Pictures/{}.png", picture.hash);
         assert!(
@@ -981,6 +1178,7 @@ mod tests {
     fn writes_cell_colors() {
         let file = write(
             &crate::html::tests::colored_cells(),
+            &crate::model::Parts::default(),
             None,
             "Cells",
             &Pictures::new(),
@@ -996,9 +1194,40 @@ mod tests {
     }
 
     #[test]
+    fn writes_borders_padding_row_heights_and_lines() {
+        let file = write(
+            &crate::html::tests::google_layout(),
+            &crate::model::Parts::default(),
+            None,
+            "Resume",
+            &Pictures::new(),
+        );
+        let content = part(&file, "content.xml");
+        assert!(content.contains(
+            "<style:table-cell-properties fo:padding-top=\"3.6pt\" fo:padding-right=\"3.6pt\" \
+             fo:padding-bottom=\"3.6pt\" fo:padding-left=\"3.6pt\" fo:border-top=\"none\""
+        ));
+        assert!(content.contains("fo:border-top=\"1pt solid #ff0000\" fo:border-right=\"none\""));
+        assert!(content.contains("<style:table-row-properties style:min-row-height=\"120pt\"/>"));
+        assert!(content.contains("<table:table-row table:style-name=\"Table1.R0\">"));
+        assert!(
+            content.contains(
+                "<style:paragraph-properties fo:border-bottom=\"2.25pt solid #000000\"/>"
+            )
+        );
+        assert!(content.contains("<text:p text:style-name=\"Rule1\"/>"));
+    }
+
+    #[test]
     fn writes_paragraph_layout_list_styles_and_page_breaks() {
         let blocks = crate::html::tests::laid_out();
-        let file = write(&blocks, None, "Layout", &Pictures::new());
+        let file = write(
+            &blocks,
+            &crate::model::Parts::default(),
+            None,
+            "Layout",
+            &Pictures::new(),
+        );
         let content = part(&file, "content.xml");
         assert!(content.contains(
             "style:parent-style-name=\"Standard\"><style:paragraph-properties fo:text-align=\"justify\" \

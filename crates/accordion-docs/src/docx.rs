@@ -4,11 +4,16 @@
 //! nine levels, checklists (as ☐ and ☑ bullets, with done items struck
 //! through as on the page), quotes, code, rules, and tables with merged
 //! cells and column widths. The page setup becomes the section's paper and
-//! margins. Text is Arial 11 point, as in Google Docs.
+//! margins. Text is Arial 11 point, as in Google Docs. Headers and footers,
+//! the first page's own too, are Word's, with page numbers and counts as
+//! Word's fields.
 
 use std::fmt::Write as _;
 
-use crate::model::{Align, Block, Image, Inline, Kind, ListStyle, Marks, PageSetup, Para, Script};
+use crate::model::{
+    self, Align, Block, Field, Image, Inline, Kind, ListStyle, Marks, PageSetup, Para, Parts, Row,
+    Script,
+};
 use crate::office::{self, Grid, Part, Slot, escape, escaped};
 use crate::picture::{Picture, Pictures};
 
@@ -16,6 +21,7 @@ use crate::picture::{Picture, Pictures};
 /// `title` in its properties.
 pub fn write(
     blocks: &[Block],
+    parts: &Parts,
     setup: Option<&PageSetup>,
     title: &str,
     pictures: &Pictures,
@@ -32,6 +38,30 @@ pub fn write(
     let room = office::text_width(&page);
     writer.blocks(blocks, &Context::top(room));
     let body = std::mem::take(&mut writer.out);
+    // Each header and footer is a part of its own, with Word's name for
+    // where it goes.
+    let mut margins: Vec<(String, &str, &str, String)> = Vec::new();
+    for (name, blocks) in parts.each() {
+        if blocks.is_empty() {
+            continue;
+        }
+        writer.blocks(blocks, &Context::top(room));
+        let content = std::mem::take(&mut writer.out);
+        let (tag, kind) = match name {
+            "header" => ("hdr", "default"),
+            "footer" => ("ftr", "default"),
+            "first_header" => ("hdr", "first"),
+            _ => ("ftr", "first"),
+        };
+        let xml = format!(
+            "{XML}<w:{tag} xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+             xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
+             xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
+             xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
+             xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">{content}</w:{tag}>"
+        );
+        margins.push((name.replace('_', "-"), tag, kind, xml));
+    }
 
     let mut document = String::from(XML);
     document.push_str(
@@ -46,13 +76,25 @@ pub fn write(
     let [top, right, bottom, left] = page.margins.map(twips);
     let _ = write!(
         document,
-        "<w:sectPr><w:pgSz w:w=\"{}\" w:h=\"{}\"{}/>\
+        "<w:sectPr>{}<w:pgSz w:w=\"{}\" w:h=\"{}\"{}/>\
          <w:pgMar w:top=\"{top}\" w:right=\"{right}\" w:bottom=\"{bottom}\" w:left=\"{left}\" \
-         w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/></w:sectPr></w:body></w:document>",
+         w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>{}</w:sectPr></w:body></w:document>",
+        margins
+            .iter()
+            .map(|(name, tag, kind, _)| format!(
+                "<w:{}Reference w:type=\"{kind}\" r:id=\"rId-{name}\"/>",
+                if *tag == "hdr" { "header" } else { "footer" }
+            ))
+            .collect::<String>(),
         twips(width),
         twips(height),
         if page.landscape {
             " w:orient=\"landscape\""
+        } else {
+            ""
+        },
+        if parts.different_first {
+            "<w:titlePg/>"
         } else {
             ""
         },
@@ -81,6 +123,18 @@ pub fn write(
         );
     }
     relations.push_str("</Relationships>");
+    // Headers and footers can hold links and pictures too, by the same IDs.
+    let part_relations = relations.clone();
+    let mut extra = String::new();
+    for (name, tag, _, _) in &margins {
+        let kind = if *tag == "hdr" { "header" } else { "footer" };
+        let _ = write!(
+            extra,
+            "<Relationship Id=\"rId-{name}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}\" \
+             Target=\"{name}.xml\"/>"
+        );
+    }
+    relations = relations.replace("</Relationships>", &format!("{extra}</Relationships>"));
 
     let core = format!(
         "{XML}<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
@@ -112,6 +166,25 @@ pub fn write(
         "<Default Extension=\"xml\"",
         &format!("{defaults}<Default Extension=\"xml\""),
     );
+    let overrides: String = margins
+        .iter()
+        .map(|(name, tag, _, _)| {
+            format!(
+                "<Override PartName=\"/word/{name}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.{}+xml\"/>",
+                if *tag == "hdr" { "header" } else { "footer" }
+            )
+        })
+        .collect();
+    content_types = content_types.replace("</Types>", &format!("{overrides}</Types>"));
+    let margin_paths: Vec<(String, String)> = margins
+        .iter()
+        .map(|(name, _, _, _)| {
+            (
+                format!("word/{name}.xml"),
+                format!("word/_rels/{name}.xml.rels"),
+            )
+        })
+        .collect();
     let media_paths: Vec<String> = writer
         .media
         .iter()
@@ -155,6 +228,18 @@ pub fn write(
             stored: false,
         },
     ];
+    for ((path, relations_path), (_, _, _, xml)) in margin_paths.iter().zip(&margins) {
+        parts.push(Part {
+            path,
+            contents: xml.as_bytes(),
+            stored: false,
+        });
+        parts.push(Part {
+            path: relations_path,
+            contents: part_relations.as_bytes(),
+            stored: false,
+        });
+    }
     for (path, picture) in media_paths.iter().zip(&writer.media) {
         parts.push(Part {
             path,
@@ -301,8 +386,15 @@ impl Writer<'_> {
                     );
                 }
             }
-            Block::Rule => {
-                self.out.push_str("<w:p><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"6\" w:space=\"1\" w:color=\"C4C7C5\"/></w:pBdr>");
+            Block::Rule(rule) => {
+                let size = rule.thickness.map_or(6, eighths);
+                let color = rule
+                    .color
+                    .map_or("C4C7C5".to_owned(), |color| color.hex_upper());
+                let _ = write!(
+                    self.out,
+                    "<w:p><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"{size}\" w:space=\"1\" w:color=\"{color}\"/></w:pBdr>"
+                );
                 self.indent(context, false, &Para::default());
                 self.out.push_str("</w:pPr></w:p>");
             }
@@ -487,6 +579,7 @@ impl Writer<'_> {
                 link = Some(href);
             }
             match inline {
+                Inline::Text(_, marks) if marks.field.is_some() => self.field(marks, context),
                 Inline::Text(text, marks) => self.run(text, marks, context),
                 Inline::Break => self.out.push_str("<w:r><w:br/></w:r>"),
             }
@@ -494,6 +587,22 @@ impl Writer<'_> {
         if link.is_some() {
             self.out.push_str("</w:hyperlink>");
         }
+    }
+
+    /// A page number or count, as Word's field, with a number in it until
+    /// Word works out each page's.
+    fn field(&mut self, marks: &Marks, context: &Context) {
+        let (instruction, shown) = match marks.field {
+            Some(Field::PageCount) => ("NUMPAGES", "1"),
+            _ => ("PAGE", "1"),
+        };
+        let _ = write!(self.out, "<w:fldSimple w:instr=\" {instruction} \">");
+        let plain = Marks {
+            field: None,
+            ..marks.clone()
+        };
+        self.run(shown, &plain, context);
+        self.out.push_str("</w:fldSimple>");
     }
 
     fn run(&mut self, text: &str, marks: &Marks, context: &Context) {
@@ -581,7 +690,7 @@ impl Writer<'_> {
         }
     }
 
-    fn table(&mut self, rows: &[Vec<crate::model::Cell>], context: &Context) {
+    fn table(&mut self, rows: &[Row], context: &Context) {
         let room = (context.room - context.indent() as f64 / 20.0).max(72.0);
         let grid = Grid::new(rows, room);
         let total: f64 = grid.widths.iter().sum();
@@ -608,9 +717,20 @@ impl Writer<'_> {
             // Rows of heading cells at the top repeat on each page.
             let heading = rows[..=index]
                 .iter()
-                .all(|row| !row.is_empty() && row.iter().all(|cell| cell.header));
-            if heading {
-                self.out.push_str("<w:trPr><w:tblHeader/></w:trPr>");
+                .all(|row| !row.cells.is_empty() && row.cells.iter().all(|cell| cell.header));
+            let height = rows[index].height;
+            if heading || height.is_some() {
+                self.out.push_str("<w:trPr>");
+                if let Some(height) = height {
+                    let _ = write!(
+                        self.out,
+                        "<w:trHeight w:val=\"{height}\" w:hRule=\"atLeast\"/>"
+                    );
+                }
+                if heading {
+                    self.out.push_str("<w:tblHeader/>");
+                }
+                self.out.push_str("</w:trPr>");
             }
             let mut column = 0;
             for slot in row {
@@ -631,6 +751,30 @@ impl Writer<'_> {
                         if *rows > 1 {
                             self.out.push_str("<w:vMerge w:val=\"restart\"/>");
                         }
+                        if cell.borders != [None; 4] {
+                            let color = cell
+                                .border_color
+                                .map_or("000000".to_owned(), |color| color.hex_upper());
+                            self.out.push_str("<w:tcBorders>");
+                            // Word's order: top, left, bottom, right.
+                            for at in [0, 3, 2, 1] {
+                                let side = model::SIDES[at];
+                                match cell.borders[at] {
+                                    None => {}
+                                    Some(0) => {
+                                        let _ = write!(self.out, "<w:{side} w:val=\"nil\"/>");
+                                    }
+                                    Some(border) => {
+                                        let _ = write!(
+                                            self.out,
+                                            "<w:{side} w:val=\"single\" w:sz=\"{}\" w:space=\"0\" w:color=\"{color}\"/>",
+                                            eighths(border)
+                                        );
+                                    }
+                                }
+                            }
+                            self.out.push_str("</w:tcBorders>");
+                        }
                         // A cell's own color, or a heading cell's gray.
                         let fill = match cell.background {
                             Some(color) => Some(color.hex_upper()),
@@ -643,8 +787,23 @@ impl Writer<'_> {
                                 "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{fill}\"/>"
                             );
                         }
+                        if let Some(padding) = cell.padding {
+                            self.out.push_str("<w:tcMar>");
+                            for at in [0, 3, 2, 1] {
+                                let _ = write!(
+                                    self.out,
+                                    "<w:{} w:w=\"{}\" w:type=\"dxa\"/>",
+                                    model::SIDES[at],
+                                    padding[at]
+                                );
+                            }
+                            self.out.push_str("</w:tcMar>");
+                        }
                         self.out.push_str("</w:tcPr>");
-                        let mut inner = Context::top(grid.width(column, span) - 10.8);
+                        let across = cell.padding.map_or(10.8, |padding| {
+                            model::points(padding[1]) + model::points(padding[3])
+                        });
+                        let mut inner = Context::top(grid.width(column, span) - across);
                         inner.header = cell.header;
                         self.blocks(&cell.content, &inner);
                         // A cell ends with a paragraph, even after a table.
@@ -662,6 +821,12 @@ impl Writer<'_> {
         }
         self.out.push_str("</w:tbl>");
     }
+}
+
+/// A line's thickness in eighths of a point, as Word gives borders, from
+/// a quarter point to Word's thickest, 12 points.
+fn eighths(thickness: model::Twips) -> i32 {
+    (thickness * 2 / 5).clamp(2, 96)
 }
 
 /// The numbering part: one definition each for bullets, checklists, and
@@ -793,17 +958,17 @@ const STYLES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\
 <w:style w:type=\"paragraph\" w:styleId=\"Subtitle\"><w:name w:val=\"Subtitle\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
 <w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"0\" w:after=\"320\"/></w:pPr><w:rPr><w:color w:val=\"666666\"/><w:sz w:val=\"30\"/><w:szCs w:val=\"30\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Heading1\"><w:name w:val=\"heading 1\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
-<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"400\" w:after=\"120\"/><w:outlineLvl w:val=\"0\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"40\"/><w:szCs w:val=\"40\"/></w:rPr></w:style>\
+<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"400\" w:after=\"120\"/><w:outlineLvl w:val=\"0\"/></w:pPr><w:rPr><w:sz w:val=\"40\"/><w:szCs w:val=\"40\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Heading2\"><w:name w:val=\"heading 2\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
-<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"360\" w:after=\"120\"/><w:outlineLvl w:val=\"1\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"32\"/><w:szCs w:val=\"32\"/></w:rPr></w:style>\
+<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"360\" w:after=\"120\"/><w:outlineLvl w:val=\"1\"/></w:pPr><w:rPr><w:sz w:val=\"32\"/><w:szCs w:val=\"32\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Heading3\"><w:name w:val=\"heading 3\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
-<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"320\" w:after=\"80\"/><w:outlineLvl w:val=\"2\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"28\"/><w:szCs w:val=\"28\"/></w:rPr></w:style>\
+<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"320\" w:after=\"80\"/><w:outlineLvl w:val=\"2\"/></w:pPr><w:rPr><w:color w:val=\"434343\"/><w:sz w:val=\"28\"/><w:szCs w:val=\"28\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Heading4\"><w:name w:val=\"heading 4\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
-<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"280\" w:after=\"80\"/><w:outlineLvl w:val=\"3\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"24\"/><w:szCs w:val=\"24\"/></w:rPr></w:style>\
+<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"280\" w:after=\"80\"/><w:outlineLvl w:val=\"3\"/></w:pPr><w:rPr><w:color w:val=\"666666\"/><w:sz w:val=\"24\"/><w:szCs w:val=\"24\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Heading5\"><w:name w:val=\"heading 5\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
-<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"240\" w:after=\"80\"/><w:outlineLvl w:val=\"4\"/></w:pPr><w:rPr><w:b/></w:rPr></w:style>\
+<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"240\" w:after=\"80\"/><w:outlineLvl w:val=\"4\"/></w:pPr><w:rPr><w:color w:val=\"666666\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Heading6\"><w:name w:val=\"heading 6\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
-<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"240\" w:after=\"80\"/><w:outlineLvl w:val=\"5\"/></w:pPr><w:rPr><w:b/><w:i/></w:rPr></w:style>\
+<w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before=\"240\" w:after=\"80\"/><w:outlineLvl w:val=\"5\"/></w:pPr><w:rPr><w:i/><w:color w:val=\"666666\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/><w:basedOn w:val=\"Normal\"/><w:qFormat/>\
 <w:pPr><w:pBdr><w:left w:val=\"single\" w:sz=\"18\" w:space=\"8\" w:color=\"DADCE0\"/></w:pBdr></w:pPr><w:rPr><w:color w:val=\"444746\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Code\"><w:name w:val=\"Code\"/><w:basedOn w:val=\"Normal\"/>\
@@ -836,6 +1001,44 @@ mod tests {
             .read_to_string(&mut text)
             .unwrap();
         text
+    }
+
+    #[test]
+    fn writes_headers_footers_and_page_numbers() {
+        let parts = crate::html::tests::parts();
+        let blocks = vec![Block::Paragraph(Para::default(), Vec::new())];
+        let file = write(&blocks, &parts, None, "Parts", &Pictures::new());
+        let document = crate::office::tests::unzip(&file, "word/document.xml");
+        assert!(
+            document.contains("<w:headerReference w:type=\"default\" r:id=\"rId-header\"/>"),
+            "{document}"
+        );
+        assert!(
+            document.contains("<w:footerReference w:type=\"first\" r:id=\"rId-first-footer\"/>"),
+            "{document}"
+        );
+        assert!(document.contains("<w:titlePg/></w:sectPr>"), "{document}");
+        let header = crate::office::tests::unzip(&file, "word/header.xml");
+        assert!(
+            header.starts_with(XML) && header.contains("<w:hdr "),
+            "{header}"
+        );
+        assert!(
+            header.contains("<w:fldSimple w:instr=\" PAGE \"><w:r><w:rPr><w:sz w:val=\"18\"/>"),
+            "{header}"
+        );
+        assert!(
+            header.contains("<w:fldSimple w:instr=\" NUMPAGES \">"),
+            "{header}"
+        );
+        let relations = crate::office::tests::unzip(&file, "word/_rels/document.xml.rels");
+        assert!(
+            relations.contains("Target=\"first-footer.xml\""),
+            "{relations}"
+        );
+        let types = crate::office::tests::unzip(&file, "[Content_Types].xml");
+        assert!(types.contains("PartName=\"/word/footer.xml\""), "{types}");
+        crate::office::tests::unzip(&file, "word/_rels/header.xml.rels");
     }
 
     #[test]
@@ -883,7 +1086,7 @@ mod tests {
                     vec![Inline::Text("Done".to_owned(), Marks::default())],
                 )],
             )]),
-            Block::Table(vec![vec![Cell {
+            crate::model::table(vec![vec![Cell {
                 header: true,
                 colspan: 1,
                 rowspan: 1,
@@ -893,6 +1096,7 @@ mod tests {
                     Para::default(),
                     vec![Inline::Text("Head".to_owned(), Marks::default())],
                 )],
+                ..Cell::default()
             }]]),
         ];
         let setup = PageSetup {
@@ -900,7 +1104,13 @@ mod tests {
             landscape: true,
             margins: [36.0, 72.0, 36.0, 72.0],
         };
-        let file = write(&blocks, Some(&setup), "Plan & notes", &Pictures::new());
+        let file = write(
+            &blocks,
+            &crate::model::Parts::default(),
+            Some(&setup),
+            "Plan & notes",
+            &Pictures::new(),
+        );
         let document = part(&file, "word/document.xml");
         assert!(
             document.contains("<w:pStyle w:val=\"Heading1\"/>"),
@@ -944,7 +1154,13 @@ mod tests {
             width: None,
         });
         let pictures: Pictures = [(picture.hash.clone(), picture)].into_iter().collect();
-        let file = write(&[image.clone(), image], Some(&setup), "Pictures", &pictures);
+        let file = write(
+            &[image.clone(), image],
+            &crate::model::Parts::default(),
+            Some(&setup),
+            "Pictures",
+            &pictures,
+        );
         let document = part(&file, "word/document.xml");
         assert_eq!(
             document.matches("r:embed=\"rIdPicture0\"").count(),
@@ -970,6 +1186,7 @@ mod tests {
     fn writes_cell_colors() {
         let file = write(
             &crate::html::tests::colored_cells(),
+            &crate::model::Parts::default(),
             None,
             "Cells",
             &Pictures::new(),
@@ -984,9 +1201,46 @@ mod tests {
     }
 
     #[test]
+    fn writes_borders_padding_row_heights_and_lines() {
+        let file = write(
+            &crate::html::tests::google_layout(),
+            &crate::model::Parts::default(),
+            None,
+            "Resume",
+            &Pictures::new(),
+        );
+        let document = part(&file, "word/document.xml");
+        assert!(
+            document.contains("<w:trPr><w:trHeight w:val=\"2400\" w:hRule=\"atLeast\"/></w:trPr>")
+        );
+        assert!(document.contains(
+            "<w:tcBorders><w:top w:val=\"nil\"/><w:left w:val=\"nil\"/><w:bottom w:val=\"nil\"/><w:right w:val=\"nil\"/></w:tcBorders>\
+             <w:tcMar><w:top w:w=\"72\" w:type=\"dxa\"/>"
+        ));
+        assert!(
+            document
+                .contains("<w:top w:val=\"single\" w:sz=\"8\" w:space=\"0\" w:color=\"FF0000\"/>")
+        );
+        assert!(
+            document.contains(
+                "<w:bottom w:val=\"single\" w:sz=\"18\" w:space=\"1\" w:color=\"000000\"/>"
+            )
+        );
+        // Headings are regular weight, as in Google Docs.
+        let styles = part(&file, "word/styles.xml");
+        assert!(!styles.contains("<w:outlineLvl w:val=\"0\"/></w:pPr><w:rPr><w:b/>"));
+    }
+
+    #[test]
     fn writes_paragraph_layout_list_styles_and_page_breaks() {
         let blocks = crate::html::tests::laid_out();
-        let file = write(&blocks, None, "Layout", &Pictures::new());
+        let file = write(
+            &blocks,
+            &crate::model::Parts::default(),
+            None,
+            "Layout",
+            &Pictures::new(),
+        );
         let document = part(&file, "word/document.xml");
         assert!(document.contains("<w:pStyle w:val=\"Title\"/><w:jc w:val=\"center\"/>"));
         assert!(document.contains(
