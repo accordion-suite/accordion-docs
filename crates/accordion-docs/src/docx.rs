@@ -6,25 +6,29 @@
 //! cells and column widths. The page setup becomes the section's paper and
 //! margins. Text is Arial 11 point, as in Google Docs. Headers and footers,
 //! the first page's own too, are Word's, with page numbers and counts as
-//! Word's fields. Footnotes are Word's, numbered by Word.
+//! Word's fields. Footnotes are Word's, numbered by Word. A table of
+//! contents is Word's TOC field, with its entries and page numbers already
+//! in it, so it shows as it does in Docs and Word can update it.
 
 use std::fmt::Write as _;
 
 use crate::model::{
-    self, Align, Block, Field, Image, Inline, Kind, ListStyle, Marks, PageSetup, Para, Parts, Row,
-    Script,
+    self, Align, Block, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks, PageSetup,
+    Para, Parts, Row, Script,
 };
 use crate::office::{self, Grid, Part, Slot, escape, escaped};
 use crate::picture::{Picture, Pictures};
 
 /// `blocks` on `setup`'s page as a Word file, with `pictures` in it and
-/// `title` in its properties.
+/// `title` in its properties. `pages` is the page each entry of a table of
+/// contents is on, as the editor lays the pages out, or empty if unknown.
 pub fn write(
     blocks: &[Block],
     parts: &Parts,
     setup: Option<&PageSetup>,
     title: &str,
     pictures: &Pictures,
+    pages: &[u32],
 ) -> Vec<u8> {
     let page = office::page_of(setup);
     let mut writer = Writer {
@@ -35,10 +39,23 @@ pub fn write(
         media: Vec::new(),
         drawings: 0,
         notes: Vec::new(),
+        anchors: Vec::new(),
+        headings: 0,
+        contents: Vec::new(),
+        pages: Vec::new(),
     };
+    if model::has_contents(blocks) {
+        writer.anchors = model::heading_anchors(blocks);
+        writer.contents = model::contents(blocks);
+        if pages.len() == writer.contents.len() {
+            writer.pages = pages.to_vec();
+        }
+    }
     let room = office::text_width(&page);
     writer.blocks(blocks, &Context::top(room));
     let body = std::mem::take(&mut writer.out);
+    // Headers and footers have no headings the contents link to.
+    writer.anchors.clear();
     let notes = std::mem::take(&mut writer.notes);
     // Each header and footer is a part of its own, with Word's name for
     // where it goes.
@@ -369,6 +386,13 @@ struct Writer<'a> {
     drawings: usize,
     /// Each footnote, as Word's `<w:footnote>`, numbered from 1.
     notes: Vec<String>,
+    /// Each heading's anchor, while the document has a table of contents,
+    /// and how many headings are written.
+    anchors: Vec<Option<String>>,
+    headings: usize,
+    /// The table of contents' entries, and each one's page, if known.
+    contents: Vec<model::Entry>,
+    pages: Vec<u32>,
 }
 
 impl Writer<'_> {
@@ -400,8 +424,11 @@ impl Writer<'_> {
             }
             Block::Heading(level, para, inlines) => {
                 let style = format!("Heading{}", (*level).clamp(1, 6));
+                let start = self.out.len();
                 self.paragraph(context, Some(&style), para, inlines);
+                self.bookmark(start);
             }
+            Block::Contents(style) => self.contents(*style, context),
             Block::PageBreak => self
                 .out
                 .push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>"),
@@ -541,6 +568,107 @@ impl Writer<'_> {
             }
         }
         self.out.push_str("/>");
+    }
+
+    /// Marks the heading written from `start` as the place its table of
+    /// contents entry links to, if it has one.
+    fn bookmark(&mut self, start: usize) {
+        let index = self.headings;
+        self.headings += 1;
+        let Some(anchor) = self.anchors.get(index).cloned().flatten() else {
+            return;
+        };
+        let Some(entry) = self
+            .contents
+            .iter()
+            .position(|entry| entry.anchor == anchor)
+        else {
+            return;
+        };
+        let Some(after) = self.out[start..].find("</w:pPr>") else {
+            return;
+        };
+        let at = start + after + "</w:pPr>".len();
+        self.out.insert_str(
+            at,
+            &format!(
+                "<w:bookmarkStart w:id=\"{entry}\" w:name=\"{}\"/>",
+                toc_name(entry)
+            ),
+        );
+        if self.out.ends_with("</w:p>") {
+            let end = self.out.len() - "</w:p>".len();
+            self.out
+                .insert_str(end, &format!("<w:bookmarkEnd w:id=\"{entry}\"/>"));
+        }
+    }
+
+    /// A table of contents: Word's TOC field around a paragraph for each
+    /// heading, each a link to its heading's bookmark with a PAGEREF field
+    /// for its page, as Word writes one.
+    fn contents(&mut self, style: ContentsStyle, context: &Context) {
+        let leader = if style == ContentsStyle::Dotted {
+            "dot"
+        } else {
+            "none"
+        };
+        let tab = (context.room * 20.0).round() as i64;
+        let switches = if style.numbered() { "" } else { " \\n" };
+        let begin = format!(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText xml:space=\"preserve\"> TOC \\o \"1-6\" \\h \\z \\u{switches} </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>"
+        );
+        let end = "<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        self.out.push_str(
+            "<w:sdt><w:sdtPr><w:docPartObj><w:docPartGallery w:val=\"Table of Contents\"/><w:docPartUnique/></w:docPartObj></w:sdtPr><w:sdtContent>",
+        );
+        let entries = std::mem::take(&mut self.contents);
+        if entries.is_empty() {
+            let _ = write!(self.out, "<w:p>{begin}{end}</w:p>");
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            let _ = write!(
+                self.out,
+                "<w:p><w:pPr><w:pStyle w:val=\"TOC{}\"/><w:tabs><w:tab w:val=\"right\" w:leader=\"{leader}\" w:pos=\"{tab}\"/></w:tabs></w:pPr>",
+                entry.level
+            );
+            if index == 0 {
+                self.out.push_str(&begin);
+            }
+            let name = toc_name(index);
+            let _ = write!(
+                self.out,
+                "<w:hyperlink w:anchor=\"{name}\" w:history=\"1\"><w:r>"
+            );
+            if !style.numbered() {
+                self.out
+                    .push_str("<w:rPr><w:rStyle w:val=\"Hyperlink\"/></w:rPr>");
+            }
+            self.out.push_str("<w:t xml:space=\"preserve\">");
+            escape(&mut self.out, &entry.text);
+            self.out.push_str("</w:t></w:r>");
+            if style.numbered() {
+                let page = self
+                    .pages
+                    .get(index)
+                    .map(u32::to_string)
+                    .unwrap_or_default();
+                let _ = write!(
+                    self.out,
+                    "<w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+                     <w:r><w:instrText xml:space=\"preserve\"> PAGEREF {name} \\h </w:instrText></w:r>\
+                     <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:t>{page}</w:t></w:r>\
+                     <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+                );
+            }
+            self.out.push_str("</w:hyperlink>");
+            if index + 1 == entries.len() {
+                self.out.push_str(end);
+            }
+            self.out.push_str("</w:p>");
+        }
+        self.contents = entries;
+        self.out.push_str("</w:sdtContent></w:sdt>");
     }
 
     fn paragraph(
@@ -1005,6 +1133,11 @@ const PACKAGE_RELATIONS: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standa
 <Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>\
 </Relationships>";
 
+/// The bookmark a table of contents entry links to, as Word names them.
+fn toc_name(entry: usize) -> String {
+    format!("_Toc{}", entry + 1)
+}
+
 /// The styles, matching the page Docs writes: Arial 11 point, headings
 /// from 20 point down, quotes with a bar at their left, and code on gray.
 const STYLES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
@@ -1039,6 +1172,12 @@ const STYLES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\
 <w:style w:type=\"paragraph\" w:styleId=\"Code\"><w:name w:val=\"Code\"/><w:basedOn w:val=\"Normal\"/>\
 <w:pPr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F1F3F4\"/><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>\
 <w:rPr><w:rFonts w:ascii=\"Courier New\" w:hAnsi=\"Courier New\" w:cs=\"Courier New\"/><w:sz w:val=\"20\"/><w:szCs w:val=\"20\"/></w:rPr></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"TOC1\"><w:name w:val=\"toc 1\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:uiPriority w:val=\"39\"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after=\"80\"/></w:pPr></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"TOC2\"><w:name w:val=\"toc 2\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:uiPriority w:val=\"39\"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after=\"80\"/><w:ind w:left=\"360\"/></w:pPr></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"TOC3\"><w:name w:val=\"toc 3\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:uiPriority w:val=\"39\"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after=\"80\"/><w:ind w:left=\"720\"/></w:pPr></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"TOC4\"><w:name w:val=\"toc 4\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:uiPriority w:val=\"39\"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after=\"80\"/><w:ind w:left=\"1080\"/></w:pPr></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"TOC5\"><w:name w:val=\"toc 5\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:uiPriority w:val=\"39\"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after=\"80\"/><w:ind w:left=\"1440\"/></w:pPr></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"TOC6\"><w:name w:val=\"toc 6\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:uiPriority w:val=\"39\"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after=\"80\"/><w:ind w:left=\"1800\"/></w:pPr></w:style>\
 <w:style w:type=\"character\" w:styleId=\"Hyperlink\"><w:name w:val=\"Hyperlink\"/><w:basedOn w:val=\"DefaultParagraphFont\"/>\
 <w:rPr><w:color w:val=\"1155CC\"/><w:u w:val=\"single\"/></w:rPr></w:style>\
 <w:style w:type=\"table\" w:default=\"1\" w:styleId=\"TableNormal\"><w:name w:val=\"Normal Table\"/><w:semiHidden/>\
@@ -1069,9 +1208,62 @@ mod tests {
     }
 
     #[test]
+    fn writes_contents_as_words() {
+        let blocks = crate::html::tests::with_contents();
+        let file = write(
+            &blocks,
+            &Parts::default(),
+            None,
+            "Contents",
+            &Pictures::new(),
+            &[1, 1, 2],
+        );
+        let document = crate::office::tests::unzip(&file, "word/document.xml");
+        assert!(
+            document.contains("<w:docPartGallery w:val=\"Table of Contents\"/>"),
+            "{document}"
+        );
+        assert!(
+            document.contains(" TOC \\o \"1-6\" \\h \\z \\u </w:instrText>"),
+            "{document}"
+        );
+        assert!(
+            document.contains("<w:pStyle w:val=\"TOC3\"/><w:tabs><w:tab w:val=\"right\" w:leader=\"dot\" w:pos=\"9360\"/>"),
+            "{document}"
+        );
+        assert!(document.contains(" PAGEREF _Toc3 \\h </w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:t>2</w:t>"), "{document}");
+        assert!(
+            document.contains("<w:bookmarkStart w:id=\"1\" w:name=\"_Toc2\"/>"),
+            "{document}"
+        );
+        assert_eq!(document.matches("<w:bookmarkEnd ").count(), 3, "{document}");
+        // Page numbers that don't match the entries are left out.
+        let file = write(
+            &blocks,
+            &Parts::default(),
+            None,
+            "Contents",
+            &Pictures::new(),
+            &[1],
+        );
+        let document = crate::office::tests::unzip(&file, "word/document.xml");
+        assert!(
+            document.contains("<w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:t></w:t>"),
+            "{document}"
+        );
+    }
+
+    #[test]
     fn writes_footnotes() {
         let blocks = crate::html::tests::noted();
-        let file = write(&blocks, &Parts::default(), None, "Notes", &Pictures::new());
+        let file = write(
+            &blocks,
+            &Parts::default(),
+            None,
+            "Notes",
+            &Pictures::new(),
+            &[],
+        );
         let document = crate::office::tests::unzip(&file, "word/document.xml");
         assert!(
             document.contains("<w:footnoteReference w:id=\"1\"/>")
@@ -1102,7 +1294,7 @@ mod tests {
             crate::office::tests::unzip(&file, "word/styles.xml").contains("FootnoteReference")
         );
         // A document without footnotes has no footnotes part.
-        let plain = write(&[], &Parts::default(), None, "Plain", &Pictures::new());
+        let plain = write(&[], &Parts::default(), None, "Plain", &Pictures::new(), &[]);
         let types = crate::office::tests::unzip(&plain, "[Content_Types].xml");
         assert!(!types.contains("footnotes"), "{types}");
     }
@@ -1111,7 +1303,7 @@ mod tests {
     fn writes_headers_footers_and_page_numbers() {
         let parts = crate::html::tests::parts();
         let blocks = vec![Block::Paragraph(Para::default(), Vec::new())];
-        let file = write(&blocks, &parts, None, "Parts", &Pictures::new());
+        let file = write(&blocks, &parts, None, "Parts", &Pictures::new(), &[]);
         let document = crate::office::tests::unzip(&file, "word/document.xml");
         assert!(
             document.contains("<w:headerReference w:type=\"default\" r:id=\"rId-header\"/>"),
@@ -1214,6 +1406,7 @@ mod tests {
             Some(&setup),
             "Plan & notes",
             &Pictures::new(),
+            &[],
         );
         let document = part(&file, "word/document.xml");
         assert!(
@@ -1264,6 +1457,7 @@ mod tests {
             Some(&setup),
             "Pictures",
             &pictures,
+            &[],
         );
         let document = part(&file, "word/document.xml");
         assert_eq!(
@@ -1294,6 +1488,7 @@ mod tests {
             None,
             "Cells",
             &Pictures::new(),
+            &[],
         );
         let document = part(&file, "word/document.xml");
         assert!(document.contains("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"FCE5CD\"/>"));
@@ -1312,6 +1507,7 @@ mod tests {
             None,
             "Resume",
             &Pictures::new(),
+            &[],
         );
         let document = part(&file, "word/document.xml");
         assert!(
@@ -1344,6 +1540,7 @@ mod tests {
             None,
             "Layout",
             &Pictures::new(),
+            &[],
         );
         let document = part(&file, "word/document.xml");
         assert!(document.contains("<w:pStyle w:val=\"Title\"/><w:jc w:val=\"center\"/>"));

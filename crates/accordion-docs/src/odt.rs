@@ -2,36 +2,50 @@
 //! (decision 30), with the same look as the Word file: Arial 11 point,
 //! the document's paper and margins, and everything the editor has, its
 //! headers and footers too, in the page style, with page numbers and
-//! counts as OpenDocument's fields. Footnotes are OpenDocument's.
+//! counts as OpenDocument's fields. Footnotes are OpenDocument's. A table
+//! of contents is OpenDocument's, with its entries and page numbers already
+//! in it, so LibreOffice shows it as Docs does and can update it.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::model::{
-    self, Align, Block, Cell, Field, Image, Inline, Kind, ListStyle, Marks, PageSetup, Para, Parts,
-    Row, SIDES, Script,
+    self, Align, Block, Cell, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks,
+    PageSetup, Para, Parts, Row, SIDES, Script,
 };
 use crate::office::{self, Grid, Part, Slot, escape, escaped};
 use crate::picture::{Picture, Pictures};
 use crate::style::{self, Color, HalfPoints};
 
 /// `blocks` on `setup`'s page as an OpenDocument file, with `pictures` in
-/// it and `title` in its properties.
+/// it and `title` in its properties. `pages` is the page each entry of a
+/// table of contents is on, as the editor lays the pages out, or empty if
+/// unknown.
 pub fn write(
     blocks: &[Block],
     parts: &Parts,
     setup: Option<&PageSetup>,
     title: &str,
     pictures: &Pictures,
+    pages: &[u32],
 ) -> Vec<u8> {
     let page = office::page_of(setup);
     let mut writer = Writer {
         pictures: Some(pictures),
         ..Writer::default()
     };
+    if model::has_contents(blocks) {
+        writer.anchors = model::heading_anchors(blocks);
+        writer.contents = model::contents(blocks);
+        if pages.len() == writer.contents.len() {
+            writer.pages = pages.to_vec();
+        }
+    }
     let room = office::text_width(&page);
     writer.blocks(blocks, &Context::top(room));
     let body = std::mem::take(&mut writer.out);
+    // Headers and footers have no headings the contents link to.
+    writer.anchors.clear();
     // Headers and footers come from the same writer, so their styles have
     // names of their own, and go in the styles file too.
     let mut margins = BTreeMap::new();
@@ -338,6 +352,13 @@ struct Writer<'a> {
     line_start: bool,
     /// How many footnotes so far, for their numbers.
     notes: usize,
+    /// Each heading's anchor, while the document has a table of contents,
+    /// and how many headings are written.
+    anchors: Vec<Option<String>>,
+    headings: usize,
+    /// The table of contents' entries, and each one's page, if known.
+    contents: Vec<model::Entry>,
+    pages: Vec<u32>,
 }
 
 impl Writer<'_> {
@@ -536,9 +557,17 @@ impl Writer<'_> {
                 self.open(&format!(
                     "<text:h text:style-name=\"{style}\" text:outline-level=\"{level}\">"
                 ));
+                let mark = self.bookmark();
+                if let Some(name) = &mark {
+                    let _ = write!(self.out, "<text:bookmark-start text:name=\"{name}\"/>");
+                }
                 self.runs(inlines, context);
+                if let Some(name) = &mark {
+                    let _ = write!(self.out, "<text:bookmark-end text:name=\"{name}\"/>");
+                }
                 self.out.push_str("</text:h>");
             }
+            Block::Contents(style) => self.contents(*style, context),
             Block::PageBreak => self.out.push_str("<text:p text:style-name=\"PageBreak\"/>"),
             Block::Quote(blocks) => {
                 let mut inner = context.clone();
@@ -771,6 +800,111 @@ impl Writer<'_> {
     }
 
     /// Opens a paragraph or heading.
+    /// The bookmark the next heading's table of contents entry links to,
+    /// if it has one.
+    fn bookmark(&mut self) -> Option<String> {
+        let index = self.headings;
+        self.headings += 1;
+        let anchor = self.anchors.get(index).cloned().flatten()?;
+        let entry = self
+            .contents
+            .iter()
+            .position(|entry| entry.anchor == anchor)?;
+        Some(toc_name(entry))
+    }
+
+    /// A table of contents: its source, which says how LibreOffice makes it
+    /// again, and a paragraph for each heading with a link to its bookmark,
+    /// as LibreOffice writes one.
+    fn contents(&mut self, style: ContentsStyle, context: &Context) {
+        let number = self.out.matches("<text:table-of-content ").count() + 1;
+        let _ = write!(
+            self.out,
+            "<text:table-of-content text:name=\"Table of Contents{number}\" text:protected=\"false\">\
+             <text:table-of-content-source text:outline-level=\"6\" text:use-index-marks=\"false\" text:use-outline-level=\"true\">"
+        );
+        for level in 1..=6 {
+            let _ = write!(
+                self.out,
+                "<text:table-of-content-entry-template text:outline-level=\"{level}\" text:style-name=\"Contents_20_{level}\">\
+                 <text:index-entry-link-start{}/><text:index-entry-text/>{}<text:index-entry-link-end/>\
+                 </text:table-of-content-entry-template>",
+                if style.numbered() {
+                    ""
+                } else {
+                    " text:style-name=\"Internet_20_link\""
+                },
+                match style {
+                    ContentsStyle::Links => "",
+                    ContentsStyle::Dotted =>
+                        "<text:index-entry-tab-stop style:type=\"right\" style:leader-char=\".\"/><text:index-entry-page-number/>",
+                    ContentsStyle::Plain =>
+                        "<text:index-entry-tab-stop style:type=\"right\" style:leader-char=\" \"/><text:index-entry-page-number/>",
+                }
+            );
+        }
+        self.out
+            .push_str("</text:table-of-content-source><text:index-body>");
+        let entries = std::mem::take(&mut self.contents);
+        for (index, entry) in entries.iter().enumerate() {
+            let paragraph = self.toc_style(entry.level, style, context.room);
+            let _ = write!(
+                self.out,
+                "<text:p text:style-name=\"{paragraph}\"><text:a xlink:type=\"simple\" xlink:href=\"#{}\"{}>",
+                toc_name(index),
+                if style.numbered() {
+                    ""
+                } else {
+                    " text:style-name=\"Internet_20_link\""
+                },
+            );
+            escape(&mut self.out, &entry.text);
+            if style.numbered() {
+                self.out.push_str("<text:tab/>");
+                if let Some(page) = self.pages.get(index) {
+                    let _ = write!(self.out, "{page}");
+                }
+            }
+            self.out.push_str("</text:a></text:p>");
+        }
+        self.contents = entries;
+        self.out
+            .push_str("</text:index-body></text:table-of-content>");
+    }
+
+    /// The style of an entry at `level`, with a tab stop at the right
+    /// margin for its page number, its dots leading to it if `style` has
+    /// them.
+    fn toc_style(&mut self, level: u8, style: ContentsStyle, room: f64) -> String {
+        if !style.numbered() {
+            return format!("Contents_20_{level}");
+        }
+        let name = format!(
+            "Toc{}{level}",
+            if style == ContentsStyle::Dotted {
+                "Dotted"
+            } else {
+                "Plain"
+            }
+        );
+        if self.styles.contains(&format!("style:name=\"{name}\"")) {
+            return name;
+        }
+        let leader = if style == ContentsStyle::Dotted {
+            " style:leader-style=\"dotted\" style:leader-text=\".\""
+        } else {
+            ""
+        };
+        let _ = write!(
+            self.styles,
+            "<style:style style:name=\"{name}\" style:family=\"paragraph\" style:parent-style-name=\"Contents_20_{level}\">\
+             <style:paragraph-properties><style:tab-stops><style:tab-stop style:position=\"{}pt\" style:type=\"right\"{leader}/>\
+             </style:tab-stops></style:paragraph-properties></style:style>",
+            office::number(room - f64::from(level - 1) * 18.0)
+        );
+        name
+    }
+
     fn open(&mut self, tag: &str) {
         self.out.push_str(tag);
         self.line_start = true;
@@ -1023,9 +1157,27 @@ const STYLES: &str = "<office:styles>\
 <style:paragraph-properties fo:margin-bottom=\"0pt\"/></style:style>\
 <style:style style:name=\"Table_20_Heading\" style:display-name=\"Table Heading\" style:family=\"paragraph\" style:parent-style-name=\"Table_20_Contents\" style:class=\"extra\">\
 <style:text-properties fo:font-weight=\"bold\"/></style:style>\
+<style:style style:name=\"Contents_20_1\" style:display-name=\"Contents 1\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"index\">\
+<style:paragraph-properties fo:margin-left=\"0pt\" fo:margin-bottom=\"4pt\"/></style:style>\
+<style:style style:name=\"Contents_20_2\" style:display-name=\"Contents 2\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"index\">\
+<style:paragraph-properties fo:margin-left=\"18pt\" fo:margin-bottom=\"4pt\"/></style:style>\
+<style:style style:name=\"Contents_20_3\" style:display-name=\"Contents 3\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"index\">\
+<style:paragraph-properties fo:margin-left=\"36pt\" fo:margin-bottom=\"4pt\"/></style:style>\
+<style:style style:name=\"Contents_20_4\" style:display-name=\"Contents 4\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"index\">\
+<style:paragraph-properties fo:margin-left=\"54pt\" fo:margin-bottom=\"4pt\"/></style:style>\
+<style:style style:name=\"Contents_20_5\" style:display-name=\"Contents 5\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"index\">\
+<style:paragraph-properties fo:margin-left=\"72pt\" fo:margin-bottom=\"4pt\"/></style:style>\
+<style:style style:name=\"Contents_20_6\" style:display-name=\"Contents 6\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"index\">\
+<style:paragraph-properties fo:margin-left=\"90pt\" fo:margin-bottom=\"4pt\"/></style:style>\
 <style:style style:name=\"Internet_20_link\" style:display-name=\"Internet link\" style:family=\"text\">\
 <style:text-properties fo:color=\"#1155cc\" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"/></style:style>\
 </office:styles>";
+
+/// The bookmark a table of contents entry links to, as LibreOffice names
+/// them.
+fn toc_name(entry: usize) -> String {
+    format!("__RefHeading___Toc{}", entry + 1)
+}
 
 const MANIFEST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <manifest:manifest xmlns:manifest=\"urn:oasis:names:tc:opendocument:xmlns:manifest:1.0\" manifest:version=\"1.3\">\
@@ -1056,9 +1208,46 @@ mod tests {
     }
 
     #[test]
+    fn writes_contents_as_opendocuments() {
+        let blocks = crate::html::tests::with_contents();
+        let file = write(
+            &blocks,
+            &Parts::default(),
+            None,
+            "Contents",
+            &Pictures::new(),
+            &[1, 1, 2],
+        );
+        let content = part(&file, "content.xml");
+        assert!(
+            content.contains("<text:table-of-content text:name=\"Table of Contents1\""),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "<text:p text:style-name=\"TocDotted3\"><text:a xlink:type=\"simple\" xlink:href=\"#__RefHeading___Toc3\">\
+                 Café &amp; tea!<text:tab/>2</text:a></text:p>"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("<text:bookmark-start text:name=\"__RefHeading___Toc1\"/>Plan"),
+            "{content}"
+        );
+        assert!(content.contains("style:name=\"TocDotted3\""), "{content}");
+    }
+
+    #[test]
     fn writes_footnotes() {
         let blocks = crate::html::tests::noted();
-        let file = write(&blocks, &Parts::default(), None, "Notes", &Pictures::new());
+        let file = write(
+            &blocks,
+            &Parts::default(),
+            None,
+            "Notes",
+            &Pictures::new(),
+            &[],
+        );
         let content = part(&file, "content.xml");
         assert!(
             content.contains(
@@ -1077,7 +1266,7 @@ mod tests {
     fn writes_headers_footers_and_page_numbers() {
         let parts = crate::html::tests::parts();
         let blocks = vec![Block::Paragraph(Para::default(), Vec::new())];
-        let file = write(&blocks, &parts, None, "Parts", &Pictures::new());
+        let file = write(&blocks, &parts, None, "Parts", &Pictures::new(), &[]);
         let styles = crate::office::tests::unzip(&file, "styles.xml");
         assert!(styles.contains("<style:header><text:p"), "{styles}");
         assert!(
@@ -1147,6 +1336,7 @@ mod tests {
             Some(&setup),
             "Plan",
             &Pictures::new(),
+            &[],
         );
         // The mimetype comes first, stored as is, as OpenDocument asks.
         assert_eq!(&file[30..38], b"mimetype");
@@ -1201,6 +1391,7 @@ mod tests {
             Some(&setup),
             "Pictures",
             &pictures,
+            &[],
         );
         let content = part(&file, "content.xml");
         let path = format!("Pictures/{}.png", picture.hash);
@@ -1222,6 +1413,7 @@ mod tests {
             None,
             "Cells",
             &Pictures::new(),
+            &[],
         );
         let content = part(&file, "content.xml");
         assert!(content.contains(
@@ -1241,6 +1433,7 @@ mod tests {
             None,
             "Resume",
             &Pictures::new(),
+            &[],
         );
         let content = part(&file, "content.xml");
         assert!(content.contains(
@@ -1267,6 +1460,7 @@ mod tests {
             None,
             "Layout",
             &Pictures::new(),
+            &[],
         );
         let content = part(&file, "content.xml");
         assert!(content.contains(

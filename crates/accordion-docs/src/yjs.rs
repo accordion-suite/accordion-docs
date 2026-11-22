@@ -19,8 +19,8 @@ use yrs::{
 };
 
 use crate::model::{
-    self, Align, Block, Cell, Field, Image, Inline, Kind, ListStyle, Marks, PageSetup, PageSize,
-    Para, Parts, Script,
+    self, Align, Block, Cell, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks,
+    PageSetup, PageSize, Para, Parts, Script,
 };
 use crate::style::{self, Color};
 
@@ -237,6 +237,11 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
             Block::Heading(level, read_para(txn, element), read_inlines(txn, element))
         }
         "page_break" => Block::PageBreak,
+        "table_of_contents" => Block::Contents(
+            string(txn, element, "style")
+                .and_then(|style| ContentsStyle::from_name(&style))
+                .unwrap_or_default(),
+        ),
         "blockquote" => Block::Quote(read_children(txn, element)),
         "code_block" => Block::Code(
             read_inlines(txn, element)
@@ -610,6 +615,10 @@ fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32
         }
         Block::PageBreak => {
             element(txn, parent, index, "page_break");
+        }
+        Block::Contents(style) => {
+            let el = element(txn, parent, index, "table_of_contents");
+            el.insert_attribute(txn, "style", Any::from(style.name()));
         }
         Block::Quote(blocks) => {
             let el = element(txn, parent, index, "blockquote");

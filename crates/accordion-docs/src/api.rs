@@ -653,6 +653,32 @@ struct DownloadQuery {
     /// "md", "docx", or "odt".
     #[serde(rename = "as")]
     format: String,
+    /// The page each heading in a table of contents is on, as the editor
+    /// lays the pages out, such as "1.1.2", for Word's and OpenDocument's
+    /// page numbers.
+    pages: Option<String>,
+}
+
+/// The most page numbers a download takes.
+const MAX_CONTENTS_PAGES: usize = 10_000;
+
+/// Page numbers such as "1.1.2", or none if any isn't one.
+fn contents_pages(text: Option<&str>) -> Vec<u32> {
+    let Some(text) = text.filter(|text| !text.is_empty()) else {
+        return Vec::new();
+    };
+    let pages: Option<Vec<u32>> = text
+        .split('.')
+        .take(MAX_CONTENTS_PAGES + 1)
+        .map(|page| {
+            page.parse()
+                .ok()
+                .filter(|page| (1..=100_000).contains(page))
+        })
+        .collect();
+    pages
+        .filter(|pages| pages.len() <= MAX_CONTENTS_PAGES)
+        .unwrap_or_default()
 }
 
 /// `GET /documents/{id}/download?as=html`: the document to keep, with
@@ -686,6 +712,7 @@ async fn download(
         // Writing a big document takes a moment, so it's done off the
         // threads that answer requests.
         let format = query.format;
+        let pages = contents_pages(query.pages.as_deref());
         tokio::task::spawn_blocking(move || {
             let html::Document {
                 blocks,
@@ -695,8 +722,8 @@ async fn download(
             } = html::read_document(&contents);
             match format.as_str() {
                 "md" => markdown::write(&blocks, &pictures).into_bytes(),
-                "docx" => docx::write(&blocks, &parts, setup.as_ref(), &title, &pictures),
-                _ => odt::write(&blocks, &parts, setup.as_ref(), &title, &pictures),
+                "docx" => docx::write(&blocks, &parts, setup.as_ref(), &title, &pictures, &pages),
+                _ => odt::write(&blocks, &parts, setup.as_ref(), &title, &pictures, &pages),
             }
         })
         .await

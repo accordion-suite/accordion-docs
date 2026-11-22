@@ -18,6 +18,7 @@
 //! | [`Block::Table`] | `table`, `table_row` (`height`), `table_cell`, `table_header` | `<table>`, `<tr>`, `<td>`, `<th>` |
 //! | [`Block::Image`] | `image` (`src`, `alt`, `width`) | `<img>` |
 //! | [`Block::PageBreak`] | `page_break` | `<div class="page-break">` |
+//! | [`Block::Contents`] | `table_of_contents` (`style`) | `<nav data-contents>` |
 //! | [`Inline::Break`] | `hard_break` | `<br>` |
 //! | [`Inline::Footnote`] | `footnote` (its text inside) | `<sup><a data-footnote-ref>` |
 //!
@@ -26,6 +27,11 @@
 //! `<section data-footnotes>` at the end of `<main>`, as GitHub writes them.
 //! Footnotes are numbered in the order they come, and only the document's
 //! own text has them, not headers or footers.
+//!
+//! A table of contents keeps only its style. Its entries are the
+//! document's headings, found again each time it's shown or written
+//! ([`contents`]), so it's never out of date. Only the document's own blocks
+//! have one, not lists, quotes, cells, headers, or footers.
 //!
 //! Headers and footers ([`Parts`]) are fragments of their own beside the
 //! document's, `header`, `footer`, `first_header`, and `first_footer`, and
@@ -158,7 +164,8 @@ impl Parts {
     }
 }
 
-/// `blocks` with their footnotes left out, for headers and footers.
+/// `blocks` with their footnotes and any table of contents left out, for
+/// headers and footers.
 fn without_footnotes(blocks: Vec<Block>) -> Vec<Block> {
     let inlines = |inlines: Vec<Inline>| {
         inlines
@@ -168,6 +175,7 @@ fn without_footnotes(blocks: Vec<Block>) -> Vec<Block> {
     };
     blocks
         .into_iter()
+        .filter(|block| !matches!(block, Block::Contents(_)))
         .map(|block| match block {
             Block::Paragraph(para, runs) => Block::Paragraph(para, inlines(runs)),
             Block::Heading(level, para, runs) => Block::Heading(level, para, inlines(runs)),
@@ -243,7 +251,11 @@ fn for_inlines<'a>(blocks: &'a [Block], visit: &mut dyn FnMut(&'a [Inline])) {
                     }
                 }
             }
-            Block::Code(_) | Block::Rule(_) | Block::Image(_) | Block::PageBreak => {}
+            Block::Code(_)
+            | Block::Rule(_)
+            | Block::Image(_)
+            | Block::PageBreak
+            | Block::Contents(_) => {}
         }
     }
 }
@@ -531,6 +543,134 @@ pub enum Block {
     Image(Image),
     /// Where a new page starts in print.
     PageBreak,
+    /// A table of contents, listing the document's headings.
+    Contents(ContentsStyle),
+}
+
+/// How a table of contents shows its headings: as Google Docs' three
+/// kinds, with page numbers, with dots leading to them, or as blue links
+/// without them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContentsStyle {
+    #[default]
+    Plain,
+    Dotted,
+    Links,
+}
+
+impl ContentsStyle {
+    pub fn name(self) -> &'static str {
+        match self {
+            ContentsStyle::Plain => "plain",
+            ContentsStyle::Dotted => "dotted",
+            ContentsStyle::Links => "links",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Plain, Self::Dotted, Self::Links]
+            .into_iter()
+            .find(|style| style.name() == name)
+    }
+
+    /// Whether it shows each heading's page number.
+    pub fn numbered(self) -> bool {
+        self != ContentsStyle::Links
+    }
+}
+
+/// A heading a table of contents lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// 1 to 6.
+    pub level: u8,
+    /// Its text on one line, without its footnotes.
+    pub text: String,
+    /// The name a link to it uses ([`heading_anchors`]).
+    pub anchor: String,
+}
+
+/// Whether `blocks` have a table of contents of their own.
+pub fn has_contents(blocks: &[Block]) -> bool {
+    blocks
+        .iter()
+        .any(|block| matches!(block, Block::Contents(_)))
+}
+
+/// Every heading in `blocks`, in order, inside lists, quotes, and cells
+/// too, as the editor finds them.
+fn headings<'a>(blocks: &'a [Block], out: &mut Vec<(u8, &'a [Inline])>) {
+    for block in blocks {
+        match block {
+            Block::Heading(level, _, inlines) => out.push((*level, inlines)),
+            Block::Quote(blocks) => headings(blocks, out),
+            Block::Bullets(_, items) | Block::Numbers(_, _, items) => {
+                items.iter().for_each(|item| headings(item, out));
+            }
+            Block::Checks(items) => items.iter().for_each(|(_, item)| headings(item, out)),
+            Block::Table(rows) => cells(rows).for_each(|cell| headings(&cell.content, out)),
+            _ => {}
+        }
+    }
+}
+
+/// A name for each heading in `blocks`, in order, for links to it, or
+/// `None` for a heading without text, which a table of contents leaves
+/// out. Names are made as GitHub makes them for Markdown's headings, so a
+/// Markdown download's links work there too: lowercase, without
+/// punctuation, with hyphens for spaces, and a number after a name already
+/// taken.
+pub fn heading_anchors(blocks: &[Block]) -> Vec<Option<String>> {
+    let mut found = Vec::new();
+    headings(blocks, &mut found);
+    let mut taken = std::collections::HashSet::new();
+    found
+        .into_iter()
+        .map(|(_, inlines)| {
+            let text = one_line(&plain(inlines));
+            if text.is_empty() {
+                return None;
+            }
+            let mut base: String = text
+                .to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+                .map(|c| if c == ' ' { '-' } else { c })
+                .collect();
+            if base.is_empty() {
+                base = "section".to_owned();
+            }
+            let mut anchor = base.clone();
+            let mut count = 0;
+            while !taken.insert(anchor.clone()) {
+                count += 1;
+                anchor = format!("{base}-{count}");
+            }
+            Some(anchor)
+        })
+        .collect()
+}
+
+/// The headings a table of contents in `blocks` lists: those with text, in
+/// order.
+pub fn contents(blocks: &[Block]) -> Vec<Entry> {
+    let mut found = Vec::new();
+    headings(blocks, &mut found);
+    found
+        .into_iter()
+        .zip(heading_anchors(blocks))
+        .filter_map(|((level, inlines), anchor)| {
+            Some(Entry {
+                level,
+                text: one_line(&plain(inlines)),
+                anchor: anchor?,
+            })
+        })
+        .collect()
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A picture in a document. Its contents are kept apart from the blocks,
@@ -573,7 +713,8 @@ pub fn image_hashes(blocks: &[Block]) -> Vec<String> {
                 | Block::Heading(..)
                 | Block::Code(_)
                 | Block::Rule(_)
-                | Block::PageBreak => {}
+                | Block::PageBreak
+                | Block::Contents(_) => {}
             }
         }
     }
@@ -618,7 +759,11 @@ pub fn any_marks(blocks: &[Block], test: &dyn Fn(&Marks) -> bool) -> bool {
         }
         Block::Checks(items) => items.iter().any(|(_, item)| any_marks(item, test)),
         Block::Table(rows) => cells(rows).any(|cell| any_marks(&cell.content, test)),
-        Block::Code(_) | Block::Rule(_) | Block::Image(_) | Block::PageBreak => false,
+        Block::Code(_)
+        | Block::Rule(_)
+        | Block::Image(_)
+        | Block::PageBreak
+        | Block::Contents(_) => false,
     })
 }
 
@@ -882,6 +1027,7 @@ pub fn normalize_block(block: Block) -> Option<Block> {
             color: rule.color,
         }),
         Block::PageBreak => Block::PageBreak,
+        Block::Contents(style) => Block::Contents(style),
         Block::Image(image) => {
             if !crate::picture::is_hash(&image.hash) {
                 return None;
@@ -941,9 +1087,17 @@ pub fn normalize_block(block: Block) -> Option<Block> {
     })
 }
 
+/// Blocks inside another, which has no table of contents of its own.
+fn nested(blocks: Vec<Block>) -> Vec<Block> {
+    normalize_blocks(blocks)
+        .into_iter()
+        .filter(|block| !matches!(block, Block::Contents(_)))
+        .collect()
+}
+
 /// A list item: blocks that start with a paragraph.
 fn item(blocks: Vec<Block>) -> Vec<Block> {
-    let mut blocks = normalize_blocks(blocks);
+    let mut blocks = nested(blocks);
     if !matches!(blocks.first(), Some(Block::Paragraph(..))) {
         blocks.insert(0, Block::Paragraph(Para::default(), Vec::new()));
     }
@@ -973,7 +1127,7 @@ fn cell(cell: Cell) -> Cell {
 }
 
 fn at_least_a_paragraph(blocks: Vec<Block>) -> Vec<Block> {
-    let blocks = normalize_blocks(blocks);
+    let blocks = nested(blocks);
     if blocks.is_empty() {
         vec![Block::Paragraph(Para::default(), Vec::new())]
     } else {
@@ -1054,7 +1208,9 @@ pub fn first_text(blocks: &[Block]) -> Option<String> {
             Block::Table(rows) => cells(rows)
                 .find_map(|cell| first_text(&cell.content))
                 .unwrap_or_default(),
-            Block::Rule(_) | Block::Image(_) | Block::PageBreak => String::new(),
+            Block::Rule(_) | Block::Image(_) | Block::PageBreak | Block::Contents(_) => {
+                String::new()
+            }
         };
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         if !text.is_empty() {
@@ -1081,6 +1237,50 @@ mod tests {
 
     fn text(text: &str) -> Inline {
         Inline::Text(text.into(), Marks::default())
+    }
+
+    #[test]
+    fn contents_are_the_headings_with_text() {
+        let blocks = vec![
+            Block::Contents(ContentsStyle::Links),
+            Block::Heading(1, Para::default(), vec![text("  Big   plan ")]),
+            Block::Heading(2, Para::default(), vec![text("Big plan")]),
+            Block::Heading(2, Para::default(), vec![text("Big plan-1")]),
+            Block::Heading(3, Para::default(), vec![text("!!!")]),
+            Block::Heading(3, Para::default(), Vec::new()),
+        ];
+        assert_eq!(
+            heading_anchors(&blocks),
+            vec![
+                Some("big-plan".to_owned()),
+                Some("big-plan-1".to_owned()),
+                // Taken by the one before, so it's numbered too.
+                Some("big-plan-1-1".to_owned()),
+                Some("section".to_owned()),
+                None,
+            ]
+        );
+        let entries = contents(&blocks);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            (entries[0].level, entries[0].text.as_str()),
+            (1, "Big plan")
+        );
+    }
+
+    #[test]
+    fn only_the_document_has_contents() {
+        let fixed = normalize(vec![
+            Block::Contents(ContentsStyle::Plain),
+            Block::Quote(vec![Block::Contents(ContentsStyle::Plain)]),
+        ]);
+        assert_eq!(
+            fixed,
+            vec![
+                Block::Contents(ContentsStyle::Plain),
+                Block::Quote(vec![Block::Paragraph(Para::default(), Vec::new())]),
+            ]
+        );
     }
 
     #[test]

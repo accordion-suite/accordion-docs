@@ -226,6 +226,7 @@ mod tests {
             ]
             .into_iter()
             .chain(html::tests::noted())
+            .chain(html::tests::with_contents())
             .collect::<Vec<_>>(),
             &crate::model::Parts::default(),
             Some(&PageSetup::new(PageSize::A4)),

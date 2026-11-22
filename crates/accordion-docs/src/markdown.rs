@@ -19,7 +19,7 @@ use crate::picture::Pictures;
 pub fn write(blocks: &[Block], pictures: &Pictures) -> String {
     let mut writer = Writer {
         pictures,
-        notes: html::Notes::default(),
+        notes: html::Notes::for_document(blocks),
     };
     let mut out = String::new();
     writer.blocks(&mut out, blocks);
@@ -72,11 +72,20 @@ impl Writer<'_> {
                 aligned(out, "p", para, inlines, &mut self.notes);
             }
             Block::Heading(level, para, inlines) if para.align != Align::Left => {
-                aligned(out, &format!("h{level}"), para, inlines, &mut self.notes);
+                // GitHub names a heading written as HTML only by its `id`.
+                let tag = match self.notes.next_anchor() {
+                    Some(anchor) => format!("h{level} id=\"{}\"", html::escape_attribute(&anchor)),
+                    None => format!("h{level}"),
+                };
+                aligned(out, &tag, para, inlines, &mut self.notes);
             }
+            Block::Contents(_) => self.contents(out),
             Block::PageBreak => out.push_str("<div style=\"page-break-after: always;\"></div>"),
             Block::Paragraph(_, inlines) => write_inlines(out, inlines, false, &mut self.notes),
             Block::Heading(level, _, inlines) => {
+                // GitHub names Markdown's headings itself, as the table of
+                // contents does.
+                self.notes.next_anchor();
                 for _ in 0..*level {
                     out.push('#');
                 }
@@ -174,6 +183,34 @@ impl Writer<'_> {
 
     /// A picture, with its contents in its address. One whose contents are
     /// missing keeps only its words.
+    /// A table of contents: a list of links to the headings, nested by
+    /// level. A list goes one level deeper at most, or it would read as
+    /// code.
+    fn contents(&mut self, out: &mut String) {
+        let entries = std::mem::take(&mut self.notes.contents);
+        let top = entries.iter().map(|entry| entry.level).min().unwrap_or(1);
+        let mut depth = 0;
+        for (index, entry) in entries.iter().enumerate() {
+            depth = usize::from(entry.level - top).min(if index == 0 { 0 } else { depth + 1 });
+            if index > 0 {
+                out.push('\n');
+            }
+            out.push_str(&"  ".repeat(depth));
+            out.push_str("- ");
+            let link = Marks {
+                link: Some(format!("#{}", entry.anchor)),
+                ..Marks::default()
+            };
+            write_inlines(
+                out,
+                &[Inline::Text(entry.text.clone(), link)],
+                true,
+                &mut html::Notes::default(),
+            );
+        }
+        self.notes.contents = entries;
+    }
+
     fn image(&mut self, out: &mut String, image: &Image) {
         out.push_str("![");
         let mut line_start = false;
@@ -661,6 +698,17 @@ mod tests {
         let written = write(&crate::html::tests::colored_cells(), &Pictures::new());
         assert!(written.starts_with("<table>"), "{written}");
         assert!(written.contains("background-color:#fce5cd"), "{written}");
+    }
+
+    #[test]
+    fn contents_are_a_list_of_links() {
+        let markdown = write(&crate::html::tests::with_contents(), &Pictures::new());
+        assert!(
+            markdown.starts_with(
+                "- [Plan](#plan)\n  - [Plan](#plan-1)\n    - [Café \\& tea!](#café--tea)\n\n# Plan[^1]"
+            ),
+            "{markdown}"
+        );
     }
 
     #[test]

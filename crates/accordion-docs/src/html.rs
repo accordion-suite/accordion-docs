@@ -19,8 +19,8 @@ use std::fmt::Write as _;
 use scraper::{Html, Node};
 
 use crate::model::{
-    self, Align, Block, Cell, Field, Image, Inline, Kind, ListStyle, Marks, PageSetup, PageSize,
-    Para, Parts, Row, SIDES, Script,
+    self, Align, Block, Cell, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks,
+    PageSetup, PageSize, Para, Parts, Row, SIDES, Script,
 };
 use crate::office::number;
 use crate::picture::{self, Picture, Pictures};
@@ -80,6 +80,10 @@ ul.checklist>li>input{float:left;margin:6px 8px 0 0}\
 ul.checklist>li[data-checked=true]>p{text-decoration:line-through;color:#5f6368}\
 header[data-part]{margin-bottom:18pt}footer[data-part]{margin-top:18pt}\
 a[data-footnote-ref]{text-decoration:none;color:inherit}\
+nav[data-contents]{margin:0 0 12pt}nav[data-contents]>p{margin:0 0 4pt}\
+nav[data-contents]>p>a{color:inherit;text-decoration:none}nav[data-contents=links]>p>a{color:#1155cc;text-decoration:underline}\
+.contents-2{margin-left:18pt}.contents-3{margin-left:36pt}.contents-4{margin-left:54pt}\
+.contents-5{margin-left:72pt}.contents-6{margin-left:90pt}\
 section[data-footnotes]{margin-top:18pt;padding-top:6pt;border-top:1px solid #c4c7c5;font-size:10pt}\
 section[data-footnotes]>ol{margin:0;padding-left:2em}section[data-footnotes] p{margin:0}\
 main[data-first-page=different]>header[data-part=header],footer[data-part=first-footer]{display:none}\
@@ -92,7 +96,7 @@ main[data-first-page=different]>header[data-part=header],footer[data-part=first-
 const DARK_STYLE: &str = "@media screen and (prefers-color-scheme:dark){body{background:#131314;color:#e3e3e3}\
 main{background:#1f1f1f}pre,th{background:#2d2f31}td,th,hr,section[data-footnotes]{border-color:#444746}h3{color:#c4c7c5}\
 h4,h5,h6,p.subtitle{color:#9aa0a6}\
-blockquote{border-color:#444746;color:#c4c7c5}}";
+blockquote{border-color:#444746;color:#c4c7c5}nav[data-contents=links]>p>a{color:#8ab4f8}}";
 
 /// The whole file for `blocks` on the page `setup`, with `state`, the
 /// co-editing state, in its data block when there is one.
@@ -182,7 +186,7 @@ fn write_page(
     };
     part(&mut out, "header", "first_header", &parts.first_header);
     part(&mut out, "header", "header", &parts.header);
-    let mut notes = Notes::default();
+    let mut notes = Notes::for_document(blocks);
     write_blocks(&mut out, blocks, pictures, &mut notes);
     notes.write_section(&mut out);
     part(&mut out, "footer", "footer", &parts.footer);
@@ -243,13 +247,39 @@ pub(crate) fn fragment(blocks: &[Block], pictures: &Pictures, notes: &mut Notes)
 }
 
 /// The footnotes written so far, each one's text in the order they're
-/// numbered.
+/// numbered, and, in a document with a table of contents, the headings it
+/// links to.
 #[derive(Default)]
 pub(crate) struct Notes {
     pub(crate) texts: Vec<Vec<Inline>>,
+    /// Each heading's anchor, in order, while the document has a table of
+    /// contents, and how many headings are written.
+    anchors: Vec<Option<String>>,
+    headings: usize,
+    /// The table of contents' entries.
+    pub(crate) contents: Vec<model::Entry>,
 }
 
 impl Notes {
+    /// For writing `blocks`, a whole document's text.
+    pub(crate) fn for_document(blocks: &[Block]) -> Self {
+        if !model::has_contents(blocks) {
+            return Self::default();
+        }
+        Self {
+            anchors: model::heading_anchors(blocks),
+            contents: model::contents(blocks),
+            ..Self::default()
+        }
+    }
+
+    /// The next heading's anchor, if a table of contents links to it.
+    pub(crate) fn next_anchor(&mut self) -> Option<String> {
+        let anchor = self.anchors.get(self.headings).cloned().flatten();
+        self.headings += 1;
+        anchor
+    }
+
     /// Takes in a footnote's text, and returns its number.
     pub(crate) fn add(&mut self, text: &[Inline]) -> usize {
         self.texts.push(text.to_vec());
@@ -279,8 +309,11 @@ fn write_blocks(out: &mut String, blocks: &[Block], pictures: &Pictures, notes: 
 }
 
 /// A paragraph's or heading's opening tag, with its layout.
-fn open_para(out: &mut String, tag: &str, para: &Para) {
+fn open_para(out: &mut String, tag: &str, para: &Para, id: Option<&str>) {
     let _ = write!(out, "<{tag}");
+    if let Some(id) = id {
+        let _ = write!(out, " id=\"{}\"", escape_attribute(id));
+    }
     if let Some(kind) = para.kind {
         let _ = write!(out, " class=\"{}\"", kind.name());
     }
@@ -359,16 +392,18 @@ fn open_list(out: &mut String, tag: &str, style: Option<ListStyle>, start: Optio
 fn write_block(out: &mut String, block: &Block, pictures: &Pictures, notes: &mut Notes) {
     match block {
         Block::Paragraph(para, inlines) => {
-            open_para(out, "p", para);
+            open_para(out, "p", para, None);
             write_inlines(out, inlines, notes);
             out.push_str("</p>\n");
         }
         Block::Heading(level, para, inlines) => {
-            open_para(out, &format!("h{level}"), para);
+            let id = notes.next_anchor();
+            open_para(out, &format!("h{level}"), para, id.as_deref());
             write_inlines(out, inlines, notes);
             let _ = writeln!(out, "</h{level}>");
         }
         Block::PageBreak => out.push_str("<div class=\"page-break\"></div>\n"),
+        Block::Contents(style) => write_contents(out, *style, &notes.contents),
         Block::Quote(blocks) => {
             out.push_str("<blockquote>\n");
             write_blocks(out, blocks, pictures, notes);
@@ -457,6 +492,26 @@ fn write_block(out: &mut String, block: &Block, pictures: &Pictures, notes: &mut
             out.push_str("</tbody>\n</table>\n");
         }
     }
+}
+
+/// A table of contents: a link to each heading, indented by its level.
+/// Page numbers are left out, since a web page has no pages.
+fn write_contents(out: &mut String, style: ContentsStyle, entries: &[model::Entry]) {
+    let _ = writeln!(
+        out,
+        "<nav class=\"contents\" data-contents=\"{}\">",
+        style.name()
+    );
+    for entry in entries {
+        let _ = writeln!(
+            out,
+            "<p class=\"contents-{}\"><a href=\"#{}\">{}</a></p>",
+            entry.level,
+            escape_attribute(&entry.anchor),
+            escape_text(&entry.text)
+        );
+    }
+    out.push_str("</nav>\n");
 }
 
 /// The CSS for a line with a thickness or color of its own.
@@ -679,7 +734,7 @@ fn escape_text(text: &str) -> String {
     out
 }
 
-fn escape_attribute(text: &str) -> String {
+pub(crate) fn escape_attribute(text: &str) -> String {
     escape_text(text).replace('"', "&quot;")
 }
 
@@ -1066,6 +1121,15 @@ fn read_blocks(parent: NodeRef, out: &mut Vec<Block>, pictures: &mut Pictures, n
                     out.push(Block::Heading(level, para_of(&child), inlines));
                 }
                 images_in(child, out, pictures);
+            }
+            // Its entries come from the headings, so they aren't read.
+            "nav" if attribute(&child, "data-contents").is_some() => {
+                flush(&mut runs, out);
+                out.push(Block::Contents(
+                    attribute(&child, "data-contents")
+                        .and_then(ContentsStyle::from_name)
+                        .unwrap_or_default(),
+                ));
             }
             "div" if has_class(&child, "page-break") => {
                 flush(&mut runs, out);
@@ -2156,6 +2220,65 @@ pub(crate) mod tests {
                 ],
             )]
         );
+    }
+
+    /// A table of contents, and headings it lists: one with a footnote,
+    /// two with the same text, an empty one it leaves out, and one in a
+    /// quote.
+    pub(crate) fn with_contents() -> Vec<Block> {
+        vec![
+            Block::Contents(model::ContentsStyle::Dotted),
+            Block::Heading(
+                1,
+                Para::default(),
+                vec![text("Plan"), Inline::Footnote(vec![text("Note")])],
+            ),
+            Block::Heading(2, Para::default(), vec![text("Plan")]),
+            Block::Heading(2, Para::default(), Vec::new()),
+            Block::Quote(vec![Block::Heading(
+                3,
+                Para::default(),
+                vec![text("Café & tea!")],
+            )]),
+        ]
+    }
+
+    #[test]
+    fn contents_link_to_headings() {
+        let file = page(
+            &with_contents(),
+            &Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
+        assert!(
+            file.contains(
+                "<nav class=\"contents\" data-contents=\"dotted\">\n\
+                 <p class=\"contents-1\"><a href=\"#plan\">Plan</a></p>\n\
+                 <p class=\"contents-2\"><a href=\"#plan-1\">Plan</a></p>\n\
+                 <p class=\"contents-3\"><a href=\"#café--tea\">Café &amp; tea!</a></p>\n</nav>"
+            ),
+            "{file}"
+        );
+        assert!(file.contains("<h1 id=\"plan\">Plan<sup>"), "{file}");
+        assert!(
+            file.contains("<h2 id=\"plan-1\">Plan</h2>\n<h2></h2>"),
+            "{file}"
+        );
+        assert!(file.contains("<h3 id=\"café--tea\">"), "{file}");
+        // The entries come from the headings, so reading leaves only the
+        // table of contents itself.
+        assert_eq!(read(file.as_bytes()), with_contents());
+        // Without one, headings have no IDs.
+        let plain = page(
+            &with_contents()[1..],
+            &Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
+        assert!(plain.contains("<h1>Plan<sup>"), "{plain}");
     }
 
     pub(crate) fn laid_out() -> Vec<Block> {
