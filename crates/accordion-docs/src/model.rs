@@ -42,7 +42,10 @@
 //! `superscript` (`<sup>`), and `subscript` (`<sub>`). The styles
 //! `text_color` (`color`), `highlight` (`color`), `font_size` (`size`, in
 //! points), and `font_family` (`family`) are marks too, written as one
-//! `<span style>` around the text. A page number or count is a `field`
+//! `<span style>` around the text. A font is always one Docs has
+//! ([`crate::fonts`]). `font_weight` (`weight`) is a weight other than
+//! regular and bold, such as 300 for Light, written inside `<strong>` as a
+//! `<span data-weight>`, since bold makes it bolder. A page number or count is a `field`
 //! mark (`kind`) on a stand-in character, `<span data-field>`, which each
 //! page shows as its own number.
 //!
@@ -55,6 +58,7 @@
 //! ProseMirror's content rules would, so a document read from HTML or from a
 //! co-editing state never makes the editor throw content away.
 
+use crate::fonts;
 use crate::style::{self, Color, HalfPoints};
 
 /// The marks on a run of text.
@@ -76,8 +80,12 @@ pub struct Marks {
     pub highlight: Option<Color>,
     /// The size in half points.
     pub size: Option<HalfPoints>,
-    /// The font's name, once [`style::font_name`] has checked it.
+    /// The font's name, one of [`crate::fonts::FONTS`] other than the
+    /// default, once [`Marks::normalized`] has checked it.
     pub font: Option<String>,
+    /// A weight other than regular (400) and bold (700, the `bold` mark),
+    /// in hundreds.
+    pub weight: Option<u16>,
     /// The text stands for the page's number or the number of pages.
     pub field: Option<Field>,
 }
@@ -287,7 +295,28 @@ impl Marks {
         self.size = self
             .size
             .filter(|size| style::half_points(style::points(*size)) == Some(*size));
-        self.font = self.font.and_then(|font| style::font_name(&font));
+        // A font Docs doesn't have is the one it uses in its place, and a
+        // weight is one the font has.
+        let resolved = self
+            .font
+            .as_deref()
+            .and_then(style::font_name)
+            .map(|font| fonts::resolve(&font));
+        let font = resolved.as_ref().map_or_else(
+            || fonts::named(fonts::DEFAULT).expect("default font"),
+            |resolved| resolved.font,
+        );
+        self.font = (font.name != fonts::DEFAULT).then(|| font.name.to_owned());
+        let weight = self
+            .weight
+            .filter(|weight| weight % 100 == 0 && (100..=900).contains(weight))
+            .or_else(|| resolved.and_then(|resolved| resolved.weight));
+        self.weight = None;
+        match weight.map(|weight| fonts::nearest_weight(font, weight)) {
+            Some(700) => self.bold = true,
+            Some(400) | None => {}
+            weight => self.weight = weight,
+        }
         self
     }
 }

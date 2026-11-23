@@ -10,6 +10,7 @@
 
 mod api;
 pub mod docx;
+pub mod fonts;
 mod format;
 pub mod html;
 mod images;

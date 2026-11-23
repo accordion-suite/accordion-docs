@@ -427,6 +427,18 @@ fn marks(attributes: Option<&Attrs>) -> Marks {
             "text_color" => marks.color = attr_text(value, "color").and_then(Color::from_hex),
             "highlight" => marks.highlight = attr_text(value, "color").and_then(Color::from_hex),
             "font_family" => marks.font = attr_text(value, "family").and_then(style::font_name),
+            "font_weight" => {
+                marks.weight = match value {
+                    Any::Map(attrs) => match attrs.get("weight") {
+                        Some(Any::Number(weight)) => weight
+                            .as_f64()
+                            .filter(|weight| (100.0..=900.0).contains(weight))
+                            .map(|weight| weight as u16),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            }
             "font_size" => {
                 marks.size = match value {
                     Any::Map(attrs) => match attrs.get("size") {
@@ -462,7 +474,7 @@ fn attr_text<'a>(value: &'a Any, name: &str) -> Option<&'a str> {
 }
 
 /// The marks y-prosemirror writes, so a run that hasn't one says so.
-const MARK_NAMES: [&str; 13] = [
+const MARK_NAMES: [&str; 14] = [
     "bold",
     "italic",
     "underline",
@@ -475,6 +487,7 @@ const MARK_NAMES: [&str; 13] = [
     "highlight",
     "font_size",
     "font_family",
+    "font_weight",
     "field",
 ];
 
@@ -530,6 +543,9 @@ fn attributes(marks: &Marks) -> Attrs {
             "font_family".into(),
             with("family", Any::from(font.as_str())),
         );
+    }
+    if let Some(weight) = marks.weight {
+        attrs.insert("font_weight".into(), with("weight", int(i64::from(weight))));
     }
     if let Some(field) = marks.field {
         attrs.insert("field".into(), with("kind", Any::from(field.name())));

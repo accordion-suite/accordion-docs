@@ -6,6 +6,8 @@
 //! a number, and a font's name has only letters, digits, spaces, and a few
 //! marks, so nothing read can end the attribute or add a rule of its own.
 
+use crate::fonts;
+
 /// A color, as red, green, and blue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Color(pub [u8; 3]);
@@ -285,9 +287,10 @@ pub fn font_name(name: &str) -> Option<String> {
         .then(|| name.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-/// The first font a CSS `font-family` names that isn't a generic family
-/// such as `sans-serif`.
-pub fn font_from_css(text: &str) -> Option<String> {
+/// The font Docs uses for a CSS `font-family` ([`fonts::resolve`]), if
+/// it names a font, or a generic family such as `serif`. One that names
+/// neither, such as `url(x)`, sets nothing.
+pub fn font_from_css(text: &str) -> Option<fonts::Resolved> {
     const GENERIC: &[&str] = &[
         "serif",
         "sans-serif",
@@ -302,17 +305,15 @@ pub fn font_from_css(text: &str) -> Option<String> {
         "math",
         "emoji",
         "fangsong",
-        "inherit",
-        "initial",
-        "unset",
+        "-apple-system",
+        "blinkmacsystemfont",
         "-webkit-standard",
     ];
-    let first = text.split(',').next()?.trim();
-    let unquoted = first.trim_matches(['"', '\'']).trim();
-    if GENERIC.contains(&unquoted.to_ascii_lowercase().as_str()) {
-        return None;
-    }
-    font_name(unquoted)
+    let readable = text.split(',').any(|name| {
+        let name = name.trim().trim_matches(['"', '\'']).trim();
+        GENERIC.contains(&name.to_ascii_lowercase().as_str()) || font_name(name).is_some()
+    });
+    readable.then(|| fonts::resolve(text))
 }
 
 /// The declarations in a `style` attribute, each name in lowercase, with
@@ -388,13 +389,12 @@ mod tests {
 
     #[test]
     fn font_names_stay_safe() {
-        assert_eq!(
-            font_from_css("\"Times New Roman\", serif"),
-            Some("Times New Roman".into())
-        );
-        assert_eq!(font_from_css("Arial"), Some("Arial".into()));
-        assert_eq!(font_from_css("sans-serif"), None);
-        assert_eq!(font_from_css("'a';color:red"), None);
+        let font = |text: &str| font_from_css(text).map(|resolved| resolved.font.name);
+        assert_eq!(font("\"Times New Roman\", serif"), Some("Tinos"));
+        assert_eq!(font("Arial"), Some("Arimo"));
+        assert_eq!(font("sans-serif"), Some("Arimo"));
+        assert_eq!(font("url(x)"), None);
+        assert_eq!(font("'a';color:red"), None);
         assert_eq!(font_name("x\"}body{"), None);
         assert_eq!(font_name("  Open   Sans "), Some("Open Sans".into()));
     }

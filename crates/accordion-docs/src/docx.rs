@@ -4,14 +4,19 @@
 //! nine levels, checklists (as ☐ and ☑ bullets, with done items struck
 //! through as on the page), quotes, code, rules, and tables with merged
 //! cells and column widths. The page setup becomes the section's paper and
-//! margins. Text is Arial 11 point, as in Google Docs. Headers and footers,
-//! the first page's own too, are Word's, with page numbers and counts as
-//! Word's fields. Footnotes are Word's, numbered by Word. A table of
-//! contents is Word's TOC field, with its entries and page numbers already
-//! in it, so it shows as it does in Docs and Word can update it.
+//! margins. Text is Arimo 11 point, as Google Docs uses Arial. Fonts keep
+//! their own names, and the font table names Word's font with the same
+//! letter widths, such as Calibri for Carlito, for Word to use where the
+//! font isn't installed. A weight other than regular and bold is the font's
+//! name for it, such as "Raleway Light", as Word names weights. Headers
+//! and footers, the first page's own too, are Word's, with page numbers and
+//! counts as Word's fields. Footnotes are Word's, numbered by Word. A table
+//! of contents is Word's TOC field, with its entries and page numbers
+//! already in it, so it shows as it does in Docs and Word can update it.
 
 use std::fmt::Write as _;
 
+use crate::fonts;
 use crate::model::{
     self, Align, Block, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks, PageSetup,
     Para, Parts, Row, Script,
@@ -38,6 +43,7 @@ pub fn write(
         pictures,
         media: Vec::new(),
         drawings: 0,
+        fonts: vec![fonts::DEFAULT.to_owned(), fonts::CODE.to_owned()],
         notes: Vec::new(),
         anchors: Vec::new(),
         headings: 0,
@@ -153,6 +159,10 @@ pub fn write(
              Target=\"{name}.xml\"/>"
         );
     }
+    extra.push_str(
+        "<Relationship Id=\"rIdFonts\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable\" \
+         Target=\"fontTable.xml\"/>",
+    );
     if !notes.is_empty() {
         extra.push_str(
             "<Relationship Id=\"rIdFootnotes\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes\" \
@@ -178,6 +188,7 @@ pub fn write(
         escaped(title)
     );
     let numbering = numbering(&writer.numbered);
+    let font_table = font_table(&writer.fonts);
     let mut content_types = CONTENT_TYPES.to_owned();
     let mut kinds: Vec<&Picture> = Vec::new();
     for picture in &writer.media {
@@ -268,6 +279,11 @@ pub fn write(
         Part {
             path: "word/numbering.xml",
             contents: numbering.as_bytes(),
+            stored: false,
+        },
+        Part {
+            path: "word/fontTable.xml",
+            contents: font_table.as_bytes(),
             stored: false,
         },
     ];
@@ -384,6 +400,8 @@ struct Writer<'a> {
     media: Vec<Picture>,
     /// How many pictures are drawn, for their IDs.
     drawings: usize,
+    /// Each font the text names, for the font table.
+    fonts: Vec<String>,
     /// Each footnote, as Word's `<w:footnote>`, numbered from 1.
     notes: Vec<String>,
     /// Each heading's anchor, while the document has a table of contents,
@@ -803,18 +821,23 @@ impl Writer<'_> {
         if marks.link.is_some() {
             self.out.push_str("<w:rStyle w:val=\"Hyperlink\"/>");
         }
-        if let Some(font) = &marks.font {
-            let font = escaped(font);
+        let shown = fonts::shown_weight(marks.weight, marks.bold);
+        let family = marks.font.as_deref().or(marks.code.then_some(fonts::CODE));
+        let font = match fonts::weight_word(shown) {
+            Some(word) => Some(format!("{} {word}", family.unwrap_or(fonts::DEFAULT))),
+            None => family.map(str::to_owned),
+        };
+        if let Some(font) = font {
+            let name = escaped(&font);
             let _ = write!(
                 self.out,
-                "<w:rFonts w:ascii=\"{font}\" w:hAnsi=\"{font}\" w:eastAsia=\"{font}\" w:cs=\"{font}\"/>"
+                "<w:rFonts w:ascii=\"{name}\" w:hAnsi=\"{name}\" w:eastAsia=\"{name}\" w:cs=\"{name}\"/>"
             );
-        } else if marks.code {
-            self.out.push_str(
-                "<w:rFonts w:ascii=\"Courier New\" w:hAnsi=\"Courier New\" w:cs=\"Courier New\"/>",
-            );
+            if !self.fonts.contains(&font) {
+                self.fonts.push(font);
+            }
         }
-        if marks.bold || context.header {
+        if shown == 700 || (context.header && marks.weight.is_none()) {
             self.out.push_str("<w:b/>");
         }
         if marks.italic {
@@ -1124,6 +1147,7 @@ const CONTENT_TYPES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone
 <Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
 <Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>\
 <Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>\
+<Override PartName=\"/word/fontTable.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml\"/>\
 <Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>\
 </Types>";
 
@@ -1138,11 +1162,41 @@ fn toc_name(entry: usize) -> String {
     format!("_Toc{}", entry + 1)
 }
 
-/// The styles, matching the page Docs writes: Arial 11 point, headings
+/// Word's font table: each font the file names, with what Word needs to
+/// pick a font like it where it isn't installed. A font made to the letter
+/// widths of one Word has, such as Carlito, names that font as its other
+/// name, so lines break in the same places with either.
+fn font_table(names: &[String]) -> String {
+    let mut out = format!(
+        "{XML}<w:fonts xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+    );
+    for name in names {
+        let font = fonts::resolve(name).font;
+        let _ = write!(out, "<w:font w:name=\"{}\">", escaped(name));
+        if let Some(twin) = fonts::twin(name) {
+            let _ = write!(out, "<w:altName w:val=\"{twin}\"/>");
+        }
+        let (family, pitch) = match font.kind {
+            fonts::Kind::SansSerif => ("swiss", "variable"),
+            fonts::Kind::Serif => ("roman", "variable"),
+            fonts::Kind::Monospace => ("modern", "fixed"),
+            fonts::Kind::Display => ("decorative", "variable"),
+            fonts::Kind::Handwriting => ("script", "variable"),
+        };
+        let _ = write!(
+            out,
+            "<w:family w:val=\"{family}\"/><w:pitch w:val=\"{pitch}\"/></w:font>"
+        );
+    }
+    out.push_str("</w:fonts>");
+    out
+}
+
+/// The styles, matching the page Docs writes: Arimo 11 point, headings
 /// from 20 point down, quotes with a bar at their left, and code on gray.
 const STYLES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
 <w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
-<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii=\"Arial\" w:hAnsi=\"Arial\" w:eastAsia=\"Arial\" w:cs=\"Arial\"/>\
+<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii=\"Arimo\" w:hAnsi=\"Arimo\" w:eastAsia=\"Arimo\" w:cs=\"Arimo\"/>\
 <w:color w:val=\"1F1F1F\"/><w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/></w:rPr></w:rPrDefault>\
 <w:pPrDefault><w:pPr><w:spacing w:after=\"120\" w:line=\"276\" w:lineRule=\"auto\"/></w:pPr></w:pPrDefault></w:docDefaults>\
 <w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:qFormat/></w:style>\
@@ -1171,7 +1225,7 @@ const STYLES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\
 <w:pPr><w:pBdr><w:left w:val=\"single\" w:sz=\"18\" w:space=\"8\" w:color=\"DADCE0\"/></w:pBdr></w:pPr><w:rPr><w:color w:val=\"444746\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Code\"><w:name w:val=\"Code\"/><w:basedOn w:val=\"Normal\"/>\
 <w:pPr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F1F3F4\"/><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>\
-<w:rPr><w:rFonts w:ascii=\"Courier New\" w:hAnsi=\"Courier New\" w:cs=\"Courier New\"/><w:sz w:val=\"20\"/><w:szCs w:val=\"20\"/></w:rPr></w:style>\
+<w:rPr><w:rFonts w:ascii=\"Cousine\" w:hAnsi=\"Cousine\" w:cs=\"Cousine\"/><w:sz w:val=\"20\"/><w:szCs w:val=\"20\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"TOC1\"><w:name w:val=\"toc 1\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:uiPriority w:val=\"39\"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after=\"80\"/></w:pPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"TOC2\"><w:name w:val=\"toc 2\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:uiPriority w:val=\"39\"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after=\"80\"/><w:ind w:left=\"360\"/></w:pPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"TOC3\"><w:name w:val=\"toc 3\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:uiPriority w:val=\"39\"/><w:unhideWhenUsed/><w:pPr><w:spacing w:after=\"80\"/><w:ind w:left=\"720\"/></w:pPr></w:style>\
@@ -1554,5 +1608,71 @@ mod tests {
         assert!(numbering.contains("<w:lvlText w:val=\"➢\"/>"));
         assert!(numbering.contains("<w:lvlText w:val=\"%1)\"/>"));
         assert!(part(&file, "word/styles.xml").contains("w:styleId=\"Subtitle\""));
+    }
+
+    #[test]
+    fn names_fonts_weights_and_their_twins() {
+        let marks = |font: Option<&str>, weight: Option<u16>, bold: bool| Marks {
+            font: font.map(str::to_owned),
+            weight,
+            bold,
+            ..Marks::default()
+        };
+        let blocks = vec![Block::Paragraph(
+            Para::default(),
+            vec![
+                Inline::Text("light".into(), marks(Some("Raleway"), Some(300), false)),
+                Inline::Text(
+                    "light, bold".into(),
+                    marks(Some("Raleway"), Some(300), true),
+                ),
+                Inline::Text("semibold, bold".into(), marks(None, Some(600), true)),
+                Inline::Text("Carlito".into(), marks(Some("Carlito"), None, true)),
+            ],
+        )];
+        let file = write(
+            &blocks,
+            &Parts::default(),
+            None,
+            "Fonts",
+            &Pictures::new(),
+            &[],
+        );
+        let document = part(&file, "word/document.xml");
+        // Word names weights in the font's name, and bold shows a light
+        // weight as regular and a semibold as bold.
+        assert!(
+            document.contains("<w:rFonts w:ascii=\"Raleway Light\""),
+            "{document}"
+        );
+        assert!(
+            document.contains(
+                "w:cs=\"Raleway\"/></w:rPr><w:t xml:space=\"preserve\">light, bold</w:t>"
+            ),
+            "{document}"
+        );
+        assert!(
+            document
+                .contains("<w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">semibold, bold</w:t>"),
+            "{document}"
+        );
+        let table = part(&file, "word/fontTable.xml");
+        assert!(
+            table.contains(
+                "<w:font w:name=\"Arimo\"><w:altName w:val=\"Arial\"/><w:family w:val=\"swiss\"/>"
+            ),
+            "{table}"
+        );
+        assert!(
+            table.contains("<w:font w:name=\"Carlito\"><w:altName w:val=\"Calibri\"/>"),
+            "{table}"
+        );
+        assert!(
+            table.contains("<w:font w:name=\"Raleway Light\"><w:family w:val=\"swiss\"/>"),
+            "{table}"
+        );
+        assert!(table.contains("<w:font w:name=\"Cousine\"><w:altName w:val=\"Courier New\"/><w:family w:val=\"modern\"/><w:pitch w:val=\"fixed\"/>"), "{table}");
+        assert!(part(&file, "[Content_Types].xml").contains("/word/fontTable.xml"));
+        assert!(part(&file, "word/_rels/document.xml.rels").contains("Target=\"fontTable.xml\""));
     }
 }

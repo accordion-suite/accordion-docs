@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 
 use scraper::{Html, Node};
 
+use crate::fonts;
 use crate::model::{
     self, Align, Block, Cell, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks,
     PageSetup, PageSize, Para, Parts, Row, SIDES, Script,
@@ -39,14 +40,15 @@ pub const DATA_VERSION: u32 = 1;
 /// How the page looks on screen and in print, kept small. The editor in the
 /// web app has its own styles. Only blocks of text keep typed spaces: list
 /// items and cells hold blocks, with line breaks between them in the file
-/// that aren't part of the text. Text is Arial at 11 points, as in Google
-/// Docs and the Word download, or the fonts made to match it. Lines and
+/// that aren't part of the text. Text is Arimo at 11 points, as Google Docs
+/// uses Arial, or Arial where Arimo isn't installed, since the two have the
+/// same letter widths. Lines and
 /// paragraphs are spaced as the Word download spaces them: 1.15 lines, 6
 /// points after each paragraph, and Google Docs' space around headings.
 /// Headings have Google Docs' look too: regular weight, the smaller ones
 /// gray.
 const STYLE: &str = "\
-body{margin:0;background:#f8f9fa;color:#1f1f1f;font:11pt/1.3225 Arial,Arimo,'Liberation Sans',sans-serif}\
+body{margin:0;background:#f8f9fa;color:#1f1f1f;font:11pt/1.3225 Arimo,Arial,'Liberation Sans',sans-serif}\
 main{box-sizing:border-box;max-width:816px;margin:24px auto;padding:72px 96px;background:#fff;\
 box-shadow:0 1px 3px rgba(0,0,0,.15)}\
 p,h1,h2,h3,h4,h5,h6{white-space:pre-wrap}\
@@ -576,6 +578,9 @@ enum Tag {
     Link(String),
     /// Color, highlight, size, and font, as one `<span style>`.
     Style(String),
+    /// A weight other than regular and bold, with whether it's bold too,
+    /// inside `<strong>` as the editor writes it.
+    Weight(u16, bool),
     Bold,
     Italic,
     Underline,
@@ -593,7 +598,12 @@ enum Tag {
 pub(crate) fn style_of(marks: &Marks) -> String {
     let mut parts = Vec::new();
     if let Some(font) = &marks.font {
-        parts.push(format!("font-family:'{font}'"));
+        // The font made to the same widths after it, for a browser outside
+        // Docs that doesn't have the font, such as Carlito's Calibri.
+        match fonts::twin(font) {
+            Some(twin) => parts.push(format!("font-family:'{font}','{twin}'")),
+            None => parts.push(format!("font-family:'{font}'")),
+        }
     }
     if let Some(size) = marks.size {
         parts.push(format!("font-size:{}pt", style::points_text(size)));
@@ -629,6 +639,9 @@ impl Tag {
                 tags.push(tag);
             }
         }
+        if let Some(weight) = marks.weight {
+            tags.push(Tag::Weight(weight, marks.bold));
+        }
         if let Some(field) = marks.field {
             tags.push(Tag::Field(field));
         }
@@ -642,6 +655,14 @@ impl Tag {
             }
             Tag::Style(css) => {
                 let _ = write!(out, "<span style=\"{}\">", escape_attribute(css));
+            }
+            Tag::Weight(weight, bold) => {
+                // The weight it shows, for browsers, and its own, for Docs.
+                let shown = fonts::shown_weight(Some(*weight), *bold);
+                let _ = write!(
+                    out,
+                    "<span data-weight=\"{weight}\" style=\"font-weight:{shown}\">"
+                );
             }
             Tag::Bold => out.push_str("<strong>"),
             Tag::Italic => out.push_str("<em>"),
@@ -659,7 +680,7 @@ impl Tag {
     fn close(&self, out: &mut String) {
         out.push_str(match self {
             Tag::Link(_) => "</a>",
-            Tag::Style(_) => "</span>",
+            Tag::Style(_) | Tag::Weight(..) => "</span>",
             Tag::Bold => "</strong>",
             Tag::Italic => "</em>",
             Tag::Underline => "</u>",
@@ -1476,6 +1497,16 @@ fn inlines_of(node: NodeRef, notes: &NoteTexts) -> Vec<Inline> {
     runs.finish()
 }
 
+/// Sets the font Docs uses for a font read from a style, and the weight its
+/// name gives, such as "Raleway Light", unless the style sets a weight.
+fn set_font(marks: &mut Marks, font: &fonts::Resolved, weighted: bool) {
+    marks.font = Some(font.font.name.to_owned());
+    if !weighted && let Some(weight) = font.weight {
+        marks.bold = weight == 700;
+        marks.weight = (weight != 700).then_some(weight);
+    }
+}
+
 /// The text styles an element's `style` attribute sets, and an old-style
 /// `<font>`'s. A block's background is shading, not a highlight, so only
 /// inline elements highlight.
@@ -1485,7 +1516,7 @@ fn apply_style(node: &NodeRef, marks: &mut Marks, block: bool) {
             marks.color = Some(color);
         }
         if let Some(face) = attribute(node, "face").and_then(style::font_from_css) {
-            marks.font = Some(face);
+            set_font(marks, &face, false);
         }
         if let Some(size) = attribute(node, "size").and_then(style::size_from_font_tag) {
             marks.size = Some(size);
@@ -1495,6 +1526,15 @@ fn apply_style(node: &NodeRef, marks: &mut Marks, block: bool) {
         return;
     };
     let declarations = style::declarations(css);
+    // Docs' own weight, which the style shows with bold added.
+    let own_weight = attribute(node, "data-weight")
+        .and_then(|weight| weight.trim().parse::<u16>().ok())
+        .filter(|weight| weight % 100 == 0 && (100..=900).contains(weight));
+    if own_weight.is_some() {
+        marks.weight = own_weight;
+    }
+    let weighted =
+        own_weight.is_some() || declarations.iter().any(|(name, _)| name == "font-weight");
     // Programs that raise text also make it smaller, which the editor
     // already does for superscript and subscript.
     let mut raised = false;
@@ -1534,15 +1574,27 @@ fn apply_style(node: &NodeRef, marks: &mut Marks, block: bool) {
             }
             "font-family" => {
                 if let Some(font) = style::font_from_css(value) {
-                    marks.font = Some(font);
+                    set_font(marks, &font, weighted);
                 }
             }
-            "font-weight" => match lower.as_str() {
-                "bold" | "bolder" => marks.bold = true,
-                "normal" | "lighter" => marks.bold = false,
+            // Only 700 is bold. Other weights are their own, as the editor
+            // keeps them.
+            "font-weight" if own_weight.is_none() => match lower.as_str() {
+                "bold" | "bolder" => {
+                    marks.bold = true;
+                    marks.weight = None;
+                }
+                "normal" | "lighter" => {
+                    marks.bold = false;
+                    marks.weight = None;
+                }
                 weight => {
-                    if let Ok(weight) = weight.parse::<u32>() {
-                        marks.bold = weight >= 600;
+                    if let Ok(weight) = weight.parse::<f64>()
+                        && weight.is_finite()
+                    {
+                        let weight = ((weight / 100.0).round() * 100.0).clamp(100.0, 900.0) as u16;
+                        marks.bold = weight == 700;
+                        marks.weight = (weight != 400 && weight != 700).then_some(weight);
                     }
                 }
             },
@@ -2807,12 +2859,61 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn keeps_fonts_and_weights() {
+        let marks = |font: Option<&str>, weight: Option<u16>, bold: bool| Marks {
+            font: font.map(str::to_owned),
+            weight,
+            bold,
+            ..Marks::default()
+        };
+        let blocks = vec![Block::Paragraph(
+            Para::default(),
+            vec![
+                marked("light ", marks(Some("Raleway"), Some(300), false)),
+                marked("light and bold ", marks(Some("Raleway"), Some(300), true)),
+                marked("black ", marks(Some("Raleway"), Some(900), false)),
+                marked("Carlito", marks(Some("Carlito"), None, false)),
+            ],
+        )];
+        let written = page(&blocks, &Parts::default(), None, None, &Pictures::new());
+        // Bold shows a light weight as regular, and Carlito names Calibri
+        // after it for browsers without it.
+        assert!(
+            written.contains("<strong><span data-weight=\"300\" style=\"font-weight:400\">light and bold </span></strong>"),
+            "{written}"
+        );
+        assert!(
+            written.contains("font-family:'Carlito','Calibri'"),
+            "{written}"
+        );
+        assert_eq!(read(written.as_bytes()), blocks);
+
+        // Other programs' weights, and fonts Docs has in place of theirs.
+        // Only 700 is bold, and a weight inside bold is its own.
+        let other = r#"<p><span style="font-family:'Raleway Light'">a</span><span style="font-family:Raleway;font-weight:800">b</span><span style="font-family:Verdana;font-weight:600">c</span><span style="font-family:'Comic Sans MS';font-weight:bold">d</span><b><span style="font-weight:300">e</span></b></p>"#;
+        assert_eq!(
+            read(other.as_bytes()),
+            vec![Block::Paragraph(
+                Para::default(),
+                vec![
+                    marked("a", marks(Some("Raleway"), Some(300), false)),
+                    marked("b", marks(Some("Raleway"), Some(800), false)),
+                    marked("c", marks(Some("Noto Sans"), Some(600), false)),
+                    marked("d", marks(Some("Comic Relief"), None, true)),
+                    // Arimo has no light, so it's regular.
+                    marked("e", marks(None, None, false)),
+                ],
+            )]
+        );
+    }
+
+    #[test]
     fn reads_the_styles_google_docs_and_word_write() {
         // As Google Docs puts a paste on the clipboard.
         let google = r#"<meta charset="utf-8"><b style="font-weight:normal;" id="docs-internal-guid-1"><p dir="ltr"><span style="font-size:11pt;font-family:Arial,sans-serif;color:#000000;background-color:transparent;font-weight:400;">Plain </span><span style="font-size:11pt;font-family:Arial,sans-serif;color:#ff0000;background-color:#ffff00;font-weight:700;">loud</span><span style="font-size:6.6pt;font-family:Arial,sans-serif;color:#000000;vertical-align:super;">2</span></p></b>"#;
+        // Arial is Arimo, the font text has anyway.
         let arial = Marks {
             size: Some(22),
-            font: Some("Arial".into()),
             ..Marks::default()
         };
         assert_eq!(
@@ -2846,7 +2947,7 @@ pub(crate) mod tests {
         let word = r#"<p class=MsoNormal style='font-family:"Times New Roman";font-size:12.0pt'>A <font color="navy" size="5">big</font> <span style="font-family:url(x);color:#ff0000ff">word</span></p>"#;
         let times = Marks {
             size: Some(24),
-            font: Some("Times New Roman".into()),
+            font: Some("Tinos".into()),
             ..Marks::default()
         };
         assert_eq!(

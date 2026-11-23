@@ -1,14 +1,17 @@
 //! A document as an OpenDocument text file (`.odt`), for **Download as**
-//! (decision 30), with the same look as the Word file: Arial 11 point,
+//! (decision 30), with the same look as the Word file: Arimo 11 point,
 //! the document's paper and margins, and everything the editor has, its
 //! headers and footers too, in the page style, with page numbers and
 //! counts as OpenDocument's fields. Footnotes are OpenDocument's. A table
 //! of contents is OpenDocument's, with its entries and page numbers already
-//! in it, so LibreOffice shows it as Docs does and can update it.
+//! in it, so LibreOffice shows it as Docs does and can update it. Fonts
+//! keep their own names, and a weight other than regular and bold is
+//! OpenDocument's number for it.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use crate::fonts;
 use crate::model::{
     self, Align, Block, Cell, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks,
     PageSetup, Para, Parts, Row, SIDES, Script,
@@ -250,13 +253,18 @@ struct SpanKey {
     highlight: Option<Color>,
     size: Option<HalfPoints>,
     font: Option<String>,
+    weight: Option<u16>,
 }
 
 impl SpanKey {
     fn properties(&self) -> String {
         let mut out = String::new();
-        if self.bold {
-            out.push_str(" fo:font-weight=\"bold\"");
+        match fonts::shown_weight(self.weight, self.bold) {
+            400 => {}
+            700 => out.push_str(" fo:font-weight=\"bold\""),
+            weight => {
+                let _ = write!(out, " fo:font-weight=\"{weight}\"");
+            }
         }
         if self.italic {
             out.push_str(" fo:font-style=\"italic\"");
@@ -274,7 +282,7 @@ impl SpanKey {
         if let Some(font) = &self.font {
             let _ = write!(out, " fo:font-family=\"&apos;{}&apos;\"", escaped(font));
         } else if self.code {
-            out.push_str(" style:font-name=\"Courier New\"");
+            out.push_str(" style:font-name=\"Cousine\"");
         }
         if let Some(color) = self.highlight {
             let _ = write!(out, " fo:background-color=\"{}\"", color.css());
@@ -728,6 +736,7 @@ impl Writer<'_> {
             highlight: marks.highlight,
             size: marks.size,
             font: marks.font.clone(),
+            weight: marks.weight,
         };
         if key == SpanKey::default() {
             self.field_or_text(text, marks);
@@ -1037,8 +1046,8 @@ const CONTENT_STYLES: &str = "<style:style style:name=\"Cell\" style:family=\"ta
 <style:text-properties fo:font-size=\"1pt\"/></style:style>";
 
 const FONTS: &str = "<office:font-face-decls>\
-<style:font-face style:name=\"Arial\" svg:font-family=\"Arial\" style:font-family-generic=\"swiss\" style:font-pitch=\"variable\"/>\
-<style:font-face style:name=\"Courier New\" svg:font-family=\"&apos;Courier New&apos;\" style:font-family-generic=\"modern\" style:font-pitch=\"fixed\"/>\
+<style:font-face style:name=\"Arimo\" svg:font-family=\"Arimo\" style:font-family-generic=\"swiss\" style:font-pitch=\"variable\"/>\
+<style:font-face style:name=\"Cousine\" svg:font-family=\"Cousine\" style:font-family-generic=\"modern\" style:font-pitch=\"fixed\"/>\
 <style:font-face style:name=\"Segoe UI Symbol\" svg:font-family=\"&apos;Segoe UI Symbol&apos;\" style:font-pitch=\"variable\"/>\
 </office:font-face-decls>";
 
@@ -1127,7 +1136,7 @@ fn level_properties(level: usize) -> String {
 /// The common styles, matching the page Docs writes and the Word file.
 const STYLES: &str = "<office:styles>\
 <style:default-style style:family=\"paragraph\"><style:paragraph-properties fo:margin-top=\"0pt\" fo:margin-bottom=\"6pt\" fo:line-height=\"115%\"/>\
-<style:text-properties style:font-name=\"Arial\" fo:font-size=\"11pt\" fo:color=\"#1f1f1f\"/></style:default-style>\
+<style:text-properties style:font-name=\"Arimo\" fo:font-size=\"11pt\" fo:color=\"#1f1f1f\"/></style:default-style>\
 <style:style style:name=\"Standard\" style:family=\"paragraph\" style:class=\"text\"/>\
 <style:style style:name=\"Title\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:next-style-name=\"Standard\" style:class=\"chapter\">\
 <style:paragraph-properties fo:margin-top=\"0pt\" fo:margin-bottom=\"3pt\" fo:keep-with-next=\"always\"/><style:text-properties fo:font-size=\"26pt\"/></style:style>\
@@ -1150,7 +1159,7 @@ const STYLES: &str = "<office:styles>\
 <style:text-properties fo:color=\"#444746\"/></style:style>\
 <style:style style:name=\"Preformatted_20_Text\" style:display-name=\"Preformatted Text\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"html\">\
 <style:paragraph-properties fo:margin-top=\"0pt\" fo:margin-bottom=\"0pt\" fo:line-height=\"100%\" fo:background-color=\"#f1f3f4\"/>\
-<style:text-properties style:font-name=\"Courier New\" fo:font-size=\"10pt\"/></style:style>\
+<style:text-properties style:font-name=\"Cousine\" fo:font-size=\"10pt\"/></style:style>\
 <style:style style:name=\"Rule\" style:family=\"paragraph\" style:parent-style-name=\"Standard\">\
 <style:paragraph-properties fo:padding-bottom=\"2pt\" fo:border-bottom=\"0.75pt solid #c4c7c5\" fo:border-top=\"none\" fo:border-left=\"none\" fo:border-right=\"none\"/></style:style>\
 <style:style style:name=\"Table_20_Contents\" style:display-name=\"Table Contents\" style:family=\"paragraph\" style:parent-style-name=\"Standard\" style:class=\"extra\">\
@@ -1474,5 +1483,38 @@ mod tests {
         // The title is a style of its own, centered by one of the document's.
         assert!(content.contains("style:parent-style-name=\"Title\"><style:paragraph-properties fo:text-align=\"center\"/>"));
         assert!(part(&file, "styles.xml").contains("style:name=\"Subtitle\""));
+    }
+
+    #[test]
+    fn writes_weights_as_numbers() {
+        let marks = |weight: Option<u16>, bold: bool| Marks {
+            font: Some("Raleway".into()),
+            weight,
+            bold,
+            ..Marks::default()
+        };
+        let blocks = vec![Block::Paragraph(
+            Para::default(),
+            vec![
+                Inline::Text("light".into(), marks(Some(300), false)),
+                Inline::Text("light, bold".into(), marks(Some(300), true)),
+                Inline::Text("black".into(), marks(Some(900), false)),
+            ],
+        )];
+        let file = write(
+            &blocks,
+            &Parts::default(),
+            None,
+            "Fonts",
+            &Pictures::new(),
+            &[],
+        );
+        let content = part(&file, "content.xml");
+        assert!(content.contains("fo:font-weight=\"300\""), "{content}");
+        assert!(content.contains("fo:font-weight=\"900\""), "{content}");
+        assert!(
+            content.contains("style:font-name=\"Arimo\"")
+                || part(&file, "styles.xml").contains("style:font-name=\"Arimo\"")
+        );
     }
 }

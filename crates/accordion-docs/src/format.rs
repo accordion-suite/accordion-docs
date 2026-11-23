@@ -146,7 +146,7 @@ mod tests {
     use yrs::{OffsetKind, Options, Update, XmlFragmentRef};
 
     use super::*;
-    use crate::model::{Image, Inline, Marks, PageSize, Script};
+    use crate::model::{Image, Inline, Marks, PageSize, Para, Script};
     use crate::picture::Picture;
     use crate::style::Color;
 
@@ -250,6 +250,36 @@ mod tests {
         let before = doc.transact().state_vector();
         format().absorb(&doc, &written).unwrap();
         assert_eq!(doc.transact().state_vector(), before);
+    }
+
+    #[test]
+    fn fonts_and_weights_survive_the_editor_and_the_file() {
+        let doc = doc();
+        let marks = |font: &str, weight: Option<u16>, bold: bool| Marks {
+            font: Some(font.into()),
+            weight,
+            bold,
+            ..Marks::default()
+        };
+        let blocks = vec![Block::Paragraph(
+            Para::default(),
+            vec![
+                Inline::Text("light ".into(), marks("Raleway", Some(300), false)),
+                Inline::Text("and bold".into(), marks("Raleway", Some(300), true)),
+                Inline::Text(" Tinos".into(), marks("Tinos", None, false)),
+            ],
+        )];
+        let file = html::page(
+            &blocks,
+            &crate::model::Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
+        format().absorb(&doc, file.as_bytes()).unwrap();
+        assert_eq!(self::blocks(&doc), blocks);
+        let written = format().write(&doc).unwrap();
+        assert_eq!(html::read(&written), blocks);
     }
 
     #[test]
