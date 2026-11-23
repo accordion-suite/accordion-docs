@@ -1010,3 +1010,165 @@ mod live {
         );
     }
 }
+
+#[tokio::test]
+async fn opens_word_files_and_pages_with_docs() {
+    let server = start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let my_drive = server.storage.top_folder(server.alex.id).await.unwrap();
+    let alex = server.as_person(&server.alex);
+
+    // A Word file with a large photo, as Docs' own download writes one.
+    let photo = Picture::read(photo(dir.path(), 3000, 2000)).unwrap();
+    let blocks = vec![
+        paragraph("From Word"),
+        Block::Image(Image {
+            hash: photo.hash.clone(),
+            alt: "A photo".into(),
+            width: None,
+        }),
+    ];
+    let mut pictures = std::collections::HashMap::new();
+    pictures.insert(photo.hash.clone(), photo.clone());
+    let word =
+        accordion_docs::docx::write(&blocks, &Default::default(), None, "Report", &pictures, &[]);
+    let file = alex
+        .create_file(my_drive, "Report.docx", word.as_slice())
+        .await
+        .unwrap();
+
+    // Nobody else can open it with Docs.
+    let request = |item: &ItemId, confirmed: bool| json!({ "item": item, "confirmed": confirmed });
+    let (status, _) = server
+        .api(
+            &server.sam,
+            "POST",
+            "/imports",
+            Some(request(&file.id, false)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Nothing is lost, so the document is made at once, beside the file.
+    let (status, made) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/imports",
+            Some(request(&file.id, false)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{made}");
+    let document = &made["document"];
+    assert_eq!(document["name"], "Report.html");
+    assert_eq!(document["folder"], json!(my_drive));
+    assert_eq!(made["report"]["lost"], json!([]));
+    let id = document["id"].as_str().unwrap();
+    let text = server.file_text(id).await;
+    assert!(text.starts_with(MARKER), "{text}");
+    let read = html::read_document(text.as_bytes());
+    assert_eq!(read.blocks[0], paragraph("From Word"));
+    // The photo was shrunk, as one added in the editor is.
+    let Block::Image(image) = &read.blocks[1] else {
+        panic!("{:?}", read.blocks);
+    };
+    assert_eq!(image.alt, "A photo");
+    let kept = &read.pictures[&image.hash];
+    assert_eq!((kept.width, kept.height), (2560, 1707));
+    // Opening it again makes another, numbered.
+    let (_, again) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/imports",
+            Some(request(&file.id, false)),
+        )
+        .await;
+    assert_eq!(again["document"]["name"], "Report (2).html");
+
+    // A page with a picture from elsewhere on the web loses it, so Docs
+    // asks first.
+    let page = alex
+        .create_file(
+            my_drive,
+            "Saved page.htm",
+            b"<h1>Saved</h1><p>Text <img src=\"https://example.com/a.png\"></p>".as_slice(),
+        )
+        .await
+        .unwrap();
+    let (status, asked) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/imports",
+            Some(request(&page.id, false)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{asked}");
+    assert_eq!(asked["document"], Value::Null);
+    let (status, made) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/imports",
+            Some(request(&page.id, true)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{made}");
+    assert_eq!(made["document"]["name"], "Saved page.html");
+
+    // A viewer's document goes in their own Docs, since they can't add
+    // beside the file.
+    let notes = alex
+        .create_file(
+            my_drive,
+            "Notes.md",
+            b"# Notes\n\n- one\n- two\n".as_slice(),
+        )
+        .await
+        .unwrap();
+    server
+        .as_person(&server.alex)
+        .share(notes.id, server.sam.id, ShareLevel::Viewer, server.alex.id)
+        .await
+        .unwrap();
+    let (status, mine) = server
+        .api(
+            &server.sam,
+            "POST",
+            "/imports",
+            Some(request(&notes.id, false)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{mine}");
+    assert_eq!(mine["document"]["access"], "owner");
+    assert_eq!(server.names(&server.sam).await, ["Notes.html"]);
+
+    // Files Docs doesn't open, and broken ones, say so.
+    let pdf = alex
+        .create_file(my_drive, "Scan.pdf", b"%PDF-1.4".as_slice())
+        .await
+        .unwrap();
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/imports",
+            Some(request(&pdf.id, false)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let broken = alex
+        .create_file(my_drive, "Broken.docx", b"not a zip".as_slice())
+        .await
+        .unwrap();
+    let (status, problem) = server
+        .api(
+            &server.alex,
+            "POST",
+            "/imports",
+            Some(request(&broken.id, false)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{problem}");
+}

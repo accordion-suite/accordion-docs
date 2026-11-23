@@ -752,6 +752,55 @@ pub fn image_hashes(blocks: &[Block]) -> Vec<String> {
     out
 }
 
+/// Gives each picture in `blocks` its new hash from `renamed`, and leaves
+/// out pictures whose new hash is `None`, such as ones that turned out not
+/// to be pictures. Pictures `renamed` doesn't name stay as they are.
+pub fn rename_images(
+    blocks: &mut Vec<Block>,
+    renamed: &std::collections::HashMap<String, Option<String>>,
+) {
+    blocks.retain_mut(|block| match block {
+        Block::Image(image) => match renamed.get(&image.hash) {
+            Some(Some(hash)) => {
+                image.hash = hash.clone();
+                true
+            }
+            Some(None) => false,
+            None => true,
+        },
+        Block::Quote(blocks) => {
+            rename_images(blocks, renamed);
+            true
+        }
+        Block::Bullets(_, items) | Block::Numbers(_, _, items) => {
+            items
+                .iter_mut()
+                .for_each(|item| rename_images(item, renamed));
+            true
+        }
+        Block::Checks(items) => {
+            items
+                .iter_mut()
+                .for_each(|(_, item)| rename_images(item, renamed));
+            true
+        }
+        Block::Table(rows) => {
+            for row in rows {
+                for cell in &mut row.cells {
+                    rename_images(&mut cell.content, renamed);
+                }
+            }
+            true
+        }
+        Block::Paragraph(..)
+        | Block::Heading(..)
+        | Block::Code(_)
+        | Block::Rule(_)
+        | Block::PageBreak
+        | Block::Contents(_) => true,
+    });
+}
+
 /// Whether any table cell or line in `blocks`, or inside one, has a color
 /// of its own: a cell's color or borders, or a line's color.
 pub fn any_block_color(blocks: &[Block]) -> bool {

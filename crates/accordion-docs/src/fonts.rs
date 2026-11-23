@@ -359,9 +359,88 @@ pub fn resolve(family: &str) -> Resolved {
     with(named(DEFAULT).expect("Docs has its default font"), None)
 }
 
+/// How the font Docs uses in place of another relates to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Likeness {
+    /// Made to the same letter widths, such as Arimo for Arial.
+    Same,
+    /// Looks like it, such as Noto Sans for Verdana.
+    Like,
+    /// Only the same kind of font, or Docs' own.
+    Other,
+}
+
+/// A font Docs doesn't have, and the one it uses in its place, for telling
+/// people, as the editor's status line does.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Replaced {
+    pub from: String,
+    pub to: String,
+    pub kind: Likeness,
+}
+
+/// Whether [`resolve`] puts another font in place of the first one
+/// `family` names, and which, as the web app's `resolveFont` reports it.
+/// `None` for a font Docs has, or a family that names only generic ones.
+pub fn replacement(family: &str) -> Option<Replaced> {
+    let asked_name = family
+        .split(',')
+        .map(|name| {
+            let name = name.trim().trim_matches(['"', '\'']);
+            name.split_whitespace().collect::<Vec<_>>().join(" ")
+        })
+        .find(|name| !name.is_empty() && generic(name).is_none())?;
+    let (asked, asked_weight) = split_weight(&asked_name);
+    let resolved = resolve(family);
+    if asked.eq_ignore_ascii_case(resolved.font.name) {
+        return None;
+    }
+    let kind = match stand_in(asked) {
+        // Widths match only in the weight asked for.
+        Some((font, true)) if font.name == resolved.font.name => {
+            let wanted = asked_weight.filter(|weight| *weight != 400);
+            if resolved.weight == wanted || asked_weight.is_none() {
+                Likeness::Same
+            } else {
+                Likeness::Like
+            }
+        }
+        Some((font, false)) if font.name == resolved.font.name => Likeness::Like,
+        _ => Likeness::Other,
+    };
+    Some(Replaced {
+        from: asked_name,
+        to: resolved.font.name.to_owned(),
+        kind,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn says_which_font_stands_in() {
+        let replaced =
+            |family| replacement(family).map(|replaced| (replaced.to.clone(), replaced.kind));
+        assert_eq!(replaced("Arial"), Some(("Arimo".into(), Likeness::Same)));
+        assert_eq!(
+            replaced("Verdana, sans-serif"),
+            Some(("Noto Sans".into(), Likeness::Like))
+        );
+        assert_eq!(
+            replaced("Mystery, serif"),
+            Some(("Tinos".into(), Likeness::Other))
+        );
+        assert_eq!(
+            replaced("Mystery, Lato"),
+            Some(("Lato".into(), Likeness::Other))
+        );
+        assert_eq!(replaced("Raleway Light"), None);
+        assert_eq!(replaced("arimo"), None);
+        assert_eq!(replaced("serif"), None);
+    }
 
     fn name(family: &str) -> (&'static str, Option<u16>) {
         let resolved = resolve(family);

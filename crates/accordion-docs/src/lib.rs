@@ -14,6 +14,7 @@ pub mod fonts;
 mod format;
 pub mod html;
 mod images;
+pub mod import;
 pub mod markdown;
 pub mod model;
 pub mod odt;

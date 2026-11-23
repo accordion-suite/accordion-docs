@@ -25,8 +25,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 use crate::format::{DocFormat, new_document};
+use crate::import::{self, Lost, Report};
+use crate::model;
 use crate::model::{PageSetup, PageSize};
-use crate::picture::{self, Picture};
+use crate::picture::{self, Picture, Pictures};
 use crate::{DocsState, PLACE, docx, html, markdown, odt};
 
 pub(crate) fn routes(state: DocsState) -> Router {
@@ -41,6 +43,7 @@ pub(crate) fn routes(state: DocsState) -> Router {
             post(add_image).layer(DefaultBodyLimit::max(MAX_UPLOAD)),
         )
         .route("/documents/{id}/images/{hash}", get(image))
+        .route("/imports", post(import))
         .with_state(state)
 }
 
@@ -376,6 +379,222 @@ async fn copy(
         StatusCode::CREATED,
         Json(DocumentView::new(&state, copy, access_name(access), owner)),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportRequest {
+    /// The file to open with Docs.
+    item: ItemId,
+    /// Whether the person has seen what won't come across and still wants
+    /// the document. Without it, a file that would lose something isn't
+    /// converted yet: the report comes back instead.
+    #[serde(default)]
+    confirmed: bool,
+}
+
+#[derive(Serialize)]
+struct ImportView {
+    /// The new document, once there is one.
+    document: Option<DocumentView>,
+    report: Report,
+}
+
+/// `POST /imports`: a new document from a Word file, a web page, Markdown,
+/// or plain text, as Google Docs' **Open with**. The file stays as it is;
+/// the document goes beside it if the person can add to that folder, and
+/// to the top of their Docs place if not. The file is read in the sandbox
+/// (decision 1). When something wouldn't come across, such as text boxes,
+/// the first request only reports it, and the web app asks before sending
+/// `confirmed`.
+async fn import(
+    State(state): State<DocsState>,
+    Authenticated(me): Authenticated,
+    Json(request): Json<ImportRequest>,
+) -> Result<(StatusCode, Json<ImportView>), ApiError> {
+    let id = request.item;
+    state
+        .storage
+        .access(me.user.id, id)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    let item = state
+        .storage
+        .item(id)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    if !state.storage.outside_trash(id).await? {
+        return Err(ApiError::not_found());
+    }
+    let ItemKind::File { blob, .. } = &item.kind else {
+        return Err(ApiError::not_found());
+    };
+    let extension = item
+        .name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !import::EXTENSIONS.contains(&extension.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Docs opens Word files, web pages, Markdown, and text files. Choose one of those.",
+        ));
+    }
+    if blob.size > import::MAX_FILE {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "This file is too large for Docs to open. Docs opens files up to 100 MB.",
+        ));
+    }
+    let contents = read_contents(&state, blob.hash).await?;
+    let output = state
+        .thumbnails
+        .run_command(&[import::COMMAND, &extension], &contents)
+        .await
+        .map_err(|why| {
+            tracing::warn!(%id, %why, "couldn't open a file with Docs");
+            unreadable_file()
+        })?;
+    let (report, page) = match output.iter().position(|byte| *byte == b'\n') {
+        Some(end) => (
+            serde_json::from_slice::<Report>(&output[..end]).map_err(|_| unreadable_file())?,
+            &output[end + 1..],
+        ),
+        None => return Err(unreadable_file()),
+    };
+    if report.warns() && !request.confirmed {
+        return Ok((
+            StatusCode::OK,
+            Json(ImportView {
+                document: None,
+                report,
+            }),
+        ));
+    }
+    let mut report = report;
+    // The page goes through the schema again, so nothing the sandbox wrote
+    // reaches the document unchecked.
+    let html::Document {
+        mut blocks,
+        setup,
+        pictures,
+        mut parts,
+    } = html::read_document(page);
+    // Pictures are checked and shrunk as pictures people add are.
+    let mut kept = Pictures::new();
+    let mut renamed: HashMap<String, Option<String>> = HashMap::new();
+    for (hash, picture) in pictures {
+        let shrunk = match state
+            .thumbnails
+            .shrink_picture(&picture.contents, PICTURE_SIZE)
+            .await
+        {
+            Ok(shrunk) => Picture::read(shrunk.contents),
+            Err(err) => {
+                tracing::warn!(%id, %err, "couldn't shrink a picture in a file opened with Docs");
+                None
+            }
+        };
+        match shrunk {
+            Some(picture) => {
+                renamed.insert(hash, Some(picture.hash.clone()));
+                kept.insert(picture.hash.clone(), picture);
+            }
+            None => {
+                renamed.insert(hash, None);
+                report.lost.insert(Lost::Pictures);
+            }
+        }
+    }
+    model::rename_images(&mut blocks, &renamed);
+    for part in [
+        &mut parts.header,
+        &mut parts.footer,
+        &mut parts.first_header,
+        &mut parts.first_footer,
+    ] {
+        model::rename_images(part, &renamed);
+    }
+    let blocks = model::normalize(blocks);
+    let file = html::page(&blocks, &parts, setup.as_ref(), None, &kept).into_bytes();
+    if file.len() as u64 > MAX_FILE {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "This file's pictures are too large for one document. A document can be at most 50 MB.",
+        ));
+    }
+
+    // Beside the file, as Google Docs puts it, or in the person's own Docs.
+    let here = match item.parent {
+        Some(parent) => state.storage.access(me.user.id, parent).await?,
+        None => None,
+    };
+    let folder = match (item.parent, here) {
+        (Some(parent), Some(access)) if access >= Access::Editor => parent,
+        _ => state.storage.place_folder(me.user.id, PLACE.id).await?,
+    };
+    let stem = stem(&item.name).to_owned();
+    let stem = if stem.is_empty() {
+        NEW_NAME.to_owned()
+    } else {
+        stem
+    };
+    let storage = state.storage.acting_as(accordion_module::auth::actor(&me));
+    let mut created = None;
+    for number in 1..=100 {
+        let name = match number {
+            1 => format!("{stem}.html"),
+            n => format!("{stem} ({n}).html"),
+        };
+        match storage.create_file(folder, &name, file.as_slice()).await {
+            Err(Error::NameTaken { .. }) => continue,
+            result => {
+                created = Some(result?);
+                break;
+            }
+        }
+    }
+    let document = created.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "This folder already has too many documents with this file's name. Rename the file, then try again.",
+        )
+    })?;
+    let access = state
+        .storage
+        .access(me.user.id, document.id)
+        .await?
+        .unwrap_or(Access::Owner);
+    let owner = if document.owner == me.user.id {
+        None
+    } else {
+        state
+            .identity
+            .user(document.owner)
+            .await
+            .ok()
+            .flatten()
+            .map(|user| user.display_name)
+    };
+    Ok((
+        StatusCode::CREATED,
+        Json(ImportView {
+            document: Some(DocumentView::new(
+                &state,
+                document,
+                access_name(access),
+                owner,
+            )),
+            report,
+        }),
+    ))
+}
+
+fn unreadable_file() -> ApiError {
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "Docs couldn't read this file. It may be damaged, or not the kind of file its name says.",
+    )
 }
 
 fn unreadable_draft() -> ApiError {

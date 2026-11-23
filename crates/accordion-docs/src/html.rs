@@ -1712,7 +1712,14 @@ fn list(node: NodeRef, numbered: bool, pictures: &mut Pictures, notes: &NoteText
         || attribute(&node, "data-type") == Some("checklist")
         || node
             .children()
-            .any(|child| attribute(&child, "data-checked").is_some());
+            .any(|child| attribute(&child, "data-checked").is_some())
+        // GitHub's task lists, with a box at the start of each item.
+        || node.children().any(|item| {
+            element(&item) == Some("li")
+                && item.children().any(|child| {
+                    element(&child) == Some("input") && attribute(&child, "type") == Some("checkbox")
+                })
+        });
     let mut items: Vec<(bool, Vec<Block>)> = Vec::new();
     for child in node.children() {
         match element(&child) {
