@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 
 use scraper::{Html, Node};
 
+use crate::comments::{self, Thread};
 use crate::fonts;
 use crate::model::{
     self, Align, Block, Cell, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks,
@@ -109,17 +110,33 @@ pub fn page(
     state: Option<&[u8]>,
     pictures: &Pictures,
 ) -> String {
+    page_with_comments(blocks, parts, setup, state, pictures, &[])
+}
+
+/// The same as [`page`], with the document's comment threads in its data
+/// block.
+pub fn page_with_comments(
+    blocks: &[Block],
+    parts: &Parts,
+    setup: Option<&PageSetup>,
+    state: Option<&[u8]>,
+    pictures: &Pictures,
+    comments: &[Thread],
+) -> String {
     let title = model::first_text(blocks)
         .map(|text| text.chars().take(100).collect::<String>())
         .unwrap_or_else(|| "Untitled document".to_owned());
-    write_page(blocks, parts, setup, state, &title, pictures)
+    use base64::Engine as _;
+    let state = state.map(|state| base64::engine::general_purpose::STANDARD.encode(state));
+    let data = data_block(state.as_deref(), comments);
+    write_page(blocks, parts, setup, data.as_deref(), &title, pictures)
 }
 
 fn write_page(
     blocks: &[Block],
     parts: &Parts,
     setup: Option<&PageSetup>,
-    state: Option<&[u8]>,
+    data: Option<&str>,
     title: &str,
     pictures: &Pictures,
 ) -> String {
@@ -194,16 +211,93 @@ fn write_page(
     part(&mut out, "footer", "footer", &parts.footer);
     part(&mut out, "footer", "first_footer", &parts.first_footer);
     out.push_str("</main>\n");
-    if let Some(state) = state {
-        use base64::Engine as _;
-        let data = serde_json::json!({
-            "version": DATA_VERSION,
-            "state": base64::engine::general_purpose::STANDARD.encode(state),
-        });
-        let _ = writeln!(out, "<script type=\"{DATA_TYPE}\">{data}</script>");
+    if let Some(data) = data {
+        out.push_str(data);
     }
     out.push_str("</body>\n</html>\n");
     out
+}
+
+/// The data block, on a line of its own, with the co-editing state in
+/// base64 and the comment threads, or nothing if there are neither.
+fn data_block(state: Option<&str>, comments: &[Thread]) -> Option<String> {
+    if state.is_none() && comments.is_empty() {
+        return None;
+    }
+    let mut data = serde_json::json!({ "version": DATA_VERSION });
+    if let Some(state) = state {
+        data["state"] = state.into();
+    }
+    if !comments.is_empty() {
+        data["comments"] = serde_json::to_value(comments).expect("threads become JSON");
+    }
+    // Comments are typed text, and "</script>" in one would end the block.
+    // JSON has `<` only inside strings, where `\u003c` means the same.
+    let data = data.to_string().replace('<', "\\u003c");
+    Some(format!("<script type=\"{DATA_TYPE}\">{data}</script>\n"))
+}
+
+/// Where the data block is in a document's text, from its opening tag to
+/// the end of its line, and what it holds.
+fn find_data(text: &str) -> Option<(std::ops::Range<usize>, serde_json::Value)> {
+    let open = format!("<script type=\"{DATA_TYPE}\">");
+    let at = text.rfind(&open)?;
+    let start = at + open.len();
+    let end = start + text[start..].find("</script>")?;
+    let data: serde_json::Value = serde_json::from_str(&text[start..end]).ok()?;
+    if data.get("version")?.as_u64()? != u64::from(DATA_VERSION) {
+        return None;
+    }
+    let mut after = end + "</script>".len();
+    if text[after..].starts_with('\n') {
+        after += 1;
+    }
+    Some((at..after, data))
+}
+
+/// The comment threads in a document's data block, as far as they're
+/// threads Docs keeps.
+pub fn comments_in(contents: &[u8]) -> Vec<Thread> {
+    let Some((_, data)) = std::str::from_utf8(contents).ok().and_then(find_data) else {
+        return Vec::new();
+    };
+    let Some(serde_json::Value::Array(found)) = data.get("comments") else {
+        return Vec::new();
+    };
+    comments::checked(
+        found
+            .iter()
+            .filter_map(|thread| serde_json::from_value(thread.clone()).ok())
+            .collect(),
+    )
+}
+
+/// A document's file with `comments` as its threads, and the rest as it
+/// was. `None` if it isn't a document Docs wrote.
+pub fn with_comments(contents: &[u8], comments: &[Thread]) -> Option<Vec<u8>> {
+    if !is_document(contents) {
+        return None;
+    }
+    let text = std::str::from_utf8(contents).ok()?;
+    let (range, state) = match find_data(text) {
+        Some((range, data)) => {
+            let state = data
+                .get("state")
+                .and_then(|state| state.as_str())
+                .map(str::to_owned);
+            (range, state)
+        }
+        None => {
+            let at = text.rfind("</body>")?;
+            (at..at, None)
+        }
+    };
+    let block = data_block(state.as_deref(), comments).unwrap_or_default();
+    let mut written = String::with_capacity(text.len() + block.len());
+    written.push_str(&text[..range.start]);
+    written.push_str(&block);
+    written.push_str(&text[range.end..]);
+    Some(written.into_bytes())
 }
 
 /// The page's size and margins: in print, as the paper's, and on a wide
@@ -227,14 +321,7 @@ pub fn is_document(contents: &[u8]) -> bool {
 /// read.
 pub fn state_in(contents: &[u8]) -> Option<Vec<u8>> {
     use base64::Engine as _;
-    let text = std::str::from_utf8(contents).ok()?;
-    let open = format!("<script type=\"{DATA_TYPE}\">");
-    let start = text.rfind(&open)? + open.len();
-    let end = start + text[start..].find("</script>")?;
-    let data: serde_json::Value = serde_json::from_str(&text[start..end]).ok()?;
-    if data.get("version")?.as_u64()? != u64::from(DATA_VERSION) {
-        return None;
-    }
+    let (_, data) = find_data(std::str::from_utf8(contents).ok()?)?;
     base64::engine::general_purpose::STANDARD
         .decode(data.get("state")?.as_str()?)
         .ok()
@@ -2771,6 +2858,65 @@ pub(crate) mod tests {
         );
         assert_eq!(read.pictures.len(), 1);
         assert_eq!(read.pictures[&picture.hash], picture);
+    }
+
+    fn a_thread(text: &str) -> Thread {
+        Thread {
+            id: "t1".into(),
+            start: "AQID".into(),
+            end: "BAUG".into(),
+            quote: "the plan".into(),
+            resolved: None,
+            comments: vec![comments::Comment {
+                id: "c1".into(),
+                author: None,
+                name: "Dana".into(),
+                text: text.into(),
+                at: "2026-11-25T10:00:00.000Z".into(),
+                edited: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn comments_travel_in_the_data_block() {
+        let blocks = [Block::Paragraph(
+            Para::default(),
+            vec![Inline::Text("Plan".into(), Marks::default())],
+        )];
+        let parts = Parts::default();
+        let pictures = Pictures::new();
+        let threads = [a_thread("Is </script> <!-- this right?")];
+        let file = page_with_comments(&blocks, &parts, None, Some(b"state"), &pictures, &threads);
+        // Typed text can't end the block or start a comment in it.
+        assert_eq!(file.matches("</script>").count(), 1);
+        assert!(!file.contains("<!--"));
+        assert_eq!(comments_in(file.as_bytes()), threads);
+        assert_eq!(state_in(file.as_bytes()).as_deref(), Some(&b"state"[..]));
+        assert_eq!(read(file.as_bytes()), blocks);
+
+        // Changing only the threads gives what writing the page would.
+        let without = page(&blocks, &parts, None, Some(b"state"), &pictures);
+        assert_eq!(
+            with_comments(without.as_bytes(), &threads).unwrap(),
+            file.as_bytes()
+        );
+        assert_eq!(
+            with_comments(file.as_bytes(), &[]).unwrap(),
+            without.as_bytes()
+        );
+        assert!(comments_in(without.as_bytes()).is_empty());
+
+        // A new document has no state yet, and its threads still go in.
+        let fresh = page(&blocks, &parts, None, None, &pictures);
+        let commented = with_comments(fresh.as_bytes(), &threads).unwrap();
+        assert_eq!(comments_in(&commented), threads);
+        assert_eq!(state_in(&commented), None);
+        assert_eq!(
+            commented,
+            page_with_comments(&blocks, &parts, None, None, &pictures, &threads).as_bytes()
+        );
+        assert_eq!(with_comments(b"<html><body></body></html>", &threads), None);
     }
 
     #[test]

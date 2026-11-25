@@ -21,6 +21,8 @@ axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
 # The tree scraper parses HTML into.
 ego-tree = "0.11.1"
+# When comments were written.
+jiff = { version = "1.0.0", default-features = false, features = ["std"] }
 # Reads Markdown files people open with Docs, as GitHub reads them.
 pulldown-cmark = { version = "0.13.0", default-features = false, features = ["html"] }
 # Reads Word files people open with Docs, in the sandbox.
@@ -32,6 +34,8 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 tokio = { version = "1.53.3", features = ["io-util", "macros", "rt", "sync", "time"] }
 tracing = "0.1.44"
+# Comments' IDs, and the version their writes into a file make.
+uuid = { version = "1.28.0", features = ["v7"] }
 yrs = "0.28.1"
 # Packs Word and OpenDocument downloads.
 zip = { version = "9.2.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }

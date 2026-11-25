@@ -693,6 +693,297 @@ async fn copies_a_document_beside_it_or_into_the_viewers_docs() {
     );
 }
 
+/// A new thread on `id` from `person`, with made-up positions.
+fn new_thread(text: &str) -> Value {
+    json!({ "start": "AQID", "end": "BAUG", "quote": "  the\n plan ", "text": text })
+}
+
+#[tokio::test]
+async fn comments_are_kept_with_the_document_and_in_its_file() {
+    let server = start().await;
+    let id = server.new_document(&server.alex).await;
+    let comments = format!("/documents/{id}/comments");
+    let (status, none) = server.api(&server.alex, "GET", &comments, None).await;
+    assert_eq!(status, StatusCode::OK, "{none}");
+    assert_eq!(none, json!({ "can_comment": true, "threads": [] }));
+
+    let (status, view) = server
+        .api(
+            &server.alex,
+            "POST",
+            &comments,
+            Some(new_thread(" Is this </script> right? ")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let thread = &view["threads"][0];
+    let thread_id = thread["id"].as_str().unwrap().to_owned();
+    assert_eq!(thread["quote"], "the plan");
+    assert_eq!(thread["resolved"], Value::Null);
+    assert_eq!(thread["comments"][0]["text"], "Is this </script> right?");
+    assert_eq!(thread["comments"][0]["name"], "Alex Kim");
+    assert_eq!(thread["comments"][0]["mine"], true);
+
+    // The file carries the thread, and still reads as before.
+    let file = server.file_text(&id).await;
+    let kept = html::comments_in(file.as_bytes());
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].comments[0].text, "Is this </script> right?");
+    assert_eq!(kept[0].comments[0].author, Some(server.alex.id));
+    assert_eq!(
+        html::read(file.as_bytes()),
+        [Block::Paragraph(Para::default(), Vec::new())]
+    );
+
+    // Viewers see comments but can't add them.
+    let alex_storage = server.as_person(&server.alex);
+    alex_storage
+        .share(
+            id.parse().unwrap(),
+            server.sam.id,
+            ShareLevel::Viewer,
+            server.alex.id,
+        )
+        .await
+        .unwrap();
+    let (status, seen) = server.api(&server.sam, "GET", &comments, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(seen["can_comment"], false);
+    assert_eq!(seen["threads"][0]["comments"][0]["mine"], false);
+    let (status, _) = server
+        .api(&server.sam, "POST", &comments, Some(new_thread("Mine")))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Editors reply, and change only their own comments.
+    alex_storage
+        .share(
+            id.parse().unwrap(),
+            server.sam.id,
+            ShareLevel::Editor,
+            server.alex.id,
+        )
+        .await
+        .unwrap();
+    let thread_path = format!("{comments}/{thread_id}");
+    let (status, view) = server
+        .api(
+            &server.sam,
+            "POST",
+            &thread_path,
+            Some(json!({ "text": "Yes" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let first = view["threads"][0]["comments"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reply = view["threads"][0]["comments"][1]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(view["threads"][0]["comments"][1]["name"], "Sam Kim");
+    let (status, _) = server
+        .api(
+            &server.sam,
+            "PATCH",
+            &format!("{thread_path}/{first}"),
+            Some(json!({ "text": "No" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, view) = server
+        .api(
+            &server.sam,
+            "PATCH",
+            &format!("{thread_path}/{reply}"),
+            Some(json!({ "text": "Yes, it is" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["threads"][0]["comments"][1]["text"], "Yes, it is");
+    assert!(view["threads"][0]["comments"][1]["edited"].is_string());
+
+    // Resolving, and a reply opens the thread again.
+    let (_, view) = server
+        .api(
+            &server.alex,
+            "PATCH",
+            &thread_path,
+            Some(json!({ "resolved": true })),
+        )
+        .await;
+    assert_eq!(view["threads"][0]["resolved"]["name"], "Alex Kim");
+    let (_, view) = server
+        .api(
+            &server.sam,
+            "POST",
+            &thread_path,
+            Some(json!({ "text": "One more thing" })),
+        )
+        .await;
+    assert_eq!(view["threads"][0]["resolved"], Value::Null);
+    assert_eq!(view["threads"][0]["comments"].as_array().unwrap().len(), 3);
+
+    // What isn't a comment is turned away.
+    for (body, expected) in [
+        (new_thread("   "), StatusCode::BAD_REQUEST),
+        (new_thread(&"x".repeat(4001)), StatusCode::BAD_REQUEST),
+        (
+            json!({ "start": "not base64!", "end": "AQID", "text": "Hi" }),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (status, _) = server
+            .api(&server.alex, "POST", &comments, Some(body))
+            .await;
+        assert_eq!(status, expected);
+    }
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "POST",
+            &format!("{comments}/nothing"),
+            Some(json!({ "text": "Hi" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Restoring an older version of the file keeps the comments as they
+    // are, as in Google Docs.
+    let item = server
+        .storage
+        .item(id.parse().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let accordion_core::storage::ItemKind::File { blob, .. } = item.kind else {
+        panic!("a folder");
+    };
+    let older = html::with_comments(file.as_bytes(), &[]).unwrap();
+    alex_storage
+        .write_version(item.id, blob.hash, older.as_slice())
+        .await
+        .unwrap();
+    let (_, view) = server.api(&server.alex, "GET", &comments, None).await;
+    assert_eq!(view["threads"][0]["comments"].as_array().unwrap().len(), 3);
+
+    // A copy leaves the comments out, unless asked.
+    let (_, plain) = server
+        .api(
+            &server.alex,
+            "POST",
+            &format!("/documents/{id}/copy"),
+            Some(json!({ "name": "Plain" })),
+        )
+        .await;
+    let plain = plain["id"].as_str().unwrap().to_owned();
+    assert!(html::comments_in(server.file_text(&plain).await.as_bytes()).is_empty());
+    let (_, view) = server
+        .api(
+            &server.alex,
+            "GET",
+            &format!("/documents/{plain}/comments"),
+            None,
+        )
+        .await;
+    assert_eq!(view["threads"], json!([]));
+    // Comments written after the restore are in the file again.
+    server
+        .api(
+            &server.alex,
+            "PATCH",
+            &thread_path,
+            Some(json!({ "resolved": true })),
+        )
+        .await;
+    let (_, kept) = server
+        .api(
+            &server.alex,
+            "POST",
+            &format!("/documents/{id}/copy"),
+            Some(json!({ "name": "With comments", "comments": true })),
+        )
+        .await;
+    let (_, view) = server
+        .api(
+            &server.alex,
+            "GET",
+            &format!("/documents/{}/comments", kept["id"].as_str().unwrap()),
+            None,
+        )
+        .await;
+    assert_eq!(view["threads"][0]["comments"].as_array().unwrap().len(), 3);
+    assert_eq!(view["threads"][0]["resolved"]["name"], "Alex Kim");
+
+    // Deleting a reply, then the first comment, which takes the thread.
+    let (status, view) = server
+        .api(
+            &server.alex,
+            "DELETE",
+            &format!("{thread_path}/{reply}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["threads"][0]["comments"].as_array().unwrap().len(), 2);
+    let (status, view) = server
+        .api(
+            &server.alex,
+            "DELETE",
+            &format!("{thread_path}/{first}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["threads"], json!([]));
+    assert!(html::comments_in(server.file_text(&id).await.as_bytes()).is_empty());
+}
+
+#[tokio::test]
+async fn a_file_brings_its_comments_with_it() {
+    let server = start().await;
+    let top = server
+        .storage
+        .place_folder(server.alex.id, "docs")
+        .await
+        .unwrap();
+    let page = html::page(
+        &[paragraph("Plan")],
+        &Default::default(),
+        None,
+        None,
+        &Default::default(),
+    );
+    let thread: accordion_docs::comments::Thread = serde_json::from_value(json!({
+        "id": "t1",
+        "start": "AQID",
+        "end": "BAUG",
+        "quote": "Plan",
+        "comments": [{ "id": "c1", "name": "Dana Elsewhere", "text": "From another server", "at": "2026-11-01T09:00:00Z" }],
+    }))
+    .unwrap();
+    let file = html::with_comments(page.as_bytes(), &[thread]).unwrap();
+    let item = server
+        .as_person(&server.alex)
+        .create_file(top, "From elsewhere.html", file.as_slice())
+        .await
+        .unwrap();
+    let (status, view) = server
+        .api(
+            &server.alex,
+            "GET",
+            &format!("/documents/{}/comments", item.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["threads"][0]["comments"][0]["name"], "Dana Elsewhere");
+    assert_eq!(view["threads"][0]["comments"][0]["mine"], false);
+    assert_eq!(view["threads"][0]["can_delete"], true);
+}
+
 #[tokio::test]
 async fn new_documents_go_only_in_the_persons_docs_place() {
     let server = start().await;
@@ -957,6 +1248,48 @@ mod live {
             )
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn comments_on_an_open_document_stay_in_its_file() {
+        let server = start().await;
+        let address = serve(&server).await;
+        let id = server.new_document(&server.alex).await;
+        let mut alex = Browser::open(address, &server.alex, &id).await;
+        // A comment right after typing, before the new document's first
+        // save, keeps the typing.
+        alex.add_paragraph("Typed").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let (status, view) = server
+            .api(
+                &server.alex,
+                "POST",
+                &format!("/documents/{id}/comments"),
+                Some(super::new_thread("Check this")),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{view}");
+        let file = server.file_text(&id).await;
+        assert_eq!(html::comments_in(file.as_bytes()).len(), 1);
+        assert_eq!(html::read(file.as_bytes()), alex.blocks());
+
+        // The document's own saves keep the comments, and nothing the
+        // editor had was lost to the comment's write.
+        alex.take_in().await;
+        alex.add_paragraph("More").await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let file = server.file_text(&id).await;
+        assert_eq!(html::comments_in(file.as_bytes()).len(), 1);
+        assert_eq!(
+            html::read(file.as_bytes()),
+            [
+                Block::Paragraph(Para::default(), Vec::new()),
+                paragraph("Typed"),
+                paragraph("More"),
+            ]
+        );
+        assert_eq!(alex.blocks(), html::read(file.as_bytes()));
     }
 
     #[tokio::test]

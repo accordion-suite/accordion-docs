@@ -18,7 +18,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,8 @@ use crate::model;
 use crate::model::{PageSetup, PageSize};
 use crate::picture::{self, Picture, Pictures};
 use crate::{DocsState, PLACE, docx, html, markdown, odt};
+
+mod comments;
 
 pub(crate) fn routes(state: DocsState) -> Router {
     Router::new()
@@ -43,6 +45,20 @@ pub(crate) fn routes(state: DocsState) -> Router {
             post(add_image).layer(DefaultBodyLimit::max(MAX_UPLOAD)),
         )
         .route("/documents/{id}/images/{hash}", get(image))
+        .route(
+            "/documents/{id}/comments",
+            get(comments::list).post(comments::start),
+        )
+        .route(
+            "/documents/{id}/comments/{thread}",
+            post(comments::reply)
+                .patch(comments::resolve)
+                .delete(comments::remove_thread),
+        )
+        .route(
+            "/documents/{id}/comments/{thread}/{comment}",
+            patch(comments::edit).delete(comments::remove),
+        )
         .route("/imports", post(import))
         .with_state(state)
 }
@@ -256,6 +272,7 @@ async fn create(
                 .map_err(|_| unreadable_draft())?;
             let format = DocFormat {
                 images: state.images.clone(),
+                comments: None,
             };
             // Writing reads the pictures it shows from the database.
             tokio::task::spawn_blocking(move || format.file_from_draft(&update, &setup))
@@ -302,6 +319,10 @@ struct CopyRequest {
     /// The copy's name, such as "Copy of Plans.html". It gets `.html` if it
     /// doesn't end with it, and a number if it's taken.
     name: String,
+    /// Whether the copy keeps the comments. Google Docs leaves them out
+    /// unless asked.
+    #[serde(default)]
+    comments: bool,
 }
 
 /// `POST /documents/{id}/copy`: a copy of a document with everyone's latest
@@ -329,7 +350,13 @@ async fn copy(
         _ => name,
     };
     // The copy has what's been typed up to now.
-    state.coediting.save_now(id).await;
+    let (_, contents) = current_contents(&state, id, item.clone()).await?;
+    // Left out, the comments go from the copy's file too.
+    let without_comments = if request.comments || html::comments_in(&contents).is_empty() {
+        None
+    } else {
+        html::with_comments(&contents, &[])
+    };
     let here = match item.parent {
         Some(parent) => state.storage.access(me.user.id, parent).await?,
         None => None,
@@ -345,7 +372,15 @@ async fn copy(
             1 => format!("{stem}.html"),
             n => format!("{stem} ({n}).html"),
         };
-        match storage.copy_file(id, folder, &name).await {
+        let made = match &without_comments {
+            Some(contents) => {
+                storage
+                    .create_file(folder, &name, contents.as_slice())
+                    .await
+            }
+            None => storage.copy_file(id, folder, &name).await,
+        };
+        match made {
             Err(Error::NameTaken { .. }) => continue,
             result => {
                 copied = Some(result?);
@@ -693,8 +728,12 @@ async fn live(
                 .map_err(pictures_problem)?;
         }
     }
+    // Saving writes the comments into the file, so a file's own are taken
+    // in before anyone can change it.
+    comments::threads_of(&state, &item).await?;
     let format = DocFormat {
         images: state.images.clone(),
+        comments: Some((state.comments.clone(), id)),
     };
     let connection = state
         .coediting

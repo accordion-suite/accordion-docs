@@ -17,30 +17,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use accordion_core::db::rusqlite::{self, OptionalExtension};
-use accordion_core::db::{self, Database, Migration};
+use accordion_core::db::{self, Database};
 
 use crate::html;
 use crate::picture::{self, Picture, Pictures};
-
-/// The owner of Docs' tables.
-const OWNER: &str = "docs";
-
-pub(crate) static MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "Keep pictures in documents",
-    sql: "
-CREATE TABLE docs_images (
-    hash TEXT PRIMARY KEY,
-    content_type TEXT NOT NULL,
-    contents BLOB NOT NULL,
-    width INTEGER NOT NULL,
-    height INTEGER NOT NULL,
-    -- When a document last used it, in seconds since 1970.
-    used_at INTEGER NOT NULL
-) STRICT;
-CREATE INDEX docs_images_used_at ON docs_images (used_at);
-",
-}];
+use crate::tables;
 
 /// Pictures no document has used for this long are left out. Opening a
 /// document that has one brings it back from the file.
@@ -115,7 +96,7 @@ fn picture_from_row(row: &rusqlite::Row) -> rusqlite::Result<Option<Picture>> {
 
 impl Images {
     pub async fn open(db: Database) -> Result<Self, db::Error> {
-        db.migrate(OWNER, MIGRATIONS).await?;
+        db.migrate(tables::OWNER, tables::MIGRATIONS).await?;
         Ok(Self::with(Some(db)))
     }
 

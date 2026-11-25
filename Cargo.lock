@@ -47,6 +47,7 @@ dependencies = [
  "ego-tree",
  "futures-util",
  "http-body-util",
+ "jiff",
  "pulldown-cmark",
  "quick-xml",
  "scraper",
@@ -58,6 +59,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tower",
  "tracing",
+ "uuid",
  "yrs",
  "zip",
 ]

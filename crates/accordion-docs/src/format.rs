@@ -10,6 +10,9 @@ use accordion_core::coedit::{Format, FormatError};
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, OffsetKind, Options, ReadTxn, StateVector, Transact, Update, XmlFragment};
 
+use accordion_types::ItemId;
+
+use crate::comments::Comments;
 use crate::html;
 use crate::images::Images;
 use crate::model::{self, Block, PageSetup};
@@ -20,6 +23,9 @@ pub(crate) struct DocFormat {
     /// Where the pictures are, since the editor's document has only their
     /// hashes.
     pub images: Images,
+    /// Where the document's comment threads are, and which document it is,
+    /// so the file carries them. `None` for a document without a file yet.
+    pub comments: Option<(Comments, ItemId)>,
 }
 
 impl Format for DocFormat {
@@ -77,7 +83,26 @@ impl Format for DocFormat {
             hashes.extend(model::image_hashes(part));
         }
         let pictures = self.images.for_saving(&hashes);
-        Ok(html::page(&blocks, &parts, setup.as_ref(), Some(&state), &pictures).into_bytes())
+        let threads = match &self.comments {
+            // A database that can't be read mustn't leave the comments out
+            // of the file, so the save waits until it can.
+            Some((comments, item)) => comments
+                .for_saving(*item)
+                .map_err(|err| {
+                    FormatError(format!("couldn't read the document's comments: {err}"))
+                })?
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        Ok(html::page_with_comments(
+            &blocks,
+            &parts,
+            setup.as_ref(),
+            Some(&state),
+            &pictures,
+            &threads,
+        )
+        .into_bytes())
     }
 }
 
@@ -153,6 +178,7 @@ mod tests {
     fn format() -> DocFormat {
         DocFormat {
             images: Images::in_memory(),
+            comments: None,
         }
     }
 
