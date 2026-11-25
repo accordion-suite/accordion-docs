@@ -1,5 +1,7 @@
-//! **Open with Docs** (decision 30): a new document from a Word file, a
-//! web page, Markdown, or plain text.
+//! **Open with Docs** (decision 30): a new document from a Word or
+//! OpenDocument file, a web page, Markdown, or plain text. Older Word files
+//! and Rich Text are first made Word files by LibreOffice, in the sandbox
+//! too, where it's installed.
 //!
 //! The file is untrusted, so it's read in the sandbox (decision 1), by the
 //! server's own program answering [`COMMAND`], as it answers core's
@@ -19,6 +21,8 @@ use crate::html;
 use crate::model::{self, Block, Inline, Marks, PageSetup, PageSize, Para, Parts};
 use crate::picture::Pictures;
 
+mod flat;
+mod odt;
 mod word;
 mod xml;
 
@@ -31,8 +35,12 @@ pub const MAX_FILE: u64 = 100 * 1024 * 1024;
 
 /// The formats Docs opens, by their file name extensions.
 pub const EXTENSIONS: &[&str] = &[
-    "docx", "docm", "dotx", "dotm", "html", "htm", "xhtml", "md", "markdown", "txt",
+    "docx", "docm", "dotx", "dotm", "odt", "ott", "html", "htm", "xhtml", "md", "markdown", "txt",
 ];
+
+/// The formats LibreOffice makes Word files of first: Word 97–2003 files
+/// and Rich Text, which Docs doesn't read itself.
+pub const THROUGH_LIBREOFFICE: &[&str] = &["doc", "rtf"];
 
 /// What didn't come across from a file, for the warning before it's
 /// converted.
@@ -151,6 +159,7 @@ pub fn convert(extension: &str, contents: &[u8]) -> Result<(Converted, Report), 
     let mut report = Report::default();
     let mut converted = match extension.to_ascii_lowercase().as_str() {
         "docx" | "docm" | "dotx" | "dotm" => word::read(contents, &mut report)?,
+        "odt" | "ott" => odt::read(contents, &mut report)?,
         "html" | "htm" | "xhtml" => {
             if pictures_from_elsewhere(contents) {
                 report.lost.insert(Lost::Pictures);

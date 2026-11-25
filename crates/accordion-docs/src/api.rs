@@ -11,7 +11,7 @@ use std::sync::Arc;
 use accordion_core::identity::SignedIn;
 use accordion_core::storage::ContentHash;
 use accordion_core::storage::{Access, Error, Item, ItemKind, Storage};
-use accordion_core::thumbnails::{PictureError, ThumbnailKind};
+use accordion_core::thumbnails::{ConvertError, PictureError, ThumbnailKind};
 use accordion_module::{ApiError, Authenticated, coedit};
 use accordion_types::{ItemId, UserId};
 use axum::body::Bytes;
@@ -400,8 +400,10 @@ struct ImportView {
     report: Report,
 }
 
-/// `POST /imports`: a new document from a Word file, a web page, Markdown,
-/// or plain text, as Google Docs' **Open with**. The file stays as it is;
+/// `POST /imports`: a new document from a Word or OpenDocument file, a web
+/// page, Markdown, or plain text, as Google Docs' **Open with**. Older Word
+/// files and Rich Text become Word files through LibreOffice first, where
+/// it's installed. The file stays as it is;
 /// the document goes beside it if the person can add to that folder, and
 /// to the top of their Docs place if not. The file is read in the sandbox
 /// (decision 1). When something wouldn't come across, such as text boxes,
@@ -434,10 +436,11 @@ async fn import(
         .rsplit_once('.')
         .map(|(_, extension)| extension.to_ascii_lowercase())
         .unwrap_or_default();
-    if !import::EXTENSIONS.contains(&extension.as_str()) {
+    let through_office = import::THROUGH_LIBREOFFICE.contains(&extension.as_str());
+    if !import::EXTENSIONS.contains(&extension.as_str()) && !through_office {
         return Err(ApiError::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Docs opens Word files, web pages, Markdown, and text files. Choose one of those.",
+            "Docs opens Word and OpenDocument files, Rich Text, web pages, Markdown, and text files. Choose one of those.",
         ));
     }
     if blob.size > import::MAX_FILE {
@@ -446,7 +449,24 @@ async fn import(
             "This file is too large for Docs to open. Docs opens files up to 100 MB.",
         ));
     }
-    let contents = read_contents(&state, blob.hash).await?;
+    let mut contents = read_contents(&state, blob.hash).await?;
+    let mut extension = extension;
+    if through_office {
+        contents = match state.thumbnails.office_to_word(&contents, &extension).await {
+            Ok(word) => word,
+            Err(ConvertError::NotInstalled) => {
+                return Err(ApiError::new(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "Docs needs LibreOffice on the server to open this kind of file, and it isn't installed. Ask your admin to install it, or save the file as a .docx file in Word and open that.",
+                ));
+            }
+            Err(ConvertError::Failed(why)) => {
+                tracing::warn!(%id, %why, "LibreOffice couldn't convert a file to open with Docs");
+                return Err(unreadable_file());
+            }
+        };
+        extension = "docx".to_owned();
+    }
     let output = state
         .thumbnails
         .run_command(&[import::COMMAND, &extension], &contents)

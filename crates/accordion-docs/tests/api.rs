@@ -8,6 +8,7 @@ use accordion_core::events::{Actor, Events, Via};
 use accordion_core::identity::{AuthMethod, Client, Identity, NewUser};
 use accordion_core::live::Live;
 use accordion_core::storage::{ShareLevel, Storage};
+use accordion_core::takeout::{self, Imports, Takeout};
 use accordion_core::texts::{self, Texts};
 use accordion_core::thumbnails::{Thumbnails, Tools};
 use accordion_core::transcripts::Transcripts;
@@ -73,6 +74,16 @@ async fn start() -> Server {
     )
     .await
     .unwrap();
+    let events = Events::open(db.clone()).await.unwrap();
+    // Docs imports nothing from Google Takeout.
+    let takeout = Imports::open(
+        db.clone(),
+        storage.clone(),
+        events.clone(),
+        Takeout::new(takeout::Tools::installed("/nonexistent"), dir.path()),
+    )
+    .await
+    .unwrap();
     let services = Services {
         db: db.clone(),
         coediting: CoEditing::open(db.clone(), storage.clone(), identity.clone(), QUICK)
@@ -80,7 +91,7 @@ async fn start() -> Server {
             .unwrap(),
         identity: identity.clone(),
         storage: storage.clone(),
-        events: Events::open(db.clone()).await.unwrap(),
+        events,
         thumbnails: thumbnails.clone(),
         texts,
         transcripts: Transcripts::canned(db.clone(), storage.clone(), dir.path(), |_| None)
@@ -88,6 +99,7 @@ async fn start() -> Server {
             .unwrap(),
         live: Live::new(db, &identity),
         link_origin: watch::channel(None).1,
+        takeout,
     };
     let (stop, stopping) = watch::channel(false);
     let started = Docs.start(services, Stopping::new(stopping)).await.unwrap();
@@ -1169,6 +1181,87 @@ async fn opens_word_files_and_pages_with_docs() {
             "/imports",
             Some(request(&broken.id, false)),
         )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{problem}");
+}
+
+#[tokio::test]
+async fn opens_opendocument_files_and_rich_text_with_docs() {
+    let server = start().await;
+    let my_drive = server.storage.top_folder(server.alex.id).await.unwrap();
+    let alex = server.as_person(&server.alex);
+    let request = |item: &ItemId| json!({ "item": item, "confirmed": false });
+
+    // An OpenDocument file, as Docs' own download writes one.
+    let blocks = vec![
+        Block::Heading(
+            1,
+            Para::default(),
+            vec![Inline::Text("Plan".into(), Marks::default())],
+        ),
+        paragraph("From LibreOffice"),
+    ];
+    let odt = accordion_docs::odt::write(
+        &blocks,
+        &Default::default(),
+        None,
+        "Plan",
+        &Default::default(),
+        &[],
+    );
+    let file = alex
+        .create_file(my_drive, "Plan.odt", odt.as_slice())
+        .await
+        .unwrap();
+    let (status, made) = server
+        .api(&server.alex, "POST", "/imports", Some(request(&file.id)))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{made}");
+    assert_eq!(made["document"]["name"], "Plan.html");
+    let read = html::read_document(
+        server
+            .file_text(made["document"]["id"].as_str().unwrap())
+            .await
+            .as_bytes(),
+    );
+    assert_eq!(read.blocks, blocks);
+
+    // Rich Text goes through LibreOffice in the sandbox, then Docs reads
+    // the Word file it makes.
+    let rtf = alex
+        .create_file(
+            my_drive,
+            "Letter.rtf",
+            b"{\\rtf1\\ansi{\\fonttbl{\\f0 Arial;}}\\f0\\fs22 Dear Sam, {\\b thanks}.\\par}"
+                .as_slice(),
+        )
+        .await
+        .unwrap();
+    let (status, made) = server
+        .api(&server.alex, "POST", "/imports", Some(request(&rtf.id)))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{made}");
+    assert_eq!(made["document"]["name"], "Letter.html");
+    let read = html::read_document(
+        server
+            .file_text(made["document"]["id"].as_str().unwrap())
+            .await
+            .as_bytes(),
+    );
+    let Block::Paragraph(_, inlines) = &read.blocks[0] else {
+        panic!("{:?}", read.blocks);
+    };
+    assert!(inlines.iter().any(
+        |inline| matches!(inline, Inline::Text(text, marks) if text == "thanks" && marks.bold)
+    ));
+
+    // A file named as an older Word file that isn't one isn't read as one.
+    let fake = alex
+        .create_file(my_drive, "Fake.doc", b"{\\rtf1 not Word}".as_slice())
+        .await
+        .unwrap();
+    let (status, problem) = server
+        .api(&server.alex, "POST", "/imports", Some(request(&fake.id)))
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{problem}");
 }
