@@ -75,7 +75,7 @@ struct DocumentView {
     /// The folder it's in.
     folder: Option<ItemId>,
     modified_at: String,
-    /// "owner", "editor", or "viewer".
+    /// "owner", "editor", "commenter", or "viewer".
     access: &'static str,
     /// Who owns it, for a document someone shared.
     owner: Option<String>,
@@ -125,6 +125,7 @@ fn access_name(access: Access) -> &'static str {
     match access {
         Access::Owner => "owner",
         Access::Editor => "editor",
+        Access::Commenter => "commenter",
         Access::Viewer => "viewer",
     }
 }
@@ -806,7 +807,7 @@ async fn add_image(
     body: Bytes,
 ) -> Result<(StatusCode, Json<AddedImage>), ApiError> {
     let (item, access) = reach(&state, &me, id).await?;
-    if access == Access::Viewer {
+    if access < Access::Editor {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "You can view this document but not change it. Ask its owner to make you an editor.",

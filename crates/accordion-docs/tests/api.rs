@@ -755,6 +755,103 @@ async fn comments_are_kept_with_the_document_and_in_its_file() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
+    // Commenters comment, reply, and resolve, but can't change the
+    // document or delete someone else's comment.
+    alex_storage
+        .share(
+            id.parse().unwrap(),
+            server.sam.id,
+            ShareLevel::Commenter,
+            server.alex.id,
+        )
+        .await
+        .unwrap();
+    let (status, opened) = server
+        .api(&server.sam, "GET", &format!("/documents/{id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(opened["access"], "commenter");
+    let (status, view) = server
+        .api(&server.sam, "POST", &comments, Some(new_thread("From Sam")))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    assert_eq!(view["can_comment"], true);
+    let sams = view["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["comments"][0]["text"] == "From Sam")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, view) = server
+        .api(
+            &server.sam,
+            "POST",
+            &format!("{comments}/{thread_id}"),
+            Some(json!({ "text": "Seen" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let alexs = view["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["id"] == thread_id.as_str())
+        .unwrap();
+    assert_eq!(alexs["can_delete"], false);
+    let (status, _) = server
+        .api(
+            &server.sam,
+            "DELETE",
+            &format!("{comments}/{thread_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, view) = server
+        .api(
+            &server.sam,
+            "PATCH",
+            &format!("{comments}/{sams}"),
+            Some(json!({ "resolved": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let (status, view) = server
+        .api(&server.sam, "DELETE", &format!("{comments}/{sams}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    // Take Sam's reply away again, so what follows starts as it did.
+    let reply = view["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["id"] == thread_id.as_str())
+        .unwrap()["comments"][1]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _) = server
+        .api(
+            &server.sam,
+            "DELETE",
+            &format!("{comments}/{thread_id}/{reply}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = server
+        .send(
+            &server.sam,
+            "POST",
+            &format!("/documents/{id}/images"),
+            b"not a picture".to_vec(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
     // Editors reply, and change only their own comments.
     alex_storage
         .share(
@@ -1332,27 +1429,25 @@ mod live {
     }
 
     #[tokio::test]
-    async fn viewers_watch_but_their_edits_dont_land() {
+    async fn viewers_and_commenters_watch_but_their_edits_dont_land() {
         let server = start().await;
         let address = serve(&server).await;
-        let id = server.new_document(&server.alex).await;
-        server
-            .as_person(&server.alex)
-            .share(
-                id.parse().unwrap(),
-                server.sam.id,
-                ShareLevel::Viewer,
-                server.alex.id,
-            )
-            .await
-            .unwrap();
-        let mut sam = Browser::open(address, &server.sam, &id).await;
-        sam.add_paragraph("Not allowed").await;
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert_eq!(
-            file_blocks(&server, &id).await,
-            [Block::Paragraph(Para::default(), Vec::new())]
-        );
+        for level in [ShareLevel::Viewer, ShareLevel::Commenter] {
+            let id = server.new_document(&server.alex).await;
+            server
+                .as_person(&server.alex)
+                .share(id.parse().unwrap(), server.sam.id, level, server.alex.id)
+                .await
+                .unwrap();
+            let mut sam = Browser::open(address, &server.sam, &id).await;
+            sam.add_paragraph("Not allowed").await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert_eq!(
+                file_blocks(&server, &id).await,
+                [Block::Paragraph(Para::default(), Vec::new())],
+                "{level:?}"
+            );
+        }
     }
 }
 

@@ -71,10 +71,11 @@ struct CommentView {
     edited: Option<String>,
 }
 
-/// Whether someone with `access` can comment. Editors and owners can; a
-/// Commenter level comes later (decision 30).
+/// Whether someone with `access` can comment: anyone but a viewer.
+/// Commenters can't change the text, but they start threads, reply,
+/// resolve, and change their own comments, as in Google Docs.
 fn can_comment(access: Access) -> bool {
-    access >= Access::Editor
+    access >= Access::Commenter
 }
 
 /// Whether `user`, with `access`, can delete `comment`: its author can, and
@@ -86,7 +87,7 @@ fn can_delete(comment: &Comment, user: UserId, access: Access) -> bool {
 fn cant_comment() -> ApiError {
     ApiError::new(
         StatusCode::FORBIDDEN,
-        "You can view this document but not comment on it. Ask its owner to make you an editor.",
+        "You can view this document but not comment on it. Ask its owner to let you comment.",
     )
 }
 
