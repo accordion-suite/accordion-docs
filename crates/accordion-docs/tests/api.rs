@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use accordion_core::coedit::{CoEditing, Timing};
 use accordion_core::db::Database;
-use accordion_core::events::{Actor, Events, Via};
+use accordion_core::events::{Action, Actor, Events, Via};
 use accordion_core::identity::{AuthMethod, Client, Identity, NewUser};
 use accordion_core::live::Live;
 use accordion_core::storage::{ShareLevel, Storage};
@@ -39,8 +39,10 @@ struct Server {
     router: Router,
     storage: Storage,
     thumbnails: Thumbnails,
+    events: Events,
     alex: Person,
     sam: Person,
+    dana: Person,
 }
 
 struct Person {
@@ -91,7 +93,7 @@ async fn start() -> Server {
             .unwrap(),
         identity: identity.clone(),
         storage: storage.clone(),
-        events,
+        events: events.clone(),
         thumbnails: thumbnails.clone(),
         texts,
         transcripts: Transcripts::canned(db.clone(), storage.clone(), dir.path(), |_| None)
@@ -107,6 +109,8 @@ async fn start() -> Server {
         router: Router::new().nest("/api/docs", started.routes.api.unwrap()),
         alex: person(&identity, "alex", "Alex Kim", Role::Owner).await,
         sam: person(&identity, "sam", "Sam Kim", Role::User).await,
+        dana: person(&identity, "dana", "Dana Lee", Role::User).await,
+        events,
         storage,
         thumbnails,
         _dir: dir,
@@ -696,6 +700,178 @@ async fn copies_a_document_beside_it_or_into_the_viewers_docs() {
 /// A new thread on `id` from `person`, with made-up positions.
 fn new_thread(text: &str) -> Value {
     json!({ "start": "AQID", "end": "BAUG", "quote": "  the\n plan ", "text": text })
+}
+
+impl Server {
+    /// What `person`'s bell holds, newest first: each notice's action and
+    /// the comment it's about.
+    async fn bell(&self, person: &Person) -> Vec<(Action, String)> {
+        self.events
+            .notifications(person.id, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|notice| matches!(notice.event.action, Action::Mentioned | Action::Replied))
+            .map(|notice| {
+                let text = notice.event.details["text"].as_str().unwrap_or_default();
+                (notice.event.action, text.to_owned())
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn mentions_ring_the_bells_of_people_who_can_open_the_document() {
+    let server = start().await;
+    let (alex, sam, dana) = (&server.alex, &server.sam, &server.dana);
+    let id = server.new_document(alex).await;
+    let item: ItemId = id.parse().unwrap();
+    let comments = format!("/documents/{id}/comments");
+    server
+        .as_person(alex)
+        .share(item, sam.id, ShareLevel::Commenter, alex.id)
+        .await
+        .unwrap();
+
+    // Only people who can open the document can be mentioned.
+    let people = format!("/documents/{id}/people");
+    let (status, list) = server.api(alex, "GET", &people, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(
+        list,
+        json!([{ "id": sam.id, "name": "Sam Kim", "username": "sam" }])
+    );
+    let (status, _) = server.api(dana, "GET", &people, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let mention = |text: &str, people: &[&Person]| {
+        let mut body = new_thread(text);
+        body["mentions"] = json!(people.iter().map(|person| person.id).collect::<Vec<_>>());
+        body
+    };
+    let (status, refused) = server
+        .api(
+            alex,
+            "POST",
+            &comments,
+            Some(mention("@Dana Lee look", &[dana])),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("Dana Lee can't open"),
+        "{refused}"
+    );
+
+    // A mention the text no longer names is left out.
+    let (status, view) = server
+        .api(alex, "POST", &comments, Some(mention("Never mind", &[sam])))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    assert_eq!(view["threads"][0]["comments"][0]["mentions"], json!([]));
+    assert!(server.bell(sam).await.is_empty());
+
+    let (status, view) = server
+        .api(
+            alex,
+            "POST",
+            &comments,
+            Some(mention("@Sam Kim can you check?", &[sam, sam])),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let thread = &view["threads"][1];
+    let thread_id = thread["id"].as_str().unwrap().to_owned();
+    let first = thread["comments"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        thread["comments"][0]["mentions"],
+        json!([{ "user": sam.id, "name": "Sam Kim" }])
+    );
+    assert_eq!(
+        server.bell(sam).await,
+        [(Action::Mentioned, "@Sam Kim can you check?".to_owned())]
+    );
+    let notice = &server.events.notifications(sam.id, 1).await.unwrap()[0].event;
+    assert_eq!(notice.details["thread"], json!(thread_id));
+    assert_eq!(notice.item, Some(item));
+
+    // The file keeps who was mentioned.
+    let kept = html::comments_in(server.file_text(&id).await.as_bytes());
+    assert_eq!(kept[1].comments[0].mentions[0].user, sam.id);
+
+    // A reply tells the others in the thread, and a mention wins over it.
+    let thread_path = format!("{comments}/{thread_id}");
+    let (status, _) = server
+        .api(sam, "POST", &thread_path, Some(json!({ "text": "Done" })))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        server.bell(alex).await,
+        [(Action::Replied, "Done".to_owned())]
+    );
+    // Writing the comments into the file isn't an edit of the document.
+    let alexs = server.events.notifications(alex.id, 100).await.unwrap();
+    assert!(
+        alexs
+            .iter()
+            .all(|notice| notice.event.action != Action::Edited)
+    );
+    let (status, _) = server
+        .api(
+            alex,
+            "POST",
+            &thread_path,
+            Some(json!({ "text": "@Sam Kim thanks", "mentions": [sam.id] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(server.bell(sam).await.len(), 2);
+    assert_eq!(server.bell(sam).await[0].0, Action::Mentioned);
+    assert_eq!(server.bell(alex).await.len(), 1);
+
+    // An edit tells only the people it newly mentions.
+    server
+        .as_person(alex)
+        .share(item, dana.id, ShareLevel::Viewer, alex.id)
+        .await
+        .unwrap();
+    let (status, view) = server
+        .api(
+            alex,
+            "PATCH",
+            &format!("{thread_path}/{first}"),
+            Some(json!({ "text": "@Sam Kim and @Dana Lee, can you check?", "mentions": [sam.id, dana.id] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(server.bell(sam).await.len(), 2);
+    assert_eq!(
+        server.bell(dana).await,
+        [(
+            Action::Mentioned,
+            "@Sam Kim and @Dana Lee, can you check?".to_owned()
+        )]
+    );
+
+    // Someone who can't open the document anymore hears nothing more,
+    // though they wrote in the thread.
+    server
+        .as_person(alex)
+        .unshare(item, sam.id, alex.id)
+        .await
+        .unwrap();
+    let (status, _) = server
+        .api(
+            alex,
+            "POST",
+            &thread_path,
+            Some(json!({ "text": "Still there?" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(server.bell(sam).await.is_empty());
 }
 
 #[tokio::test]

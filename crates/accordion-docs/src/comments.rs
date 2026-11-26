@@ -40,6 +40,8 @@ pub const MAX_TEXT: usize = 4000;
 pub const MAX_QUOTE: usize = 200;
 /// The longest position, in base64. Yjs's are a few dozen characters.
 pub const MAX_ANCHOR: usize = 512;
+/// The most people one comment mentions.
+pub const MAX_MENTIONS: usize = 50;
 /// The longest ID a file's thread or comment may have.
 const MAX_ID: usize = 64;
 /// The largest file whose comments are written into it, as core's
@@ -91,6 +93,18 @@ pub struct Comment {
     /// When it was last changed, if it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edited: Option<String>,
+    /// The people it mentions, each as `@` and their name in the text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<Mention>,
+}
+
+/// Someone a comment mentions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mention {
+    /// Their account, on the server the comment was written on.
+    pub user: UserId,
+    /// Their name as the comment writes it, after `@`.
+    pub name: String,
 }
 
 /// A new ID for a thread or a comment.
@@ -150,6 +164,10 @@ pub fn checked(threads: Vec<Thread>) -> Vec<Thread> {
         for comment in &mut thread.comments {
             comment.text = shortened(&comment.text, MAX_TEXT);
             comment.name = shortened(&comment.name, MAX_QUOTE);
+            comment.mentions.truncate(MAX_MENTIONS);
+            for mention in &mut comment.mentions {
+                mention.name = shortened(&mention.name, MAX_QUOTE);
+            }
         }
         if !thread.comments.is_empty() {
             kept.push(thread);
@@ -274,7 +292,8 @@ impl Comments {
     /// them. While the document is open, core's co-editing service sees the
     /// file change, and finds nothing in it to take in. If the file can't
     /// be written, the threads are still kept here, and the next save of
-    /// the document writes them.
+    /// the document writes them. The write records no edit, since the
+    /// document says the same: a comment rings the bells it should itself.
     pub async fn write_file(&self, storage: &Storage, actor: Actor, item: ItemId) {
         let lock = Arc::clone(
             self.writing
@@ -329,7 +348,7 @@ impl Comments {
             }
             match storage
                 .acting_as(actor)
-                .write_edit(item, blob.hash, *edit, &written[..])
+                .write_unrecorded_edit(item, blob.hash, *edit, &written[..])
                 .await
             {
                 Ok(_) => return,
@@ -391,6 +410,7 @@ mod tests {
             text: text.into(),
             at: "2026-11-25T10:00:00Z".into(),
             edited: None,
+            mentions: Vec::new(),
         }
     }
 

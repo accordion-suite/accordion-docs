@@ -4,8 +4,9 @@
 //! answers with every thread, sends a live hint to everyone who can open
 //! the document, and writes the threads into the file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use accordion_core::events::{Action, NewEvent};
 use accordion_core::identity::SignedIn;
 use accordion_core::live::Hint;
 use accordion_core::storage::{Access, Item};
@@ -19,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use super::{reach, read_contents};
 use crate::DocsState;
 use crate::comments::{
-    self, Comment, MAX_COMMENTS, MAX_QUOTE, MAX_TEXT, MAX_THREADS, Mark, Thread,
+    self, Comment, MAX_COMMENTS, MAX_MENTIONS, MAX_QUOTE, MAX_TEXT, MAX_THREADS, Mark, Mention,
+    Thread,
 };
 use crate::html;
 
@@ -67,6 +69,8 @@ struct CommentView {
     /// Whether the person can delete it.
     can_delete: bool,
     text: String,
+    /// The people it mentions, each as `@` and their name in the text.
+    mentions: Vec<Mention>,
     at: String,
     edited: Option<String>,
 }
@@ -207,6 +211,7 @@ async fn view(
                 mine: comment.author == Some(user),
                 can_delete: can_delete(comment, user, access),
                 text: comment.text.clone(),
+                mentions: comment.mentions.clone(),
                 at: comment.at.clone(),
                 edited: comment.edited.clone(),
             });
@@ -241,13 +246,161 @@ pub(super) async fn list(
 
 /// Checks the person can comment on the document, and has its threads
 /// taken in, so a change starts from them.
-async fn ready(state: &DocsState, me: &SignedIn, id: ItemId) -> Result<Access, ApiError> {
+async fn ready(state: &DocsState, me: &SignedIn, id: ItemId) -> Result<(Item, Access), ApiError> {
     let (item, access) = reach(state, me, id).await?;
     if !can_comment(access) {
         return Err(cant_comment());
     }
     threads_of(state, &item).await?;
-    Ok(access)
+    Ok((item, access))
+}
+
+/// Someone a comment can mention.
+#[derive(Serialize)]
+pub(super) struct PersonView {
+    id: UserId,
+    name: String,
+    username: String,
+}
+
+/// `GET /documents/{id}/people`: everyone else who can open the document,
+/// by name, for whoever can comment on it. Only they can be mentioned, as
+/// decision 30 says.
+pub(super) async fn people(
+    State(state): State<DocsState>,
+    Authenticated(me): Authenticated,
+    Path(id): Path<ItemId>,
+) -> Result<Json<Vec<PersonView>>, ApiError> {
+    let (_, access) = reach(&state, &me, id).await?;
+    if !can_comment(access) {
+        return Err(cant_comment());
+    }
+    let members = state.identity.members().await.map_err(|err| {
+        tracing::error!("couldn't list people to mention: {err}");
+        ApiError::server_problem()
+    })?;
+    let mut people = Vec::new();
+    for member in members {
+        if member.turned_off || member.user.id == me.user.id {
+            continue;
+        }
+        if state.storage.access(member.user.id, id).await?.is_some() {
+            people.push(PersonView {
+                id: member.user.id,
+                name: member.user.display_name,
+                username: member.user.username,
+            });
+        }
+    }
+    people.sort_by_cached_key(|person| person.name.to_lowercase());
+    Ok(Json(people))
+}
+
+/// The people a comment mentions, from those the person chose in the
+/// editor: one the text no longer names with `@` was taken out again, and
+/// everyone else must be able to open the document.
+async fn mentions_in(
+    state: &DocsState,
+    id: ItemId,
+    text: &str,
+    chosen: Vec<UserId>,
+) -> Result<Vec<Mention>, ApiError> {
+    let mut seen = HashSet::new();
+    let mut mentions = Vec::new();
+    for user in chosen {
+        if !seen.insert(user) {
+            continue;
+        }
+        let found = state.identity.user(user).await.map_err(|err| {
+            tracing::error!("couldn't look up someone mentioned: {err}");
+            ApiError::server_problem()
+        })?;
+        let Some(found) = found else {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Someone you mentioned no longer has an account here. Take out their name, then try again.",
+            ));
+        };
+        if !text.contains(&format!("@{}", found.display_name)) {
+            continue;
+        }
+        if state.storage.access(user, id).await?.is_none() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{} can't open this document, so they can't be mentioned. Share it with them first, then try again.",
+                    found.display_name
+                ),
+            ));
+        }
+        if mentions.len() == MAX_MENTIONS {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "A comment can mention at most 50 people. Take some out, then try again.",
+            ));
+        }
+        mentions.push(Mention {
+            user,
+            name: found.display_name,
+        });
+    }
+    Ok(mentions)
+}
+
+/// Rings the bells of the people a new or changed comment is for: those
+/// newly `mentioned`, and for a reply, everyone else who wrote in the
+/// thread. Only people who can still open the document hear about it, and
+/// never the person who wrote it.
+async fn tell(
+    state: &DocsState,
+    me: &SignedIn,
+    item: &Item,
+    thread: &Thread,
+    comment: &Comment,
+    mentioned: &[UserId],
+    reply: bool,
+) {
+    let mut told = HashSet::from([me.user.id]);
+    let mut people: Vec<(UserId, Action)> = Vec::new();
+    for &user in mentioned {
+        if told.insert(user) {
+            people.push((user, Action::Mentioned));
+        }
+    }
+    if reply {
+        for earlier in &thread.comments {
+            if let Some(author) = earlier.author
+                && told.insert(author)
+            {
+                people.push((author, Action::Replied));
+            }
+        }
+    }
+    let details = serde_json::json!({
+        "thread": thread.id,
+        "comment": comment.id,
+        "text": comments::shortened(&comment.text, MAX_QUOTE),
+    });
+    for (user, action) in people {
+        match state.storage.access(user, item.id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::warn!(%err, "couldn't check who can hear about a comment");
+                continue;
+            }
+        }
+        let event = NewEvent::about(action, item.id, item.owner)
+            .other(user)
+            .details(details.clone());
+        if let Err(err) = state
+            .events
+            .record(accordion_module::auth::actor(me), event)
+            .await
+        {
+            tracing::warn!(%err, "couldn't tell someone about a comment");
+        }
+    }
 }
 
 /// After a change: tells everyone who has the document open, writes the
@@ -280,7 +433,7 @@ fn mark(me: &SignedIn) -> Mark {
     }
 }
 
-fn new_comment(me: &SignedIn, text: String) -> Comment {
+fn new_comment(me: &SignedIn, text: String, mentions: Vec<Mention>) -> Comment {
     Comment {
         id: comments::new_id(),
         author: Some(me.user.id),
@@ -288,7 +441,13 @@ fn new_comment(me: &SignedIn, text: String) -> Comment {
         text,
         at: comments::now(),
         edited: None,
+        mentions,
     }
+}
+
+/// The accounts of the people `mentions` names.
+fn users(mentions: &[Mention]) -> Vec<UserId> {
+    mentions.iter().map(|mention| mention.user).collect()
 }
 
 #[derive(Deserialize)]
@@ -301,6 +460,9 @@ pub(super) struct NewThread {
     #[serde(default)]
     quote: String,
     text: String,
+    /// The people the person chose to mention.
+    #[serde(default)]
+    mentions: Vec<UserId>,
 }
 
 /// `POST /documents/{id}/comments`: a new thread on some text.
@@ -310,8 +472,9 @@ pub(super) async fn start(
     Path(id): Path<ItemId>,
     Json(request): Json<NewThread>,
 ) -> Result<(StatusCode, Json<CommentsView>), ApiError> {
-    let access = ready(&state, &me, id).await?;
+    let (item, access) = ready(&state, &me, id).await?;
     let text = comment_text(&request.text)?;
+    let mentions = mentions_in(&state, id, &text, request.mentions).await?;
     if !comments::is_anchor(&request.start) || !comments::is_anchor(&request.end) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -332,8 +495,9 @@ pub(super) async fn start(
         end: request.end,
         quote,
         resolved: None,
-        comments: vec![new_comment(&me, text)],
+        comments: vec![new_comment(&me, text, mentions)],
     };
+    let started = thread.clone();
     let threads = state
         .comments
         .change(id, move |threads| {
@@ -347,6 +511,17 @@ pub(super) async fn start(
             Ok(threads.clone())
         })
         .await?;
+    let first = &started.comments[0];
+    tell(
+        &state,
+        &me,
+        &item,
+        &started,
+        first,
+        &users(&first.mentions),
+        false,
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(changed(&state, &me, id, access, threads).await),
@@ -357,6 +532,9 @@ pub(super) async fn start(
 #[serde(deny_unknown_fields)]
 pub(super) struct Text {
     text: String,
+    /// The people the person chose to mention.
+    #[serde(default)]
+    mentions: Vec<UserId>,
 }
 
 /// `POST /documents/{id}/comments/{thread}`: a reply. Replying to a
@@ -367,9 +545,12 @@ pub(super) async fn reply(
     Path((id, thread)): Path<(ItemId, String)>,
     Json(request): Json<Text>,
 ) -> Result<(StatusCode, Json<CommentsView>), ApiError> {
-    let access = ready(&state, &me, id).await?;
-    let comment = new_comment(&me, comment_text(&request.text)?);
-    let threads = state
+    let (item, access) = ready(&state, &me, id).await?;
+    let text = comment_text(&request.text)?;
+    let mentions = mentions_in(&state, id, &text, request.mentions).await?;
+    let comment = new_comment(&me, text, mentions);
+    let added = comment.clone();
+    let (threads, before) = state
         .comments
         .change(id, move |threads| {
             let found = threads
@@ -382,11 +563,22 @@ pub(super) async fn reply(
                     "This comment has as many replies as it can hold. Start a new comment instead.",
                 ));
             }
+            let before = found.clone();
             found.comments.push(comment);
             found.resolved = None;
-            Ok(threads.clone())
+            Ok((threads.clone(), before))
         })
         .await?;
+    tell(
+        &state,
+        &me,
+        &item,
+        &before,
+        &added,
+        &users(&added.mentions),
+        true,
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(changed(&state, &me, id, access, threads).await),
@@ -407,7 +599,7 @@ pub(super) async fn resolve(
     Path((id, thread)): Path<(ItemId, String)>,
     Json(request): Json<Resolve>,
 ) -> Result<Json<CommentsView>, ApiError> {
-    let access = ready(&state, &me, id).await?;
+    let (_, access) = ready(&state, &me, id).await?;
     let resolved = request.resolved.then(|| mark(&me));
     let threads = state
         .comments
@@ -432,7 +624,7 @@ pub(super) async fn remove_thread(
     Authenticated(me): Authenticated,
     Path((id, thread)): Path<(ItemId, String)>,
 ) -> Result<Json<CommentsView>, ApiError> {
-    let access = ready(&state, &me, id).await?;
+    let (_, access) = ready(&state, &me, id).await?;
     let user = me.user.id;
     let threads = state
         .comments
@@ -470,27 +662,48 @@ pub(super) async fn edit(
     Path((id, thread, comment)): Path<(ItemId, String, String)>,
     Json(request): Json<Text>,
 ) -> Result<Json<CommentsView>, ApiError> {
-    let access = ready(&state, &me, id).await?;
+    let (item, access) = ready(&state, &me, id).await?;
     let text = comment_text(&request.text)?;
+    let mentions = mentions_in(&state, id, &text, request.mentions).await?;
     let user = me.user.id;
-    let threads = state
+    let comment_id = comment.clone();
+    let (threads, changed_thread, before) = state
         .comments
         .change(id, move |threads| {
-            let found = threads
+            let found_thread = threads
                 .iter_mut()
                 .find(|each| each.id == thread)
-                .and_then(|thread| thread.comments.iter_mut().find(|each| each.id == comment))
+                .ok_or_else(thread_gone)?;
+            let found = found_thread
+                .comments
+                .iter_mut()
+                .find(|each| each.id == comment)
                 .ok_or_else(thread_gone)?;
             if found.author != Some(user) {
                 return Err(not_yours());
             }
+            let before = users(&found.mentions);
             if found.text != text {
                 found.text = text;
                 found.edited = Some(comments::now());
             }
-            Ok(threads.clone())
+            found.mentions = mentions;
+            let changed_thread = found_thread.clone();
+            Ok((threads.clone(), changed_thread, before))
         })
         .await?;
+    // Only people the change newly mentions hear about it.
+    if let Some(found) = changed_thread
+        .comments
+        .iter()
+        .find(|each| each.id == comment_id)
+    {
+        let new: Vec<UserId> = users(&found.mentions)
+            .into_iter()
+            .filter(|user| !before.contains(user))
+            .collect();
+        tell(&state, &me, &item, &changed_thread, found, &new, false).await;
+    }
     Ok(Json(changed(&state, &me, id, access, threads).await))
 }
 
@@ -501,7 +714,7 @@ pub(super) async fn remove(
     Authenticated(me): Authenticated,
     Path((id, thread, comment)): Path<(ItemId, String, String)>,
 ) -> Result<Json<CommentsView>, ApiError> {
-    let access = ready(&state, &me, id).await?;
+    let (_, access) = ready(&state, &me, id).await?;
     let user = me.user.id;
     let threads = state
         .comments

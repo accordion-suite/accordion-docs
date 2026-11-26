@@ -2874,6 +2874,7 @@ pub(crate) mod tests {
                 text: text.into(),
                 at: "2026-11-25T10:00:00.000Z".into(),
                 edited: None,
+                mentions: Vec::new(),
             }],
         }
     }

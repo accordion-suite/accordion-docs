@@ -49,6 +49,7 @@ pub(crate) fn routes(state: DocsState) -> Router {
             "/documents/{id}/comments",
             get(comments::list).post(comments::start),
         )
+        .route("/documents/{id}/people", get(comments::people))
         .route(
             "/documents/{id}/comments/{thread}",
             post(comments::reply)

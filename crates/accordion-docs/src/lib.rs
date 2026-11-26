@@ -26,6 +26,7 @@ mod tables;
 pub mod yjs;
 
 use accordion_core::coedit::CoEditing;
+use accordion_core::events::Events;
 use accordion_core::identity::Identity;
 use accordion_core::live::Live;
 use accordion_core::storage::{AppPlace, Storage};
@@ -76,6 +77,7 @@ impl Module for Docs {
                 live: services.live,
                 images: images.clone(),
                 comments: comments.clone(),
+                events: services.events,
             };
             Ok(Started {
                 routes: Routes {
@@ -127,6 +129,8 @@ struct DocsState {
     images: Images,
     /// Comments on documents.
     comments: Comments,
+    /// The event log, which rings people's bells about comments.
+    events: Events,
 }
 
 impl FromRef<DocsState> for Identity {
