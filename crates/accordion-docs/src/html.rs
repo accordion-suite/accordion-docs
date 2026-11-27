@@ -258,18 +258,27 @@ fn find_data(text: &str) -> Option<(std::ops::Range<usize>, serde_json::Value)> 
 /// The comment threads in a document's data block, as far as they're
 /// threads Docs keeps.
 pub fn comments_in(contents: &[u8]) -> Vec<Thread> {
+    comments::checked(threads_in(contents))
+}
+
+/// The comment threads in the page made from a Word or OpenDocument file
+/// being opened with Docs, which have no positions yet: the page's text
+/// marks where each starts and ends.
+pub fn file_comments_in(contents: &[u8]) -> Vec<Thread> {
+    comments::checked_without_positions(threads_in(contents))
+}
+
+fn threads_in(contents: &[u8]) -> Vec<Thread> {
     let Some((_, data)) = std::str::from_utf8(contents).ok().and_then(find_data) else {
         return Vec::new();
     };
     let Some(serde_json::Value::Array(found)) = data.get("comments") else {
         return Vec::new();
     };
-    comments::checked(
-        found
-            .iter()
-            .filter_map(|thread| serde_json::from_value(thread.clone()).ok())
-            .collect(),
-    )
+    found
+        .iter()
+        .filter_map(|thread| serde_json::from_value(thread.clone()).ok())
+        .collect()
 }
 
 /// A document's file with `comments` as its threads, and the rest as it
@@ -809,6 +818,20 @@ fn write_inlines(out: &mut String, inlines: &[Inline], notes: &mut Notes) {
                 out.push_str(&escape_text(text));
             }
             Inline::Break => out.push_str("<br>"),
+            Inline::CommentStart(thread) => {
+                let _ = write!(
+                    out,
+                    "<span data-comment-start=\"{}\"></span>",
+                    escape_attribute(thread)
+                );
+            }
+            Inline::CommentEnd(thread) => {
+                let _ = write!(
+                    out,
+                    "<span data-comment-end=\"{}\"></span>",
+                    escape_attribute(thread)
+                );
+            }
             Inline::Footnote(text) => {
                 // A link can't hold the footnote's own link, so marks close
                 // around it.
@@ -975,13 +998,15 @@ enum Run {
     },
     Break,
     Note(Vec<Inline>),
+    /// Where a comment's text starts or ends.
+    Comment(Inline),
 }
 
 impl Runs {
     fn is_blank(&self) -> bool {
         self.runs.iter().all(|run| match run {
             Run::Text { text, folded, .. } => *folded && text.trim().is_empty(),
-            Run::Break | Run::Note(_) => false,
+            Run::Break | Run::Note(_) | Run::Comment(_) => false,
         })
     }
 
@@ -1023,6 +1048,7 @@ impl Runs {
                     Run::Text { text, marks, .. } => Inline::Text(text, marks),
                     Run::Break => Inline::Break,
                     Run::Note(text) => Inline::Footnote(text),
+                    Run::Comment(marker) => marker,
                 })
                 .collect(),
         )
@@ -1748,6 +1774,16 @@ fn read_inline(node: NodeRef, marks: &Marks, runs: &mut Runs, notes: &NoteTexts)
         if let Some(text) = note_of(node, notes) {
             runs.runs.push(Run::Note(text.clone()));
         }
+        return;
+    }
+    if let Some(thread) = attribute(&node, "data-comment-start") {
+        runs.runs
+            .push(Run::Comment(Inline::CommentStart(thread.to_owned())));
+        return;
+    }
+    if let Some(thread) = attribute(&node, "data-comment-end") {
+        runs.runs
+            .push(Run::Comment(Inline::CommentEnd(thread.to_owned())));
         return;
     }
     let mut marks = marks.clone();

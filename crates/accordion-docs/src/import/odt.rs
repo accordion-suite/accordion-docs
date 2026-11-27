@@ -8,20 +8,26 @@
 //! written as ☐ and ☑, quotes, code, lines, tables with merged cells,
 //! borders, colors, and column widths, links, pictures, footnotes, headers
 //! and footers with page numbers and counts, a table of contents, page
-//! breaks, and the paper and margins. Anything else is left out or made
-//! plainer, and the [`Report`] says what.
+//! breaks, and the paper and margins. Comments come too, with their
+//! replies and whether they're resolved, as LibreOffice writes them, each
+//! about the text it was about. Anything else is left out or made plainer,
+//! and the [`Report`] says what.
 //!
 //! An OpenDocument file Docs wrote comes back as it was: Docs' own styles
 //! read as Docs' defaults.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufReader, Cursor, Read};
 
 use zip::ZipArchive;
 
-use super::flat::{self, Flat, ListKind, ListRef, Role, bullet_kind, format_number, group, unbold};
+use super::flat::{
+    self, Flat, ListKind, ListRef, Piece, Role, bullet_kind, format_number, group,
+    move_comment_marks, unbold,
+};
 use super::xml::{self, Element, Node, Ns};
-use super::{Converted, Lost, Report};
+use super::{Converted, FileComment, Lost, Report, file_thread};
+use crate::comments::Thread;
 use crate::model::{
     self, Align, Block, Cell, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks,
     PageSetup, Para, Parts, Row, Rule, Script, Twips,
@@ -124,7 +130,12 @@ pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Converted, Strin
         blocks_read: 0,
         fonts: BTreeSet::new(),
         lost: BTreeSet::new(),
+        annotations: HashMap::new(),
+        ending: HashMap::new(),
+        placed: HashSet::new(),
+        between: Vec::new(),
     };
+    let threads = reader.read_annotations(text);
     if text
         .child(Ns::Text, "tracked-changes")
         .is_some_and(|changes| changes.elements().next().is_some())
@@ -233,7 +244,43 @@ pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Converted, Strin
         parts,
         setup,
         pictures: reader.pictures,
+        comments: threads,
     })
+}
+
+/// An annotation's text, a line for each paragraph.
+fn annotation_text(annotation: &Element) -> String {
+    fn walk(element: &Element, out: &mut String) {
+        for node in &element.children {
+            match node {
+                Node::Text(words) => out.push_str(words),
+                Node::Element(child) => match (child.ns, child.name.as_str()) {
+                    (Some(Ns::Text), "s") => {
+                        let count = child
+                            .attr(Ns::Text, "c")
+                            .and_then(|count| count.trim().parse::<usize>().ok())
+                            .unwrap_or(1)
+                            .clamp(1, 1000);
+                        out.push_str(&" ".repeat(count));
+                    }
+                    (Some(Ns::Text), "tab") => out.push(' '),
+                    (Some(Ns::Text), "line-break") => out.push('\n'),
+                    (Some(Ns::Text), "note") => {}
+                    _ => walk(child, out),
+                },
+            }
+        }
+    }
+    let lines: Vec<String> = annotation
+        .descendants(Ns::Text, "p")
+        .into_iter()
+        .map(|paragraph| {
+            let mut line = String::new();
+            walk(paragraph, &mut line);
+            line
+        })
+        .collect();
+    lines.join("\n")
 }
 
 /// The part at `path` as XML, or `None` if the file hasn't one.
@@ -962,11 +1009,6 @@ struct Pieces {
     at_space: bool,
 }
 
-enum Piece {
-    Text(Vec<Inline>),
-    Block(Block),
-}
-
 impl Pieces {
     fn new() -> Self {
         Self {
@@ -1033,9 +1075,126 @@ struct Reader<'a> {
     /// Each font the text names, as named.
     fonts: BTreeSet<String>,
     lost: BTreeSet<Lost>,
+    /// The thread each annotation starts, by where the element is, or
+    /// `None` for a reply, and by the name its end gives.
+    annotations: HashMap<usize, Option<String>>,
+    ending: HashMap<String, String>,
+    /// The threads whose start has been read.
+    placed: HashSet<String>,
+    /// Comment marks between paragraphs, for the next one.
+    between: Vec<Inline>,
+}
+
+/// Where an element is, to know it again when it's read.
+fn identity(element: &Element) -> usize {
+    std::ptr::from_ref(element) as usize
 }
 
 impl Reader<'_> {
+    /// The document's annotations as threads: replies, named by
+    /// `loext:parent-name` as LibreOffice writes them, join their first
+    /// comment's thread.
+    fn read_annotations(&mut self, text: &Element) -> Vec<Thread> {
+        let found = text.descendants(Ns::Office, "annotation");
+        let ends: HashSet<&str> = text
+            .descendants(Ns::Office, "annotation-end")
+            .into_iter()
+            .filter_map(|end| end.attr(Ns::Office, "name"))
+            .collect();
+        let by_name: HashMap<&str, usize> = found
+            .iter()
+            .enumerate()
+            .filter_map(|(index, annotation)| Some((annotation.attr(Ns::Office, "name")?, index)))
+            .collect();
+        let first_of = |index: usize| {
+            let mut at = index;
+            for _ in 0..found.len() {
+                match found[at]
+                    .attr(Ns::Loext, "parent-name")
+                    .and_then(|parent| by_name.get(parent))
+                {
+                    Some(parent) if *parent != at => at = *parent,
+                    _ => break,
+                }
+            }
+            at
+        };
+        let mut grouped: Vec<(usize, Vec<usize>)> = Vec::new();
+        for index in 0..found.len() {
+            let first = first_of(index);
+            match grouped.iter_mut().find(|(top, _)| *top == first) {
+                Some((_, members)) => members.push(index),
+                None => grouped.push((first, vec![index])),
+            }
+        }
+        let mut threads = Vec::new();
+        for (first, mut members) in grouped {
+            members.sort_by_key(|member| (*member != first, *member));
+            let resolved = members
+                .iter()
+                .any(|member| found[*member].attr(Ns::Loext, "resolved") == Some("true"));
+            let comments = members
+                .iter()
+                .map(|member| {
+                    let annotation = found[*member];
+                    let child_text = |ns, name| annotation.child(ns, name).map(Element::text);
+                    FileComment {
+                        name: child_text(Ns::Dc, "creator").unwrap_or_default(),
+                        text: annotation_text(annotation),
+                        at: child_text(Ns::Dc, "date"),
+                    }
+                })
+                .collect();
+            let thread = file_thread(comments, resolved);
+            for member in &members {
+                let annotation = found[*member];
+                let starts = (*member == first).then(|| thread.id.clone());
+                if let (Some(thread), Some(name)) = (&starts, annotation.attr(Ns::Office, "name"))
+                    && ends.contains(name)
+                {
+                    self.ending.insert(name.to_owned(), thread.clone());
+                }
+                self.annotations.insert(identity(annotation), starts);
+            }
+            threads.push(thread);
+        }
+        threads
+    }
+
+    /// Where an annotation's thread starts, and, for an annotation without
+    /// an end, ends too. Replies' are their thread's.
+    fn annotation_mark(&mut self, annotation: &Element, inlines: &mut Vec<Inline>) {
+        if self.in_note || self.in_styles_part {
+            return;
+        }
+        let Some(Some(thread)) = self.annotations.get(&identity(annotation)).cloned() else {
+            return;
+        };
+        if !self.placed.insert(thread.clone()) {
+            return;
+        }
+        inlines.push(Inline::CommentStart(thread.clone()));
+        let ends_later = annotation
+            .attr(Ns::Office, "name")
+            .is_some_and(|name| self.ending.contains_key(name));
+        if !ends_later {
+            inlines.push(Inline::CommentEnd(thread));
+        }
+    }
+
+    /// Where a named annotation's text ends.
+    fn annotation_end(&mut self, end: &Element, inlines: &mut Vec<Inline>) {
+        if self.in_note || self.in_styles_part {
+            return;
+        }
+        if let Some(thread) = end
+            .attr(Ns::Office, "name")
+            .and_then(|name| self.ending.get(name))
+        {
+            inlines.push(Inline::CommentEnd(thread.clone()));
+        }
+    }
+
     /// The blocks among `nodes`: a body, a cell, a header, or a text box.
     fn container(&mut self, nodes: &[Node], context: &Context) -> Vec<Flat> {
         let mut out = Vec::new();
@@ -1139,7 +1298,14 @@ impl Reader<'_> {
                 out.extend(pieces.after);
             }
             (Some(Ns::Office), "annotation") => {
-                self.lost.insert(Lost::Comments);
+                let mut marks = Vec::new();
+                self.annotation_mark(element, &mut marks);
+                self.between.extend(marks);
+            }
+            (Some(Ns::Office), "annotation-end") => {
+                let mut marks = Vec::new();
+                self.annotation_end(element, &mut marks);
+                self.between.extend(marks);
             }
             _ => {}
         }
@@ -1479,6 +1645,7 @@ impl Reader<'_> {
             link: None,
         };
         let mut pieces = Pieces::new();
+        pieces.inlines = std::mem::take(&mut self.between);
         if let Some(label) = label.filter(|label| !label.is_empty()) {
             pieces
                 .inlines
@@ -1525,6 +1692,8 @@ impl Reader<'_> {
         let in_list = list_ref.is_some();
         let quote = role == Role::Quote && !in_list;
         let code = role == Role::Code && !in_list;
+        // Comment marks alone go with the text beside them.
+        move_comment_marks(&mut pieces_out);
         let has_blocks = pieces_out
             .iter()
             .any(|piece| matches!(piece, Piece::Block(_)));
@@ -1689,8 +1858,9 @@ impl Reader<'_> {
                     pieces.inlines.push(Inline::Footnote(text));
                 }
             }
-            (Some(Ns::Office), "annotation") => {
-                self.lost.insert(Lost::Comments);
+            (Some(Ns::Office), "annotation") => self.annotation_mark(element, &mut pieces.inlines),
+            (Some(Ns::Office), "annotation-end") => {
+                self.annotation_end(element, &mut pieces.inlines)
             }
             (Some(Ns::Text), "change" | "change-start") => {
                 self.lost.insert(Lost::TrackedChanges);
@@ -2328,12 +2498,30 @@ mod tests {
         setup: &PageSetup,
         pictures: &Pictures,
     ) -> (Converted, Report) {
-        let file = odt::write(blocks, parts, Some(setup), "Test", pictures, &[]);
+        let file = odt::write(blocks, parts, Some(setup), "Test", pictures, &[], &[]);
         let mut report = Report::default();
         let mut read = read(&file, &mut report).expect("Docs reads its own OpenDocument files");
         read.blocks = model::normalize(read.blocks);
         read.parts = read.parts.normalized();
         (read, report)
+    }
+
+    #[test]
+    fn comments_come_back_from_docs_opendocument_files() {
+        let (blocks, threads) = super::super::comment_fixture::document();
+        let file = odt::write(
+            &blocks,
+            &Parts::default(),
+            None,
+            "Test",
+            &Pictures::new(),
+            &[],
+            &threads,
+        );
+        let mut report = Report::default();
+        let mut read = read(&file, &mut report).unwrap();
+        read.blocks = model::normalize(read.blocks);
+        super::super::comment_fixture::check(&read);
     }
 
     #[test]
@@ -2721,11 +2909,14 @@ mod tests {
         assert_eq!(rows[2].cells.len(), 1);
         assert_eq!(plain(&blocks[13]), "Date: May 1");
 
+        // A comment marked only where it is comes across, about no text.
+        assert_eq!(converted.comments.len(), 1);
+        assert_eq!(converted.comments[0].comments[0].name, "A");
+        assert_eq!(converted.comments[0].comments[0].text, "A comment");
         assert_eq!(
             report.lost,
             [
                 Lost::TrackedChanges,
-                Lost::Comments,
                 Lost::Equations,
                 Lost::PicturesMoved,
                 Lost::Fields,

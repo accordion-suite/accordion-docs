@@ -12,7 +12,7 @@ use yrs::{Doc, OffsetKind, Options, ReadTxn, StateVector, Transact, Update, XmlF
 
 use accordion_types::ItemId;
 
-use crate::comments::Comments;
+use crate::comments::{self, Comments, Thread};
 use crate::html;
 use crate::images::Images;
 use crate::model::{self, Block, PageSetup};
@@ -152,6 +152,78 @@ impl DocFormat {
     }
 }
 
+/// The blocks of a document's file with where each of `threads` starts and
+/// ends, for Word and OpenDocument files. They're read from its co-editing
+/// state, where the editor placed them. `None` if the file has no state, or
+/// if the state no longer matches the file's text, such as after a change
+/// made outside Docs that nobody has opened since.
+pub(crate) fn blocks_with_comments(
+    contents: &[u8],
+    blocks: &[Block],
+    threads: &[Thread],
+) -> Option<Vec<Block>> {
+    let update = Update::decode_v1(&html::state_in(contents)?).ok()?;
+    // The editor's positions count UTF-16 code units.
+    let doc = Doc::with_options(Options {
+        offset_kind: OffsetKind::Utf16,
+        ..Options::default()
+    });
+    let fragment = doc.get_or_insert_xml_fragment(yjs::FRAGMENT);
+    let mut txn = doc.transact_mut();
+    txn.apply_update(update).ok()?;
+    if yjs::read(&txn, &fragment) != blocks {
+        return None;
+    }
+    Some(yjs::read_with_comments(&txn, &fragment, threads))
+}
+
+/// The file for a document opened with Docs from a file with comments,
+/// with its co-editing state made now, so the threads' positions are in
+/// it. `blocks` mark where each thread starts and ends; a thread they
+/// don't mark is about the document's start, as one whose text is gone.
+pub(crate) fn file_with_comments(
+    blocks: &[Block],
+    parts: &model::Parts,
+    setup: Option<&PageSetup>,
+    pictures: &Pictures,
+    mut threads: Vec<Thread>,
+) -> Vec<u8> {
+    let quotes = model::comment_quotes(blocks);
+    let doc = Doc::with_options(Options {
+        offset_kind: OffsetKind::Bytes,
+        ..Options::default()
+    });
+    yjs::write_parts(&doc, parts);
+    let fragment = doc.get_or_insert_xml_fragment(yjs::FRAGMENT);
+    let page = doc.get_or_insert_map(yjs::PAGE);
+    let mut txn = doc.transact_mut();
+    yjs::write_page(&mut txn, &page, setup);
+    let ends = yjs::insert_with_comments(&mut txn, &fragment, blocks);
+    let start = yjs::document_start(&txn, &fragment).unwrap_or_default();
+    for thread in &mut threads {
+        (thread.start, thread.end) = ends
+            .get(&thread.id)
+            .cloned()
+            .unwrap_or_else(|| (start.clone(), start.clone()));
+        if let Some(quote) = quotes.get(&thread.id) {
+            thread.quote = comments::shortened(quote, comments::MAX_QUOTE);
+        }
+    }
+    let body = yjs::read(&txn, &fragment);
+    let parts = yjs::read_parts(&txn, &page);
+    let setup = yjs::read_page(&txn, &page);
+    let state = txn.encode_state_as_update_v1(&StateVector::default());
+    html::page_with_comments(
+        &body,
+        &parts,
+        setup.as_ref(),
+        Some(&state),
+        pictures,
+        &comments::checked(threads),
+    )
+    .into_bytes()
+}
+
 /// The file for a new, empty document on `setup`'s page. It has no state
 /// yet: the first person to open it makes one from the body.
 pub(crate) fn new_document(setup: &PageSetup) -> Vec<u8> {
@@ -204,6 +276,105 @@ mod tests {
     fn blocks(doc: &Doc) -> Vec<Block> {
         let fragment: XmlFragmentRef = doc.get_or_insert_xml_fragment(yjs::FRAGMENT);
         yjs::read(&doc.transact(), &fragment)
+    }
+
+    fn thread(id: &str) -> Thread {
+        Thread {
+            id: id.into(),
+            start: String::new(),
+            end: String::new(),
+            quote: String::new(),
+            resolved: None,
+            comments: vec![crate::comments::Comment {
+                id: format!("{id}1"),
+                author: None,
+                name: "Dana Lee".into(),
+                text: "Look at this".into(),
+                at: "2026-11-26T10:00:00Z".into(),
+                edited: None,
+                mentions: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn comments_from_a_file_stay_on_their_text() {
+        let text = |words: &str| Inline::Text(words.into(), Marks::default());
+        let bold = Marks {
+            bold: true,
+            ..Marks::default()
+        };
+        // Accents and emoji take more bytes than UTF-16 code units, and
+        // the server's state counts bytes while the editor counts units.
+        let blocks = vec![
+            Block::Paragraph(
+                Para::default(),
+                vec![
+                    text("Café 🎉 "),
+                    Inline::CommentStart("a".into()),
+                    Inline::Text("plan".into(), bold),
+                    text(" now"),
+                    Inline::CommentEnd("a".into()),
+                ],
+            ),
+            Block::Bullets(
+                None,
+                vec![
+                    vec![Block::Paragraph(
+                        Para::default(),
+                        vec![Inline::CommentStart("b".into()), text("one")],
+                    )],
+                    vec![Block::Paragraph(
+                        Para::default(),
+                        vec![text("two"), Inline::CommentEnd("b".into())],
+                    )],
+                ],
+            ),
+        ];
+        let file = file_with_comments(
+            &blocks,
+            &model::Parts::default(),
+            None,
+            &Pictures::new(),
+            vec![thread("a"), thread("b"), thread("gone")],
+        );
+        let threads = html::comments_in(&file);
+        assert_eq!(threads.len(), 3);
+        let quote = |id: &str| {
+            threads
+                .iter()
+                .find(|thread| thread.id == id)
+                .map(|thread| thread.quote.clone())
+        };
+        assert_eq!(quote("a").as_deref(), Some("plan now"));
+        assert_eq!(quote("b").as_deref(), Some("one\ntwo"));
+        assert_eq!(quote("gone").as_deref(), Some(""));
+
+        // The file's text has no marks; its state has the positions.
+        let read = html::read_document(&file).blocks;
+        let mut plain = blocks.clone();
+        model::without_comment_marks(&mut plain);
+        assert_eq!(read, model::normalize(plain));
+        let marked = blocks_with_comments(&file, &read, &threads).unwrap();
+        let ranged = model::ranged_comments(&marked);
+        assert_eq!(ranged.len(), 2);
+        assert!(ranged.contains("a") && ranged.contains("b"));
+        // The thread without text is at the start, not around anything.
+        let Block::Paragraph(_, first) = &marked[0] else {
+            panic!("{marked:?}");
+        };
+        assert_eq!(first[0], Inline::CommentEnd("gone".into()));
+        assert_eq!(first[1], Inline::CommentStart("gone".into()));
+        let mut without_gone = marked.clone();
+        if let Block::Paragraph(_, inlines) = &mut without_gone[0] {
+            inlines.drain(..2);
+        }
+        assert_eq!(without_gone, model::normalize(blocks));
+
+        // A file whose text changed outside Docs since keeps no positions.
+        let mut changed = read.clone();
+        changed.push(paragraph("Added elsewhere"));
+        assert!(blocks_with_comments(&file, &changed, &threads).is_none());
     }
 
     #[test]

@@ -13,9 +13,13 @@
 //! counts as Word's fields. Footnotes are Word's, numbered by Word. A table
 //! of contents is Word's TOC field, with its entries and page numbers
 //! already in it, so it shows as it does in Docs and Word can update it.
+//! Comment threads are Word's comments, each reply a comment answering
+//! the first, and resolved threads are marked done, as Word marks them.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
+use crate::comments::Thread;
 use crate::fonts;
 use crate::model::{
     self, Align, Block, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks, PageSetup,
@@ -27,6 +31,9 @@ use crate::picture::{Picture, Pictures};
 /// `blocks` on `setup`'s page as a Word file, with `pictures` in it and
 /// `title` in its properties. `pages` is the page each entry of a table of
 /// contents is on, as the editor lays the pages out, or empty if unknown.
+/// `threads` are the document's comments: those whose text `blocks` mark
+/// with [`Inline::CommentStart`] and [`Inline::CommentEnd`] are about that
+/// text, and the rest, whose text is gone, are at the document's start.
 pub fn write(
     blocks: &[Block],
     parts: &Parts,
@@ -34,6 +41,7 @@ pub fn write(
     title: &str,
     pictures: &Pictures,
     pages: &[u32],
+    threads: &[Thread],
 ) -> Vec<u8> {
     let page = office::page_of(setup);
     let mut writer = Writer {
@@ -49,7 +57,21 @@ pub fn write(
         headings: 0,
         contents: Vec::new(),
         pages: Vec::new(),
+        threads: HashMap::new(),
+        ranged: model::ranged_comments(blocks),
+        unplaced: Vec::new(),
     };
+    // Each comment's Word ID is its place among all the threads' comments.
+    let mut first = 0;
+    for thread in threads {
+        writer
+            .threads
+            .insert(thread.id.as_str(), (first, thread.comments.len()));
+        if !writer.ranged.contains(&thread.id) {
+            writer.unplaced.push(thread.id.as_str());
+        }
+        first += thread.comments.len();
+    }
     if model::has_contents(blocks) {
         writer.anchors = model::heading_anchors(blocks);
         writer.contents = model::contents(blocks);
@@ -60,6 +82,8 @@ pub fn write(
     let room = office::text_width(&page);
     writer.blocks(blocks, &Context::top(room));
     let body = std::mem::take(&mut writer.out);
+    writer.threads.clear();
+    writer.unplaced.clear();
     // Headers and footers have no headings the contents link to.
     writer.anchors.clear();
     let notes = std::mem::take(&mut writer.notes);
@@ -163,6 +187,14 @@ pub fn write(
         "<Relationship Id=\"rIdFonts\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable\" \
          Target=\"fontTable.xml\"/>",
     );
+    if !threads.is_empty() {
+        extra.push_str(
+            "<Relationship Id=\"rIdComments\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" \
+             Target=\"comments.xml\"/>\
+             <Relationship Id=\"rIdCommentsExtended\" Type=\"http://schemas.microsoft.com/office/2011/relationships/commentsExtended\" \
+             Target=\"commentsExtended.xml\"/>",
+        );
+    }
     if !notes.is_empty() {
         extra.push_str(
             "<Relationship Id=\"rIdFootnotes\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes\" \
@@ -230,6 +262,16 @@ pub fn write(
              ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml\"/></Types>",
         );
     }
+    if !threads.is_empty() {
+        content_types = content_types.replace(
+            "</Types>",
+            "<Override PartName=\"/word/comments.xml\" \
+             ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml\"/>\
+             <Override PartName=\"/word/commentsExtended.xml\" \
+             ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml\"/></Types>",
+        );
+    }
+    let (comments, extended) = comments_parts(threads);
     let margin_paths: Vec<(String, String)> = margins
         .iter()
         .map(|(name, _, _, _)| {
@@ -311,6 +353,18 @@ pub fn write(
             stored: false,
         });
     }
+    if !threads.is_empty() {
+        parts.push(Part {
+            path: "word/comments.xml",
+            contents: comments.as_bytes(),
+            stored: false,
+        });
+        parts.push(Part {
+            path: "word/commentsExtended.xml",
+            contents: extended.as_bytes(),
+            stored: false,
+        });
+    }
     for (path, picture) in media_paths.iter().zip(&writer.media) {
         parts.push(Part {
             path,
@@ -323,6 +377,93 @@ pub fn write(
 }
 
 const XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
+
+/// The comments part, and the part that says which comments answer which
+/// and which are done, as Word 2013 and later write them. Each comment's
+/// last paragraph has an ID of its own for that, under 0x80000000.
+fn comments_parts(threads: &[Thread]) -> (String, String) {
+    let mut comments = format!(
+        "{XML}<w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+         xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \
+         xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" mc:Ignorable=\"w14\">"
+    );
+    let mut extended = format!(
+        "{XML}<w15:commentsEx xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\" \
+         xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" mc:Ignorable=\"w15\">"
+    );
+    let mut id = 0;
+    for thread in threads {
+        let first = paragraph_id(id);
+        let done = u8::from(thread.resolved.is_some());
+        for comment in &thread.comments {
+            let name = match comment.name.trim() {
+                "" => "Unknown",
+                name => name,
+            };
+            let initials: String = name
+                .split_whitespace()
+                .filter_map(|word| word.chars().next())
+                .take(3)
+                .collect();
+            let _ = write!(
+                comments,
+                "<w:comment w:id=\"{id}\" w:author=\"{}\" w:initials=\"{}\"",
+                escaped(name),
+                escaped(&initials)
+            );
+            if let Some(date) = word_date(&comment.at) {
+                let _ = write!(comments, " w:date=\"{date}\"");
+            }
+            comments.push('>');
+            let lines: Vec<&str> = comment.text.split('\n').collect();
+            for (index, line) in lines.iter().enumerate() {
+                if index + 1 == lines.len() {
+                    let _ = write!(
+                        comments,
+                        "<w:p w14:paraId=\"{}\" w14:textId=\"77777777\">",
+                        paragraph_id(id)
+                    );
+                } else {
+                    comments.push_str("<w:p>");
+                }
+                comments.push_str("<w:pPr><w:pStyle w:val=\"CommentText\"/></w:pPr>");
+                if index == 0 {
+                    comments.push_str(
+                        "<w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/></w:rPr><w:annotationRef/></w:r>",
+                    );
+                }
+                if !line.is_empty() {
+                    comments.push_str("<w:r><w:t xml:space=\"preserve\">");
+                    escape(&mut comments, line);
+                    comments.push_str("</w:t></w:r>");
+                }
+                comments.push_str("</w:p>");
+            }
+            comments.push_str("</w:comment>");
+            let paragraph = paragraph_id(id);
+            let _ = write!(extended, "<w15:commentEx w15:paraId=\"{paragraph}\"");
+            if paragraph != first {
+                let _ = write!(extended, " w15:paraIdParent=\"{first}\"");
+            }
+            let _ = write!(extended, " w15:done=\"{done}\"/>");
+            id += 1;
+        }
+    }
+    comments.push_str("</w:comments>");
+    extended.push_str("</w15:commentsEx>");
+    (comments, extended)
+}
+
+/// The ID of comment `id`'s last paragraph.
+fn paragraph_id(id: usize) -> String {
+    format!("{:08X}", 0x1000_0000 + id)
+}
+
+/// A comment's time as Word writes it, to the second, in UTC.
+fn word_date(at: &str) -> Option<String> {
+    let at: jiff::Timestamp = at.parse().ok()?;
+    Some(at.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
 
 /// Points in twentieths of a point, Word's unit for lengths.
 fn twips(points: f64) -> i64 {
@@ -411,6 +552,13 @@ struct Writer<'a> {
     /// The table of contents' entries, and each one's page, if known.
     contents: Vec<model::Entry>,
     pages: Vec<u32>,
+    /// Each comment thread's first Word ID and how many comments it has,
+    /// by the thread's ID, while the document's text is written.
+    threads: HashMap<&'a str, (usize, usize)>,
+    /// The threads whose text is marked, and those whose text is gone, to
+    /// put at the start of the first paragraph.
+    ranged: HashSet<String>,
+    unplaced: Vec<&'a str>,
 }
 
 impl Writer<'_> {
@@ -747,11 +895,32 @@ impl Writer<'_> {
     }
 
     fn runs(&mut self, inlines: &[Inline], context: &Context) {
+        for thread in std::mem::take(&mut self.unplaced) {
+            self.comment_references(thread);
+        }
         let mut link: Option<&str> = None;
         for inline in inlines {
             let marks = match inline {
                 Inline::Text(_, marks) => Some(marks),
                 Inline::Break | Inline::Footnote(_) => None,
+                // A comment's ends go where they are, in a link or not.
+                Inline::CommentStart(thread) => {
+                    if let Some(ids) = self.comment_ids(thread) {
+                        for id in ids {
+                            let _ = write!(self.out, "<w:commentRangeStart w:id=\"{id}\"/>");
+                        }
+                    }
+                    continue;
+                }
+                Inline::CommentEnd(thread) => {
+                    if let Some(ids) = self.comment_ids(thread) {
+                        for id in ids {
+                            let _ = write!(self.out, "<w:commentRangeEnd w:id=\"{id}\"/>");
+                        }
+                        self.comment_references(thread);
+                    }
+                    continue;
+                }
             };
             let href = marks.and_then(|marks| marks.link.as_deref());
             if link.is_some() && href != link {
@@ -769,10 +938,33 @@ impl Writer<'_> {
                 Inline::Text(text, marks) => self.run(text, marks, context),
                 Inline::Break => self.out.push_str("<w:r><w:br/></w:r>"),
                 Inline::Footnote(text) => self.footnote(text, context),
+                Inline::CommentStart(_) | Inline::CommentEnd(_) => {}
             }
         }
         if link.is_some() {
             self.out.push_str("</w:hyperlink>");
+        }
+    }
+
+    /// The Word IDs of a thread's comments, if its text is marked.
+    fn comment_ids(&self, thread: &str) -> Option<std::ops::Range<usize>> {
+        if !self.ranged.contains(thread) {
+            return None;
+        }
+        let (first, count) = self.threads.get(thread)?;
+        Some(*first..first + count)
+    }
+
+    /// Where Word shows a thread's comments: a mark for each.
+    fn comment_references(&mut self, thread: &str) {
+        let Some((first, count)) = self.threads.get(thread).copied() else {
+            return;
+        };
+        for id in first..first + count {
+            let _ = write!(
+                self.out,
+                "<w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/></w:rPr><w:commentReference w:id=\"{id}\"/></w:r>"
+            );
         }
     }
 
@@ -1221,6 +1413,10 @@ const STYLES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\
 <w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr><w:rPr><w:sz w:val=\"20\"/><w:szCs w:val=\"20\"/></w:rPr></w:style>\
 <w:style w:type=\"character\" w:styleId=\"FootnoteReference\"><w:name w:val=\"footnote reference\"/>\
 <w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"CommentText\"><w:name w:val=\"annotation text\"/><w:basedOn w:val=\"Normal\"/>\
+<w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr><w:rPr><w:sz w:val=\"20\"/><w:szCs w:val=\"20\"/></w:rPr></w:style>\
+<w:style w:type=\"character\" w:styleId=\"CommentReference\"><w:name w:val=\"annotation reference\"/>\
+<w:rPr><w:sz w:val=\"16\"/><w:szCs w:val=\"16\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/><w:basedOn w:val=\"Normal\"/><w:qFormat/>\
 <w:pPr><w:pBdr><w:left w:val=\"single\" w:sz=\"18\" w:space=\"8\" w:color=\"DADCE0\"/></w:pBdr></w:pPr><w:rPr><w:color w:val=\"444746\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"Code\"><w:name w:val=\"Code\"/><w:basedOn w:val=\"Normal\"/>\
@@ -1271,6 +1467,7 @@ mod tests {
             "Contents",
             &Pictures::new(),
             &[1, 1, 2],
+            &[],
         );
         let document = crate::office::tests::unzip(&file, "word/document.xml");
         assert!(
@@ -1299,6 +1496,7 @@ mod tests {
             "Contents",
             &Pictures::new(),
             &[1],
+            &[],
         );
         let document = crate::office::tests::unzip(&file, "word/document.xml");
         assert!(
@@ -1316,6 +1514,7 @@ mod tests {
             None,
             "Notes",
             &Pictures::new(),
+            &[],
             &[],
         );
         let document = crate::office::tests::unzip(&file, "word/document.xml");
@@ -1348,7 +1547,15 @@ mod tests {
             crate::office::tests::unzip(&file, "word/styles.xml").contains("FootnoteReference")
         );
         // A document without footnotes has no footnotes part.
-        let plain = write(&[], &Parts::default(), None, "Plain", &Pictures::new(), &[]);
+        let plain = write(
+            &[],
+            &Parts::default(),
+            None,
+            "Plain",
+            &Pictures::new(),
+            &[],
+            &[],
+        );
         let types = crate::office::tests::unzip(&plain, "[Content_Types].xml");
         assert!(!types.contains("footnotes"), "{types}");
     }
@@ -1357,7 +1564,7 @@ mod tests {
     fn writes_headers_footers_and_page_numbers() {
         let parts = crate::html::tests::parts();
         let blocks = vec![Block::Paragraph(Para::default(), Vec::new())];
-        let file = write(&blocks, &parts, None, "Parts", &Pictures::new(), &[]);
+        let file = write(&blocks, &parts, None, "Parts", &Pictures::new(), &[], &[]);
         let document = crate::office::tests::unzip(&file, "word/document.xml");
         assert!(
             document.contains("<w:headerReference w:type=\"default\" r:id=\"rId-header\"/>"),
@@ -1461,6 +1668,7 @@ mod tests {
             "Plan & notes",
             &Pictures::new(),
             &[],
+            &[],
         );
         let document = part(&file, "word/document.xml");
         assert!(
@@ -1512,6 +1720,7 @@ mod tests {
             "Pictures",
             &pictures,
             &[],
+            &[],
         );
         let document = part(&file, "word/document.xml");
         assert_eq!(
@@ -1543,6 +1752,7 @@ mod tests {
             "Cells",
             &Pictures::new(),
             &[],
+            &[],
         );
         let document = part(&file, "word/document.xml");
         assert!(document.contains("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"FCE5CD\"/>"));
@@ -1561,6 +1771,7 @@ mod tests {
             None,
             "Resume",
             &Pictures::new(),
+            &[],
             &[],
         );
         let document = part(&file, "word/document.xml");
@@ -1594,6 +1805,7 @@ mod tests {
             None,
             "Layout",
             &Pictures::new(),
+            &[],
             &[],
         );
         let document = part(&file, "word/document.xml");
@@ -1636,6 +1848,7 @@ mod tests {
             None,
             "Fonts",
             &Pictures::new(),
+            &[],
             &[],
         );
         let document = part(&file, "word/document.xml");

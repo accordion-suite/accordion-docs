@@ -44,6 +44,18 @@ pub(crate) enum Ns {
     Xlink,
     /// The `xml:` prefix, as in `xml:space`.
     Xml,
+    /// Word 2010's additions, `w14:`, which give paragraphs IDs.
+    W14,
+    /// Word 2013's, `w15:`, which say which comments answer which.
+    W15,
+    /// Word's comment IDs and UTC times, `w16cid:` and `w16cex:`.
+    W16Cid,
+    W16Cex,
+    /// Dublin Core, `dc:`, and OpenDocument's metadata, `meta:`.
+    Dc,
+    Meta,
+    /// LibreOffice's additions to OpenDocument, `loext:`.
+    Loext,
     Other,
 }
 
@@ -74,6 +86,13 @@ fn namespace(uri: &str) -> Ns {
         "urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" => Ns::Svg,
         "http://www.w3.org/1999/xlink" => Ns::Xlink,
         "http://www.w3.org/XML/1998/namespace" => Ns::Xml,
+        "http://schemas.microsoft.com/office/word/2010/wordml" => Ns::W14,
+        "http://schemas.microsoft.com/office/word/2012/wordml" => Ns::W15,
+        "http://schemas.microsoft.com/office/word/2016/wordml/cid" => Ns::W16Cid,
+        "http://schemas.microsoft.com/office/word/2018/wordml/cex" => Ns::W16Cex,
+        "http://purl.org/dc/elements/1.1/" => Ns::Dc,
+        "urn:oasis:names:tc:opendocument:xmlns:meta:1.0" => Ns::Meta,
+        "urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0" => Ns::Loext,
         _ => Ns::Other,
     }
 }

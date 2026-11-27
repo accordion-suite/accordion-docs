@@ -11,13 +11,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use base64::Engine as _;
+use yrs::branch::BranchID;
 use yrs::types::Attrs;
 use yrs::types::text::YChange;
+use yrs::updates::decoder::Decode as _;
+use yrs::updates::encoder::Encode as _;
 use yrs::{
-    Any, Map, MapRef, Number, Out, ReadTxn, Text, TransactionMut, Xml, XmlElementPrelim,
-    XmlElementRef, XmlFragment, XmlFragmentRef, XmlOut, XmlTextPrelim, XmlTextRef,
+    Any, Assoc, IndexedSequence, Map, MapRef, Number, Out, ReadTxn, StickyIndex, Text,
+    TransactionMut, Xml, XmlElementPrelim, XmlElementRef, XmlFragment, XmlFragmentRef, XmlOut,
+    XmlTextPrelim, XmlTextRef,
 };
 
+use crate::comments::Thread;
 use crate::model::{
     self, Align, Block, Cell, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks,
     PageSetup, PageSize, Para, Parts, Script,
@@ -43,7 +49,9 @@ const DIFFERENT_FIRST: &str = "different_first";
 pub fn read_parts<T: ReadTxn>(txn: &T, page: &MapRef) -> Parts {
     let part = |name: &str| {
         txn.get_xml_fragment(name)
-            .map(|fragment| model::normalize_blocks(read_children(txn, &fragment)))
+            .map(|fragment| {
+                model::normalize_blocks(read_children(txn, &fragment, &mut Anchors::default()))
+            })
             .unwrap_or_default()
     };
     Parts {
@@ -156,7 +164,64 @@ pub fn write_page(txn: &mut TransactionMut, page: &MapRef, setup: Option<&PageSe
 
 /// The document's blocks, as the editor would show them.
 pub fn read<T: ReadTxn>(txn: &T, fragment: &XmlFragmentRef) -> Vec<Block> {
-    model::normalize(read_children(txn, fragment))
+    model::normalize(read_children(txn, fragment, &mut Anchors::default()))
+}
+
+/// The same as [`read`], with [`Inline::CommentStart`] and
+/// [`Inline::CommentEnd`] where each of `threads` starts and ends, for Word
+/// and OpenDocument files. A thread whose text is gone has neither. The
+/// document's offsets must be UTF-16's, as the editor's are.
+pub fn read_with_comments<T: ReadTxn>(
+    txn: &T,
+    fragment: &XmlFragmentRef,
+    threads: &[Thread],
+) -> Vec<Block> {
+    let mut anchors = Anchors::default();
+    for thread in threads {
+        let ends = [
+            (&thread.start, Inline::CommentStart(thread.id.clone())),
+            (&thread.end, Inline::CommentEnd(thread.id.clone())),
+        ];
+        for (anchor, marker) in ends {
+            let offset = base64::engine::general_purpose::STANDARD
+                .decode(anchor)
+                .ok()
+                .and_then(|bytes| StickyIndex::decode_v1(&bytes).ok())
+                .and_then(|sticky| sticky.get_offset(txn));
+            if let Some(offset) = offset {
+                anchors
+                    .at
+                    .entry(offset.branch.id())
+                    .or_default()
+                    .push((offset.index, marker));
+            }
+        }
+    }
+    // Where one thread ends and another starts, the first ends first.
+    for markers in anchors.at.values_mut() {
+        markers.sort_by_key(|(index, marker)| (*index, matches!(marker, Inline::CommentStart(_))));
+    }
+    model::normalize(read_children(txn, fragment, &mut anchors))
+}
+
+/// Where comment threads start and end while a document is read.
+#[derive(Default)]
+struct Anchors {
+    /// The markers in each Yjs type, by their index in it: a character's in
+    /// a text, a child's in an element.
+    at: HashMap<BranchID, Vec<(u32, Inline)>>,
+    /// Markers between blocks, waiting for the next text.
+    pending: Vec<Inline>,
+}
+
+impl Anchors {
+    /// The markers in `branch`, taken out.
+    fn take(&mut self, branch: &yrs::branch::Branch) -> Vec<(u32, Inline)> {
+        if self.at.is_empty() {
+            return Vec::new();
+        }
+        self.at.remove(&branch.id()).unwrap_or_default()
+    }
 }
 
 /// Each child of `fragment` as a block of its own, normalized, or `None` for
@@ -165,20 +230,34 @@ pub fn read_each<T: ReadTxn>(txn: &T, fragment: &XmlFragmentRef) -> Vec<Option<B
     fragment
         .children(txn)
         .map(|child| match child {
-            XmlOut::Element(element) => read_block(txn, &element).and_then(model::normalize_block),
+            XmlOut::Element(element) => {
+                read_block(txn, &element, &mut Anchors::default()).and_then(model::normalize_block)
+            }
             _ => None,
         })
         .collect()
 }
 
-fn read_children<T: ReadTxn, F: XmlFragment>(txn: &T, parent: &F) -> Vec<Block> {
-    parent
-        .children(txn)
-        .filter_map(|child| match child {
-            XmlOut::Element(element) => read_block(txn, &element),
-            _ => None,
-        })
-        .collect()
+fn read_children<T: ReadTxn, F: XmlFragment>(
+    txn: &T,
+    parent: &F,
+    anchors: &mut Anchors,
+) -> Vec<Block> {
+    // Markers between blocks go with the next text.
+    let mut between = anchors.take(parent.as_ref()).into_iter().peekable();
+    let mut blocks = Vec::new();
+    for (index, child) in parent.children(txn).enumerate() {
+        while let Some((_, marker)) = between.next_if(|(at, _)| *at as usize <= index) {
+            anchors.pending.push(marker);
+        }
+        if let XmlOut::Element(element) = child
+            && let Some(block) = read_block(txn, &element, anchors)
+        {
+            blocks.push(block);
+        }
+    }
+    anchors.pending.extend(between.map(|(_, marker)| marker));
+    blocks
 }
 
 fn number<T: ReadTxn>(txn: &T, element: &XmlElementRef, name: &str) -> Option<i64> {
@@ -229,12 +308,22 @@ fn list_style<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<ListStyle>
     string(txn, element, "style").and_then(|style| ListStyle::from_name(&style))
 }
 
-fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
+fn read_block<T: ReadTxn>(
+    txn: &T,
+    element: &XmlElementRef,
+    anchors: &mut Anchors,
+) -> Option<Block> {
     Some(match element.tag().as_ref() {
-        "paragraph" => Block::Paragraph(read_para(txn, element), read_inlines(txn, element)),
+        "paragraph" => {
+            Block::Paragraph(read_para(txn, element), read_inlines(txn, element, anchors))
+        }
         "heading" => {
             let level = number(txn, element, "level").unwrap_or(1).clamp(1, 6) as u8;
-            Block::Heading(level, read_para(txn, element), read_inlines(txn, element))
+            Block::Heading(
+                level,
+                read_para(txn, element),
+                read_inlines(txn, element, anchors),
+            )
         }
         "page_break" => Block::PageBreak,
         "table_of_contents" => Block::Contents(
@@ -242,14 +331,17 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
                 .and_then(|style| ContentsStyle::from_name(&style))
                 .unwrap_or_default(),
         ),
-        "blockquote" => Block::Quote(read_children(txn, element)),
+        "blockquote" => Block::Quote(read_children(txn, element, anchors)),
         "code_block" => Block::Code(
-            read_inlines(txn, element)
+            // Comments in code keep to the text around it.
+            read_inlines(txn, element, &mut Anchors::default())
                 .into_iter()
                 .map(|inline| match inline {
                     Inline::Text(text, _) => text,
                     Inline::Break => "\n".to_owned(),
-                    Inline::Footnote(_) => String::new(),
+                    Inline::Footnote(_) | Inline::CommentStart(_) | Inline::CommentEnd(_) => {
+                        String::new()
+                    }
                 })
                 .collect(),
         ),
@@ -268,7 +360,10 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
                 width: number(txn, element, "width").and_then(|width| u32::try_from(width).ok()),
             })
         }
-        "bullet_list" => Block::Bullets(list_style(txn, element), items(txn, element, "list_item")),
+        "bullet_list" => Block::Bullets(
+            list_style(txn, element),
+            items(txn, element, "list_item", anchors),
+        ),
         "ordered_list" => {
             let start = number(txn, element, "order")
                 .unwrap_or(1)
@@ -276,7 +371,7 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
             Block::Numbers(
                 start as u32,
                 list_style(txn, element),
-                items(txn, element, "list_item"),
+                items(txn, element, "list_item", anchors),
             )
         }
         "check_list" => Block::Checks(
@@ -288,7 +383,7 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
                             item.get_attribute(txn, "checked"),
                             Some(Out::Any(Any::Bool(true)))
                         );
-                        Some((checked, read_children(txn, &item)))
+                        Some((checked, read_children(txn, &item, anchors)))
                     }
                     _ => None,
                 })
@@ -302,7 +397,7 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
                         height: float(txn, &row, "height").and_then(model::twips),
                         cells: row
                             .children(txn)
-                            .filter_map(|cell| read_cell(txn, cell))
+                            .filter_map(|cell| read_cell(txn, cell, anchors))
                             .collect(),
                     }),
                     _ => None,
@@ -313,10 +408,17 @@ fn read_block<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Option<Block> {
     })
 }
 
-fn items<T: ReadTxn>(txn: &T, list: &XmlElementRef, tag: &str) -> Vec<Vec<Block>> {
+fn items<T: ReadTxn>(
+    txn: &T,
+    list: &XmlElementRef,
+    tag: &str,
+    anchors: &mut Anchors,
+) -> Vec<Vec<Block>> {
     list.children(txn)
         .filter_map(|child| match child {
-            XmlOut::Element(item) if item.tag().as_ref() == tag => Some(read_children(txn, &item)),
+            XmlOut::Element(item) if item.tag().as_ref() == tag => {
+                Some(read_children(txn, &item, anchors))
+            }
             _ => None,
         })
         .collect()
@@ -325,7 +427,7 @@ fn items<T: ReadTxn>(txn: &T, list: &XmlElementRef, tag: &str) -> Vec<Vec<Block>
 /// A cell's border attributes: top, right, bottom, and left, in points.
 const BORDERS: [&str; 4] = ["border_top", "border_right", "border_bottom", "border_left"];
 
-fn read_cell<T: ReadTxn>(txn: &T, cell: XmlOut) -> Option<Cell> {
+fn read_cell<T: ReadTxn>(txn: &T, cell: XmlOut, anchors: &mut Anchors) -> Option<Cell> {
     let XmlOut::Element(cell) = cell else {
         return None;
     };
@@ -373,33 +475,65 @@ fn read_cell<T: ReadTxn>(txn: &T, cell: XmlOut) -> Option<Cell> {
         borders: BORDERS.map(length),
         border_color: color("border_color"),
         padding,
-        content: read_children(txn, &cell),
+        content: read_children(txn, &cell, anchors),
     })
 }
 
-fn read_inlines<T: ReadTxn>(txn: &T, element: &XmlElementRef) -> Vec<Inline> {
-    let mut inlines = Vec::new();
-    for child in element.children(txn) {
+fn read_inlines<T: ReadTxn>(
+    txn: &T,
+    element: &XmlElementRef,
+    anchors: &mut Anchors,
+) -> Vec<Inline> {
+    let mut inlines = std::mem::take(&mut anchors.pending);
+    let mut between = anchors.take(element.as_ref()).into_iter().peekable();
+    for (index, child) in element.children(txn).enumerate() {
+        while let Some((_, marker)) = between.next_if(|(at, _)| *at as usize <= index) {
+            inlines.push(marker);
+        }
         match child {
             XmlOut::Text(text) => {
+                // Each marker goes before the character at its index, in
+                // UTF-16 code units.
+                let mut markers = anchors.take(text.as_ref()).into_iter().peekable();
+                let mut at = 0;
                 for chunk in text.diff(txn, YChange::identity) {
-                    if let Out::Any(Any::String(text)) = chunk.insert {
-                        inlines.push(Inline::Text(
-                            text.to_string(),
-                            marks(chunk.attributes.as_deref()),
-                        ));
+                    let Out::Any(Any::String(chunk_text)) = chunk.insert else {
+                        continue;
+                    };
+                    let marks = marks(chunk.attributes.as_deref());
+                    let mut piece = String::new();
+                    for c in chunk_text.chars() {
+                        if markers.peek().is_some_and(|(index, _)| *index <= at) {
+                            if !piece.is_empty() {
+                                inlines
+                                    .push(Inline::Text(std::mem::take(&mut piece), marks.clone()));
+                            }
+                            while let Some((_, marker)) = markers.next_if(|(index, _)| *index <= at)
+                            {
+                                inlines.push(marker);
+                            }
+                        }
+                        piece.push(c);
+                        at += c.len_utf16() as u32;
+                    }
+                    if !piece.is_empty() {
+                        inlines.push(Inline::Text(piece, marks));
                     }
                 }
+                inlines.extend(markers.map(|(_, marker)| marker));
             }
             XmlOut::Element(inline) if inline.tag().as_ref() == "hard_break" => {
                 inlines.push(Inline::Break);
             }
             XmlOut::Element(inline) if inline.tag().as_ref() == "footnote" => {
-                inlines.push(Inline::Footnote(read_inlines(txn, &inline)));
+                // Comments are on the document's text, not in its notes.
+                let text = read_inlines(txn, &inline, &mut Anchors::default());
+                inlines.push(Inline::Footnote(text));
             }
             _ => {}
         }
     }
+    inlines.extend(between.map(|(_, marker)| marker));
     inlines
 }
 
@@ -564,8 +698,78 @@ pub fn insert_blocks<P: XmlFragment>(
     index: u32,
     blocks: &[Block],
 ) {
+    insert_all(txn, parent, index, blocks, &mut Vec::new());
+}
+
+/// Inserts `blocks` into `fragment`, which is empty, and returns where each
+/// [`Inline::CommentStart`] and [`Inline::CommentEnd`] in them is, as the
+/// editor keeps a thread's ends: Yjs positions in base64, by the thread's
+/// ID. A thread missing either end isn't there.
+pub fn insert_with_comments(
+    txn: &mut TransactionMut,
+    fragment: &XmlFragmentRef,
+    blocks: &[Block],
+) -> HashMap<String, (String, String)> {
+    let mut found = Vec::new();
+    insert_all(txn, fragment, 0, blocks, &mut found);
+    // Positions are taken once all the text is in, so each refers to the
+    // character after it, as the editor's do.
+    let mut ends: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    for (marker, spot) in found {
+        // At a type's end, the position is the type's own, as Yjs makes
+        // it. yrs before 0.28.2 makes none there.
+        let sticky = match &spot {
+            Spot::Text(text, index) if *index >= text.len(txn) => {
+                Some(StickyIndex::from_type(txn, text, Assoc::After))
+            }
+            Spot::Element(element, index) if *index >= element.len(txn) => {
+                Some(StickyIndex::from_type(txn, element, Assoc::After))
+            }
+            Spot::Text(text, index) => text.sticky_index(txn, *index, Assoc::After),
+            Spot::Element(element, index) => element.sticky_index(txn, *index, Assoc::After),
+        };
+        let Some(sticky) = sticky else {
+            continue;
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(sticky.encode_v1());
+        match marker {
+            Inline::CommentStart(thread) => ends.entry(thread).or_default().0 = Some(encoded),
+            Inline::CommentEnd(thread) => ends.entry(thread).or_default().1 = Some(encoded),
+            _ => {}
+        }
+    }
+    ends.into_iter()
+        .filter_map(|(thread, ends)| match ends {
+            (Some(start), Some(end)) => Some((thread, (start, end))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The position at the start of the document, in base64, for a thread
+/// whose text isn't marked: the editor shows it beside the text, as one
+/// whose text is gone.
+pub fn document_start<T: ReadTxn>(txn: &T, fragment: &XmlFragmentRef) -> Option<String> {
+    let sticky = fragment.sticky_index(txn, 0, Assoc::After)?;
+    Some(base64::engine::general_purpose::STANDARD.encode(sticky.encode_v1()))
+}
+
+/// Where a comment marker was while blocks went in: an index in a text, or
+/// a child's index in an element.
+enum Spot {
+    Text(XmlTextRef, u32),
+    Element(XmlElementRef, u32),
+}
+
+fn insert_all<P: XmlFragment>(
+    txn: &mut TransactionMut,
+    parent: &P,
+    index: u32,
+    blocks: &[Block],
+    found: &mut Vec<(Inline, Spot)>,
+) {
     for (offset, block) in blocks.iter().enumerate() {
-        insert_block(txn, parent, index + offset as u32, block);
+        insert_block(txn, parent, index + offset as u32, block, found);
     }
 }
 
@@ -616,18 +820,24 @@ fn insert_para(txn: &mut TransactionMut, el: &XmlElementRef, para: &Para) {
     }
 }
 
-fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32, block: &Block) {
+fn insert_block<P: XmlFragment>(
+    txn: &mut TransactionMut,
+    parent: &P,
+    index: u32,
+    block: &Block,
+    found: &mut Vec<(Inline, Spot)>,
+) {
     match block {
         Block::Paragraph(para, inlines) => {
             let el = element(txn, parent, index, "paragraph");
             insert_para(txn, &el, para);
-            insert_inlines(txn, &el, inlines);
+            insert_inlines(txn, &el, inlines, found);
         }
         Block::Heading(level, para, inlines) => {
             let el = element(txn, parent, index, "heading");
             el.insert_attribute(txn, "level", int(i64::from(*level)));
             insert_para(txn, &el, para);
-            insert_inlines(txn, &el, inlines);
+            insert_inlines(txn, &el, inlines, found);
         }
         Block::PageBreak => {
             element(txn, parent, index, "page_break");
@@ -638,7 +848,7 @@ fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32
         }
         Block::Quote(blocks) => {
             let el = element(txn, parent, index, "blockquote");
-            insert_blocks(txn, &el, 0, blocks);
+            insert_all(txn, &el, 0, blocks, found);
         }
         Block::Code(text) => {
             let el = element(txn, parent, index, "code_block");
@@ -671,7 +881,7 @@ fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32
             if let Some(style) = style {
                 el.insert_attribute(txn, "style", Any::from(style.name()));
             }
-            insert_items(txn, &el, "list_item", items);
+            insert_items(txn, &el, "list_item", items, found);
         }
         Block::Numbers(start, style, items) => {
             let el = element(txn, parent, index, "ordered_list");
@@ -679,14 +889,14 @@ fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32
             if let Some(style) = style {
                 el.insert_attribute(txn, "style", Any::from(style.name()));
             }
-            insert_items(txn, &el, "list_item", items);
+            insert_items(txn, &el, "list_item", items, found);
         }
         Block::Checks(items) => {
             let el = element(txn, parent, index, "check_list");
             for (at, (checked, blocks)) in items.iter().enumerate() {
                 let item = element(txn, &el, at as u32, "check_item");
                 item.insert_attribute(txn, "checked", Any::Bool(*checked));
-                insert_blocks(txn, &item, 0, blocks);
+                insert_all(txn, &item, 0, blocks, found);
             }
         }
         Block::Table(rows) => {
@@ -725,23 +935,34 @@ fn insert_block<P: XmlFragment>(txn: &mut TransactionMut, parent: &P, index: u32
                         let sides: Vec<Any> = padding.into_iter().map(points).collect();
                         cell_el.insert_attribute(txn, "padding", Any::Array(sides.into()));
                     }
-                    insert_blocks(txn, &cell_el, 0, &cell.content);
+                    insert_all(txn, &cell_el, 0, &cell.content, found);
                 }
             }
         }
     }
 }
 
-fn insert_items(txn: &mut TransactionMut, list: &XmlElementRef, tag: &str, items: &[Vec<Block>]) {
+fn insert_items(
+    txn: &mut TransactionMut,
+    list: &XmlElementRef,
+    tag: &str,
+    items: &[Vec<Block>],
+    found: &mut Vec<(Inline, Spot)>,
+) {
     for (at, blocks) in items.iter().enumerate() {
         let item = element(txn, list, at as u32, tag);
-        insert_blocks(txn, &item, 0, blocks);
+        insert_all(txn, &item, 0, blocks, found);
     }
 }
 
 /// Text goes in one XML text for each stretch between line breaks, as
 /// y-prosemirror makes them.
-fn insert_inlines(txn: &mut TransactionMut, element: &XmlElementRef, inlines: &[Inline]) {
+fn insert_inlines(
+    txn: &mut TransactionMut,
+    element: &XmlElementRef,
+    inlines: &[Inline],
+    found: &mut Vec<(Inline, Spot)>,
+) {
     let mut index = 0;
     let mut run: Option<XmlTextRef> = None;
     for inline in inlines {
@@ -773,9 +994,16 @@ fn insert_inlines(txn: &mut TransactionMut, element: &XmlElementRef, inlines: &[
             }
             Inline::Footnote(text) => {
                 let note = element.insert(txn, index, XmlElementPrelim::empty("footnote"));
-                insert_inlines(txn, &note, text);
+                insert_inlines(txn, &note, text, &mut Vec::new());
                 index += 1;
                 run = None;
+            }
+            marker @ (Inline::CommentStart(_) | Inline::CommentEnd(_)) => {
+                let spot = match &run {
+                    Some(text) => Spot::Text(text.clone(), text.len(txn)),
+                    None => Spot::Element(element.clone(), index),
+                };
+                found.push((marker.clone(), spot));
             }
         }
     }

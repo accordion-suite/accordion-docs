@@ -412,6 +412,8 @@ fn write_inlines(out: &mut String, inlines: &[Inline], one_line: bool, notes: &m
             Inline::Text(_, marks) if marks.field.is_some() => continue,
             Inline::Text(text, marks) if !text.is_empty() => (text.as_str(), marks.clone()),
             Inline::Text(..) => continue,
+            // Markdown has no comments.
+            Inline::CommentStart(_) | Inline::CommentEnd(_) => continue,
             Inline::Footnote(text) => {
                 close_marks(out, &mut open, link.as_deref(), 0);
                 out.push_str(&pending);

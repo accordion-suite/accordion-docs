@@ -6,11 +6,13 @@
 //! of contents is OpenDocument's, with its entries and page numbers already
 //! in it, so LibreOffice shows it as Docs does and can update it. Fonts
 //! keep their own names, and a weight other than regular and bold is
-//! OpenDocument's number for it.
+//! OpenDocument's number for it. Comment threads are annotations, with
+//! replies and resolved threads marked as LibreOffice marks them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
+use crate::comments::Thread;
 use crate::fonts;
 use crate::model::{
     self, Align, Block, Cell, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks,
@@ -23,7 +25,10 @@ use crate::style::{self, Color, HalfPoints};
 /// `blocks` on `setup`'s page as an OpenDocument file, with `pictures` in
 /// it and `title` in its properties. `pages` is the page each entry of a
 /// table of contents is on, as the editor lays the pages out, or empty if
-/// unknown.
+/// unknown. `threads` are the document's comments: those whose text
+/// `blocks` mark with [`Inline::CommentStart`] and [`Inline::CommentEnd`]
+/// are about that text, and the rest, whose text is gone, are at the
+/// document's start.
 pub fn write(
     blocks: &[Block],
     parts: &Parts,
@@ -31,12 +36,23 @@ pub fn write(
     title: &str,
     pictures: &Pictures,
     pages: &[u32],
+    threads: &[Thread],
 ) -> Vec<u8> {
     let page = office::page_of(setup);
     let mut writer = Writer {
         pictures: Some(pictures),
+        ranged: model::ranged_comments(blocks),
         ..Writer::default()
     };
+    // Each comment's name is its place among all the threads' comments.
+    let mut first = 0;
+    for thread in threads {
+        writer.threads.insert(thread.id.as_str(), (thread, first));
+        if !writer.ranged.contains(&thread.id) {
+            writer.unplaced.push(thread.id.as_str());
+        }
+        first += thread.comments.len();
+    }
     if model::has_contents(blocks) {
         writer.anchors = model::heading_anchors(blocks);
         writer.contents = model::contents(blocks);
@@ -47,6 +63,8 @@ pub fn write(
     let room = office::text_width(&page);
     writer.blocks(blocks, &Context::top(room));
     let body = std::mem::take(&mut writer.out);
+    writer.threads.clear();
+    writer.unplaced.clear();
     // Headers and footers have no headings the contents link to.
     writer.anchors.clear();
     // Headers and footers come from the same writer, so their styles have
@@ -236,7 +254,8 @@ xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\" \
 xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" \
 xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
 xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
-xmlns:meta=\"urn:oasis:names:tc:opendocument:xmlns:meta:1.0\"";
+xmlns:meta=\"urn:oasis:names:tc:opendocument:xmlns:meta:1.0\" \
+xmlns:loext=\"urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0\"";
 
 /// The marks a span of text has, which name its style.
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -367,6 +386,13 @@ struct Writer<'a> {
     /// The table of contents' entries, and each one's page, if known.
     contents: Vec<model::Entry>,
     pages: Vec<u32>,
+    /// Each comment thread and the number of its first comment, by the
+    /// thread's ID, while the document's text is written.
+    threads: HashMap<&'a str, (&'a Thread, usize)>,
+    /// The threads whose text is marked, and those whose text is gone, to
+    /// put at the start of the first paragraph.
+    ranged: HashSet<String>,
+    unplaced: Vec<&'a str>,
 }
 
 impl Writer<'_> {
@@ -676,12 +702,35 @@ impl Writer<'_> {
     }
 
     fn runs(&mut self, inlines: &[Inline], context: &Context) {
+        for thread in std::mem::take(&mut self.unplaced) {
+            self.annotations(thread, false);
+        }
         let mut link: Option<&str> = None;
         for inline in inlines {
             let marks = match inline {
                 Inline::Text(text, marks) if !text.is_empty() => Some(marks),
                 Inline::Text(..) => continue,
                 Inline::Break | Inline::Footnote(_) => None,
+                // A comment's ends go where they are, in a link or not.
+                Inline::CommentStart(thread) => {
+                    if self.ranged.contains(thread) {
+                        self.annotations(thread, true);
+                    }
+                    continue;
+                }
+                Inline::CommentEnd(thread) => {
+                    if self.ranged.contains(thread)
+                        && let Some((thread, first)) = self.threads.get(thread.as_str()).copied()
+                    {
+                        for number in first..first + thread.comments.len() {
+                            let _ = write!(
+                                self.out,
+                                "<office:annotation-end office:name=\"comment{number}\"/>"
+                            );
+                        }
+                    }
+                    continue;
+                }
             };
             let href = marks.and_then(|marks| marks.link.as_deref());
             if link.is_some() && href != link {
@@ -700,10 +749,59 @@ impl Writer<'_> {
                 Inline::Text(text, marks) => self.span(text, marks, context),
                 Inline::Break => self.open("<text:line-break/>"),
                 Inline::Footnote(text) => self.footnote(text, context),
+                Inline::CommentStart(_) | Inline::CommentEnd(_) => {}
             }
         }
         if link.is_some() {
             self.out.push_str("</text:a>");
+        }
+    }
+
+    /// A thread's comments, each an annotation, where its text starts.
+    /// Named annotations are about the text up to their ends; others are
+    /// about where they are.
+    fn annotations(&mut self, thread: &str, named: bool) {
+        let Some((thread, first)) = self.threads.get(thread).copied() else {
+            return;
+        };
+        let resolved = thread.resolved.is_some();
+        for (index, comment) in thread.comments.iter().enumerate() {
+            self.out.push_str("<office:annotation");
+            if named {
+                let _ = write!(self.out, " office:name=\"comment{}\"", first + index);
+                if index > 0 {
+                    let _ = write!(self.out, " loext:parent-name=\"comment{first}\"");
+                }
+            }
+            let _ = write!(self.out, " loext:resolved=\"{resolved}\">");
+            let name = match comment.name.trim() {
+                "" => "Unknown",
+                name => name,
+            };
+            let _ = write!(self.out, "<dc:creator>{}</dc:creator>", escaped(name));
+            if let Ok(at) = comment.at.parse::<jiff::Timestamp>() {
+                let _ = write!(
+                    self.out,
+                    "<dc:date>{}</dc:date>",
+                    at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                );
+            }
+            let initials: String = name
+                .split_whitespace()
+                .filter_map(|word| word.chars().next())
+                .take(3)
+                .collect();
+            let _ = write!(
+                self.out,
+                "<meta:creator-initials>{}</meta:creator-initials>",
+                escaped(&initials)
+            );
+            for line in comment.text.split('\n') {
+                self.out.push_str("<text:p>");
+                escape(&mut self.out, line);
+                self.out.push_str("</text:p>");
+            }
+            self.out.push_str("</office:annotation>");
         }
     }
 
@@ -1226,6 +1324,7 @@ mod tests {
             "Contents",
             &Pictures::new(),
             &[1, 1, 2],
+            &[],
         );
         let content = part(&file, "content.xml");
         assert!(
@@ -1256,6 +1355,7 @@ mod tests {
             "Notes",
             &Pictures::new(),
             &[],
+            &[],
         );
         let content = part(&file, "content.xml");
         assert!(
@@ -1275,7 +1375,7 @@ mod tests {
     fn writes_headers_footers_and_page_numbers() {
         let parts = crate::html::tests::parts();
         let blocks = vec![Block::Paragraph(Para::default(), Vec::new())];
-        let file = write(&blocks, &parts, None, "Parts", &Pictures::new(), &[]);
+        let file = write(&blocks, &parts, None, "Parts", &Pictures::new(), &[], &[]);
         let styles = crate::office::tests::unzip(&file, "styles.xml");
         assert!(styles.contains("<style:header><text:p"), "{styles}");
         assert!(
@@ -1346,6 +1446,7 @@ mod tests {
             "Plan",
             &Pictures::new(),
             &[],
+            &[],
         );
         // The mimetype comes first, stored as is, as OpenDocument asks.
         assert_eq!(&file[30..38], b"mimetype");
@@ -1401,6 +1502,7 @@ mod tests {
             "Pictures",
             &pictures,
             &[],
+            &[],
         );
         let content = part(&file, "content.xml");
         let path = format!("Pictures/{}.png", picture.hash);
@@ -1423,6 +1525,7 @@ mod tests {
             "Cells",
             &Pictures::new(),
             &[],
+            &[],
         );
         let content = part(&file, "content.xml");
         assert!(content.contains(
@@ -1442,6 +1545,7 @@ mod tests {
             None,
             "Resume",
             &Pictures::new(),
+            &[],
             &[],
         );
         let content = part(&file, "content.xml");
@@ -1469,6 +1573,7 @@ mod tests {
             None,
             "Layout",
             &Pictures::new(),
+            &[],
             &[],
         );
         let content = part(&file, "content.xml");
@@ -1507,6 +1612,7 @@ mod tests {
             None,
             "Fonts",
             &Pictures::new(),
+            &[],
             &[],
         );
         let content = part(&file, "content.xml");

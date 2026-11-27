@@ -138,6 +138,16 @@ pub fn shortened(text: &str, most: usize) -> String {
 /// there and different, positions it can keep, texts no longer than a
 /// comment may be, and no more than a document may have.
 pub fn checked(threads: Vec<Thread>) -> Vec<Thread> {
+    kept(threads, true)
+}
+
+/// The same as [`checked`], for threads read from a Word or OpenDocument
+/// file, which have no positions until the document is made.
+pub fn checked_without_positions(threads: Vec<Thread>) -> Vec<Thread> {
+    kept(threads, false)
+}
+
+fn kept(threads: Vec<Thread>, positions: bool) -> Vec<Thread> {
     let fits = |id: &str| !id.is_empty() && id.len() <= MAX_ID;
     let mut seen = HashSet::new();
     let mut kept = Vec::new();
@@ -147,8 +157,7 @@ pub fn checked(threads: Vec<Thread>) -> Vec<Thread> {
         }
         if !fits(&thread.id)
             || !seen.insert(thread.id.clone())
-            || !is_anchor(&thread.start)
-            || !is_anchor(&thread.end)
+            || positions && (!is_anchor(&thread.start) || !is_anchor(&thread.end))
         {
             continue;
         }

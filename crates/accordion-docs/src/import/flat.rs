@@ -111,7 +111,7 @@ pub(super) fn plain(inlines: &[Inline]) -> String {
         match inline {
             Inline::Text(words, _) => text.push_str(words),
             Inline::Break => text.push('\n'),
-            Inline::Footnote(_) => {}
+            Inline::Footnote(_) | Inline::CommentStart(_) | Inline::CommentEnd(_) => {}
         }
     }
     text
@@ -380,4 +380,53 @@ pub(super) fn paper(width: f64, height: f64, report: &mut Report) -> (PageSize, 
         report.paper = Some(paper);
     }
     (paper, width > height)
+}
+
+/// A paragraph's text, broken where a block has to go between, such as a
+/// picture or a page break.
+pub(super) enum Piece {
+    Text(Vec<Inline>),
+    Block(Block),
+}
+
+/// Moves text that's only comment marks, such as around a picture, into
+/// the text after it, or before it if there's none, so it doesn't become a
+/// line of its own.
+pub(super) fn move_comment_marks(pieces: &mut [Piece]) {
+    let only_marks = |inlines: &[Inline]| {
+        !inlines.is_empty()
+            && inlines
+                .iter()
+                .all(|inline| matches!(inline, Inline::CommentStart(_) | Inline::CommentEnd(_)))
+    };
+    let texts = pieces
+        .iter()
+        .filter(|piece| matches!(piece, Piece::Text(inlines) if !inlines.is_empty()))
+        .count();
+    let marks_only = pieces
+        .iter()
+        .filter(|piece| matches!(piece, Piece::Text(inlines) if only_marks(inlines)))
+        .count();
+    if marks_only == 0 || texts == marks_only {
+        return;
+    }
+    let mut carried: Vec<Inline> = Vec::new();
+    for piece in pieces.iter_mut() {
+        if let Piece::Text(inlines) = piece {
+            if only_marks(inlines) {
+                carried.append(inlines);
+            } else if !inlines.is_empty() && !carried.is_empty() {
+                carried.append(inlines);
+                *inlines = std::mem::take(&mut carried);
+            }
+        }
+    }
+    if !carried.is_empty()
+        && let Some(Piece::Text(inlines)) = pieces
+            .iter_mut()
+            .rev()
+            .find(|piece| matches!(piece, Piece::Text(inlines) if !inlines.is_empty()))
+    {
+        inlines.append(&mut carried);
+    }
 }

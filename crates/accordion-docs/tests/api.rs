@@ -1646,8 +1646,15 @@ async fn opens_word_files_and_pages_with_docs() {
     ];
     let mut pictures = std::collections::HashMap::new();
     pictures.insert(photo.hash.clone(), photo.clone());
-    let word =
-        accordion_docs::docx::write(&blocks, &Default::default(), None, "Report", &pictures, &[]);
+    let word = accordion_docs::docx::write(
+        &blocks,
+        &Default::default(),
+        None,
+        "Report",
+        &pictures,
+        &[],
+        &[],
+    );
     let file = alex
         .create_file(my_drive, "Report.docx", word.as_slice())
         .await
@@ -1812,6 +1819,7 @@ async fn opens_opendocument_files_and_rich_text_with_docs() {
         "Plan",
         &Default::default(),
         &[],
+        &[],
     );
     let file = alex
         .create_file(my_drive, "Plan.odt", odt.as_slice())
@@ -1868,4 +1876,150 @@ async fn opens_opendocument_files_and_rich_text_with_docs() {
         .api(&server.alex, "POST", "/imports", Some(request(&fake.id)))
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{problem}");
+}
+
+#[tokio::test]
+async fn word_and_opendocument_files_bring_their_comments_both_ways() {
+    let server = start().await;
+    let my_drive = server.storage.top_folder(server.alex.id).await.unwrap();
+    let alex = server.as_person(&server.alex);
+    let text = |words: &str| Inline::Text(words.into(), Marks::default());
+    let blocks = vec![
+        Block::Paragraph(
+            Para::default(),
+            vec![
+                text("Café 🎉 "),
+                Inline::CommentStart("a".into()),
+                text("plan"),
+                Inline::CommentEnd("a".into()),
+                text(" for today"),
+            ],
+        ),
+        paragraph("Second"),
+    ];
+    let threads: Vec<accordion_docs::comments::Thread> = serde_json::from_value(json!([
+        {
+            "id": "a", "start": "AQ==", "end": "AQ==", "quote": "",
+            "comments": [
+                { "id": "1", "name": "Dana Elsewhere", "text": "Which plan?", "at": "2026-11-20T09:00:00Z" },
+                { "id": "2", "name": "Sam Elsewhere", "text": "The new one", "at": "2026-11-20T10:00:00Z" },
+            ],
+        },
+        {
+            "id": "b", "start": "AQ==", "end": "AQ==", "quote": "",
+            "resolved": { "name": "Dana Elsewhere", "at": "2026-11-21T09:00:00Z" },
+            "comments": [{ "id": "3", "name": "Dana Elsewhere", "text": "Its text is gone", "at": "2026-11-20T11:00:00Z" }],
+        },
+    ]))
+    .unwrap();
+    let request = |item: &ItemId| json!({ "item": item, "confirmed": false });
+    for (name, file) in [
+        (
+            "Plans.docx",
+            accordion_docs::docx::write(
+                &blocks,
+                &Default::default(),
+                None,
+                "Plans",
+                &Default::default(),
+                &[],
+                &threads,
+            ),
+        ),
+        (
+            "Plans.odt",
+            accordion_docs::odt::write(
+                &blocks,
+                &Default::default(),
+                None,
+                "Plans",
+                &Default::default(),
+                &[],
+                &threads,
+            ),
+        ),
+    ] {
+        let item = alex
+            .create_file(my_drive, name, file.as_slice())
+            .await
+            .unwrap();
+        // Comments come across, so there's nothing to warn about.
+        let (status, made) = server
+            .api(&server.alex, "POST", "/imports", Some(request(&item.id)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        assert_eq!(made["report"]["lost"], json!([]));
+        let id = made["document"]["id"].as_str().unwrap().to_owned();
+
+        // They're the document's threads, about the same text, from
+        // people known only by name.
+        let (status, view) = server
+            .api(
+                &server.alex,
+                "GET",
+                &format!("/documents/{id}/comments"),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        let listed = view["threads"].as_array().unwrap();
+        assert_eq!(listed.len(), 2, "{name}: {view}");
+        let plan = listed
+            .iter()
+            .find(|thread| thread["quote"] == "plan")
+            .unwrap_or_else(|| panic!("{name}: {view}"));
+        assert_eq!(plan["comments"][0]["name"], "Dana Elsewhere");
+        assert_eq!(plan["comments"][0]["text"], "Which plan?");
+        assert_eq!(plan["comments"][1]["text"], "The new one");
+        assert_eq!(plan["comments"][0]["mine"], false);
+        let gone = listed
+            .iter()
+            .find(|thread| thread["quote"] == "")
+            .unwrap_or_else(|| panic!("{name}: {view}"));
+        assert!(!gone["resolved"].is_null(), "{name}: {gone}");
+        // The file has the threads' positions in its co-editing state.
+        let file = server.file_text(&id).await;
+        assert!(html::state_in(file.as_bytes()).is_some());
+        assert_eq!(html::comments_in(file.as_bytes()).len(), 2);
+
+        // A reply here goes out with them when it's downloaded again.
+        let thread = plan["id"].as_str().unwrap();
+        let (status, replied) = server
+            .api(
+                &server.alex,
+                "POST",
+                &format!("/documents/{id}/comments/{thread}"),
+                Some(json!({ "text": "Agreed" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{replied}");
+        for format in ["docx", "odt"] {
+            let (status, _, downloaded) = server
+                .send(
+                    &server.alex,
+                    "GET",
+                    &format!("/documents/{id}/download?as={format}"),
+                    Vec::new(),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            let (read, report) = accordion_docs::import::convert(format, &downloaded).unwrap();
+            assert!(report.lost.is_empty(), "{report:?}");
+            assert_eq!(read.comments.len(), 2, "{name} as {format}");
+            let quotes = accordion_docs::model::comment_quotes(&read.blocks);
+            let again = read
+                .comments
+                .iter()
+                .find(|thread| quotes.get(&thread.id).map(String::as_str) == Some("plan"))
+                .unwrap_or_else(|| panic!("{name} as {format}: {quotes:?}"));
+            let texts: Vec<&str> = again
+                .comments
+                .iter()
+                .map(|comment| comment.text.as_str())
+                .collect();
+            assert_eq!(texts, ["Which plan?", "The new one", "Agreed"]);
+            assert_eq!(again.comments[2].name, "Alex Kim");
+            assert!(read.comments.iter().any(|thread| thread.resolved.is_some()));
+        }
+    }
 }

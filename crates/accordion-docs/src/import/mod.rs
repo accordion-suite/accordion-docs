@@ -16,6 +16,7 @@ use std::os::fd::AsFd;
 
 use serde::{Deserialize, Serialize};
 
+use crate::comments::{self, Comment, Mark, Thread};
 use crate::fonts::Replaced;
 use crate::html;
 use crate::model::{self, Block, Inline, Marks, PageSetup, PageSize, Para, Parts};
@@ -67,7 +68,6 @@ impl Report {
 pub enum Lost {
     /// Word's tracked changes, which are taken as accepted.
     TrackedChanges,
-    Comments,
     /// Text boxes, whose text becomes ordinary paragraphs.
     TextBoxes,
     /// Shapes, charts, SmartArt, and embedded objects.
@@ -101,6 +101,67 @@ pub struct Converted {
     pub parts: Parts,
     pub setup: Option<PageSetup>,
     pub pictures: Pictures,
+    /// Comment threads, whose text the blocks mark with
+    /// [`Inline::CommentStart`] and [`Inline::CommentEnd`]. Their
+    /// positions are made once the document is.
+    pub comments: Vec<Thread>,
+}
+
+/// A comment as a file has it.
+pub(crate) struct FileComment {
+    pub name: String,
+    pub text: String,
+    /// When it was written, as the file writes it.
+    pub at: Option<String>,
+}
+
+/// A thread of `comments` read from a file, the first one and its replies,
+/// by people who may have no account here, so only their names are kept.
+pub(crate) fn file_thread(comments: Vec<FileComment>, resolved: bool) -> Thread {
+    let comments: Vec<Comment> = comments
+        .into_iter()
+        .map(|comment| Comment {
+            id: comments::new_id(),
+            author: None,
+            name: comment.name.trim().to_owned(),
+            text: comment.text.trim().to_owned(),
+            at: comment
+                .at
+                .as_deref()
+                .and_then(file_time)
+                .unwrap_or_else(comments::now),
+            edited: None,
+            mentions: Vec::new(),
+        })
+        .collect();
+    let resolved = resolved.then(|| Mark {
+        by: None,
+        name: String::new(),
+        at: comments
+            .last()
+            .map(|comment| comment.at.clone())
+            .unwrap_or_else(comments::now),
+    });
+    Thread {
+        id: comments::new_id(),
+        start: String::new(),
+        end: String::new(),
+        quote: String::new(),
+        resolved,
+        comments,
+    }
+}
+
+/// A time a file writes, in RFC 3339. A time without a zone is taken as
+/// UTC, since there's no telling where it was written.
+fn file_time(at: &str) -> Option<String> {
+    let at = at.trim();
+    let time = at.parse::<jiff::Timestamp>().ok().or_else(|| {
+        at.parse::<jiff::civil::DateTime>()
+            .ok()
+            .and_then(|civil| jiff::tz::TimeZone::UTC.to_timestamp(civil).ok())
+    })?;
+    Some(time.round(jiff::Unit::Millisecond).ok()?.to_string())
 }
 
 /// Runs the command: reads the file on standard input, and writes the
@@ -131,12 +192,13 @@ pub fn main(mut args: impl Iterator<Item = std::ffi::OsString>) -> i32 {
             return 1;
         }
     };
-    let page = html::page(
+    let page = html::page_with_comments(
         &converted.blocks,
         &converted.parts,
         converted.setup.as_ref(),
         None,
         &converted.pictures,
+        &converted.comments,
     );
     let mut out = io::stdout().lock();
     let written = serde_json::to_writer(&mut out, &report)
@@ -202,6 +264,7 @@ fn page(contents: &[u8]) -> Converted {
         parts,
         setup,
         pictures,
+        comments: Vec::new(),
     }
 }
 
@@ -344,6 +407,126 @@ fn markdown(text: &str, report: &mut Report) -> Converted {
         html.push_str("</ol></section>");
     }
     page(html.as_bytes())
+}
+
+/// A document with comments, and what reading it back must find, for the
+/// Word and OpenDocument readers' tests.
+#[cfg(test)]
+pub(crate) mod comment_fixture {
+    use super::*;
+
+    fn comment(name: &str, text: &str, at: &str) -> Comment {
+        Comment {
+            id: comments::new_id(),
+            author: None,
+            name: name.into(),
+            text: text.into(),
+            at: at.into(),
+            edited: None,
+            mentions: Vec::new(),
+        }
+    }
+
+    fn thread(id: &str, resolved: bool, comments: Vec<Comment>) -> Thread {
+        Thread {
+            id: id.into(),
+            start: "AQ==".into(),
+            end: "AQ==".into(),
+            quote: String::new(),
+            resolved: resolved.then(|| Mark {
+                by: None,
+                name: "Dana Lee".into(),
+                at: "2026-11-25T12:00:00Z".into(),
+            }),
+            comments,
+        }
+    }
+
+    /// Two paragraphs with a comment on a word of each, a reply to the
+    /// first, the second resolved, and a third whose text is gone.
+    pub(crate) fn document() -> (Vec<Block>, Vec<Thread>) {
+        let text = |words: &str| Inline::Text(words.into(), Marks::default());
+        let blocks = vec![
+            Block::Paragraph(
+                Para::default(),
+                vec![
+                    text("Hello "),
+                    Inline::CommentStart("a".into()),
+                    text("big"),
+                    Inline::CommentEnd("a".into()),
+                    text(" world"),
+                ],
+            ),
+            Block::Paragraph(
+                Para::default(),
+                vec![
+                    Inline::CommentStart("b".into()),
+                    text("Second"),
+                    Inline::CommentEnd("b".into()),
+                    text(" line"),
+                ],
+            ),
+        ];
+        let threads = vec![
+            thread(
+                "a",
+                false,
+                vec![
+                    comment("Dana Lee", "First\nsecond line", "2026-11-25T10:00:00.250Z"),
+                    comment("Sam Kim", "Sure & <done>", "2026-11-25T11:00:00Z"),
+                ],
+            ),
+            thread(
+                "b",
+                true,
+                vec![comment("Dana Lee", "Fixed?", "2026-11-25T10:30:00Z")],
+            ),
+            thread(
+                "gone",
+                false,
+                vec![comment(
+                    "Sam Kim",
+                    "Its text is gone",
+                    "2026-11-25T09:00:00Z",
+                )],
+            ),
+        ];
+        (blocks, threads)
+    }
+
+    /// Checks that `read` has the fixture's threads, on the same text.
+    pub(crate) fn check(read: &Converted) {
+        assert_eq!(read.comments.len(), 3, "{:?}", read.comments);
+        let quotes = model::comment_quotes(&read.blocks);
+        let by_text = |text: &str| {
+            read.comments
+                .iter()
+                .find(|thread| thread.comments[0].text == text)
+                .unwrap_or_else(|| panic!("no thread starting {text:?}: {:?}", read.comments))
+        };
+        let a = by_text("First\nsecond line");
+        assert_eq!(a.comments.len(), 2);
+        assert_eq!(a.comments[0].name, "Dana Lee");
+        assert_eq!(a.comments[0].at, "2026-11-25T10:00:00Z");
+        assert_eq!(a.comments[1].name, "Sam Kim");
+        assert_eq!(a.comments[1].text, "Sure & <done>");
+        assert_eq!(a.comments[1].at, "2026-11-25T11:00:00Z");
+        assert!(a.resolved.is_none());
+        assert_eq!(quotes.get(&a.id).map(String::as_str), Some("big"));
+        let b = by_text("Fixed?");
+        assert!(b.resolved.is_some());
+        assert_eq!(quotes.get(&b.id).map(String::as_str), Some("Second"));
+        let gone = by_text("Its text is gone");
+        assert_eq!(quotes.get(&gone.id).map(String::as_str), Some(""));
+        let ranged = model::ranged_comments(&read.blocks);
+        assert!(ranged.contains(&a.id) && ranged.contains(&b.id));
+        // The text itself is as it was.
+        let mut plain = read.blocks.clone();
+        model::without_comment_marks(&mut plain);
+        let (mut written, _) = document();
+        model::without_comment_marks(&mut written);
+        assert_eq!(model::normalize(plain), model::normalize(written));
+    }
 }
 
 #[cfg(test)]

@@ -24,7 +24,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
-use crate::format::{DocFormat, new_document};
+use crate::format::{self, DocFormat, new_document};
 use crate::import::{self, Lost, Report};
 use crate::model;
 use crate::model::{PageSetup, PageSize};
@@ -537,6 +537,7 @@ async fn import(
         pictures,
         mut parts,
     } = html::read_document(page);
+    let threads = html::file_comments_in(page);
     // Pictures are checked and shrunk as pictures people add are.
     let mut kept = Pictures::new();
     let mut renamed: HashMap<String, Option<String>> = HashMap::new();
@@ -572,8 +573,26 @@ async fn import(
     ] {
         model::rename_images(part, &renamed);
     }
-    let blocks = model::normalize(blocks);
-    let file = html::page(&blocks, &parts, setup.as_ref(), None, &kept).into_bytes();
+    let mut blocks = model::normalize(blocks);
+    for part in [
+        &mut parts.header,
+        &mut parts.footer,
+        &mut parts.first_header,
+        &mut parts.first_footer,
+    ] {
+        model::without_comment_marks(part);
+    }
+    let parts = parts.normalized();
+    // Comments need positions in the co-editing state, so a document with
+    // them gets its state now. One without them gets its state when it's
+    // first opened, as a new document does.
+    let file = if threads.is_empty() {
+        model::without_comment_marks(&mut blocks);
+        let blocks = model::normalize(blocks);
+        html::page(&blocks, &parts, setup.as_ref(), None, &kept).into_bytes()
+    } else {
+        format::file_with_comments(&blocks, &parts, setup.as_ref(), &kept, threads)
+    };
     if file.len() as u64 > MAX_FILE {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -984,6 +1003,11 @@ async fn download(
         }
     };
     let (item, contents) = current_contents(&state, id, item).await?;
+    let threads = if matches!(query.format.as_str(), "docx" | "odt") {
+        comments::threads_of(&state, &item).await?
+    } else {
+        Vec::new()
+    };
     let title = stem(&item.name).to_owned();
     let name = format!("{title}.{}", query.format);
     let file = if query.format == "html" {
@@ -995,15 +1019,36 @@ async fn download(
         let pages = contents_pages(query.pages.as_deref());
         tokio::task::spawn_blocking(move || {
             let html::Document {
-                blocks,
+                mut blocks,
                 setup,
                 pictures,
                 parts,
             } = html::read_document(&contents);
+            if !threads.is_empty()
+                && let Some(marked) = format::blocks_with_comments(&contents, &blocks, &threads)
+            {
+                blocks = marked;
+            }
             match format.as_str() {
                 "md" => markdown::write(&blocks, &pictures).into_bytes(),
-                "docx" => docx::write(&blocks, &parts, setup.as_ref(), &title, &pictures, &pages),
-                _ => odt::write(&blocks, &parts, setup.as_ref(), &title, &pictures, &pages),
+                "docx" => docx::write(
+                    &blocks,
+                    &parts,
+                    setup.as_ref(),
+                    &title,
+                    &pictures,
+                    &pages,
+                    &threads,
+                ),
+                _ => odt::write(
+                    &blocks,
+                    &parts,
+                    setup.as_ref(),
+                    &title,
+                    &pictures,
+                    &pages,
+                    &threads,
+                ),
             }
         })
         .await

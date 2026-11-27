@@ -21,6 +21,7 @@
 //! | [`Block::Contents`] | `table_of_contents` (`style`) | `<nav data-contents>` |
 //! | [`Inline::Break`] | `hard_break` | `<br>` |
 //! | [`Inline::Footnote`] | `footnote` (its text inside) | `<sup><a data-footnote-ref>` |
+//! | [`Inline::CommentStart`], [`Inline::CommentEnd`] | none | `<span data-comment-start>`, `<span data-comment-end>` |
 //!
 //! A footnote holds its own text, so it moves, copies, and goes with its
 //! number. Files show the number where the footnote is, and the notes in a
@@ -57,6 +58,8 @@
 //! [`normalize`] makes any list of blocks one the editor accepts, the way
 //! ProseMirror's content rules would, so a document read from HTML or from a
 //! co-editing state never makes the editor throw content away.
+
+use std::collections::{HashMap, HashSet};
 
 use crate::fonts;
 use crate::style::{self, Color, HalfPoints};
@@ -235,6 +238,73 @@ pub fn footnotes(blocks: &[Block]) -> Vec<&[Inline]> {
     out
 }
 
+/// The comment threads whose text starts and then ends in `blocks`, once
+/// each. Word and OpenDocument files mark only these as stretches of text.
+pub fn ranged_comments(blocks: &[Block]) -> HashSet<String> {
+    // How many starts and ends each thread has, and whether it started
+    // first.
+    let mut seen: HashMap<&str, (u32, u32, bool)> = HashMap::new();
+    for_inlines(blocks, &mut |inlines| {
+        for inline in inlines {
+            match inline {
+                Inline::CommentStart(thread) => {
+                    let counts = seen.entry(thread).or_insert((0, 0, true));
+                    counts.0 += 1;
+                }
+                Inline::CommentEnd(thread) => {
+                    let counts = seen.entry(thread).or_insert((0, 0, false));
+                    counts.1 += 1;
+                }
+                _ => {}
+            }
+        }
+    });
+    seen.into_iter()
+        .filter(|(_, counts)| *counts == (1, 1, true))
+        .map(|(thread, _)| thread.to_owned())
+        .collect()
+}
+
+/// The text each comment thread in `blocks` is about, by its ID, with
+/// lines apart, as the editor quotes it.
+pub fn comment_quotes(blocks: &[Block]) -> HashMap<String, String> {
+    let mut open: Vec<String> = Vec::new();
+    let mut quotes: HashMap<String, String> = HashMap::new();
+    let mut first = true;
+    for_inlines(blocks, &mut |inlines| {
+        if !first {
+            for thread in &open {
+                quotes.entry(thread.clone()).or_default().push('\n');
+            }
+        }
+        first = false;
+        for inline in inlines {
+            match inline {
+                Inline::CommentStart(thread) => {
+                    open.push(thread.clone());
+                    quotes.entry(thread.clone()).or_default();
+                }
+                Inline::CommentEnd(thread) => open.retain(|open| open != thread),
+                Inline::Text(text, _) => {
+                    for thread in &open {
+                        quotes.entry(thread.clone()).or_default().push_str(text);
+                    }
+                }
+                Inline::Break => {
+                    for thread in &open {
+                        quotes.entry(thread.clone()).or_default().push('\n');
+                    }
+                }
+                Inline::Footnote(_) => {}
+            }
+        }
+    });
+    quotes
+        .into_iter()
+        .map(|(thread, quote)| (thread, quote.trim().to_owned()))
+        .collect()
+}
+
 /// Calls `visit` with each paragraph's and heading's text in `blocks`, in
 /// order.
 fn for_inlines<'a>(blocks: &'a [Block], visit: &mut dyn FnMut(&'a [Inline])) {
@@ -336,6 +406,13 @@ pub enum Inline {
     /// A footnote: its number where it stands, and its text, which has no
     /// footnotes of its own, at the bottom of the page.
     Footnote(Vec<Inline>),
+    /// Where a comment thread's text starts, by the thread's ID. Documents
+    /// keep where their threads are as co-editing positions
+    /// ([`crate::comments`]), so only Word and OpenDocument files, being
+    /// written or opened, have these.
+    CommentStart(String),
+    /// Where a comment thread's text ends.
+    CommentEnd(String),
 }
 
 /// How a paragraph's lines line up.
@@ -755,6 +832,42 @@ pub fn image_hashes(blocks: &[Block]) -> Vec<String> {
 /// Gives each picture in `blocks` its new hash from `renamed`, and leaves
 /// out pictures whose new hash is `None`, such as ones that turned out not
 /// to be pictures. Pictures `renamed` doesn't name stay as they are.
+/// `blocks` without comment marks, for a document's own file, which keeps
+/// where its threads are as co-editing positions instead.
+pub fn without_comment_marks(blocks: &mut [Block]) {
+    let clean = |inlines: &mut Vec<Inline>| {
+        inlines.retain(|inline| !matches!(inline, Inline::CommentStart(_) | Inline::CommentEnd(_)));
+    };
+    for block in blocks {
+        match block {
+            Block::Paragraph(_, inlines) | Block::Heading(_, _, inlines) => clean(inlines),
+            Block::Quote(blocks) => without_comment_marks(blocks),
+            Block::Bullets(_, items) | Block::Numbers(_, _, items) => {
+                items
+                    .iter_mut()
+                    .for_each(|item| without_comment_marks(item));
+            }
+            Block::Checks(items) => {
+                items
+                    .iter_mut()
+                    .for_each(|(_, item)| without_comment_marks(item));
+            }
+            Block::Table(rows) => {
+                for row in rows {
+                    for cell in &mut row.cells {
+                        without_comment_marks(&mut cell.content);
+                    }
+                }
+            }
+            Block::Code(_)
+            | Block::Rule(_)
+            | Block::Image(_)
+            | Block::PageBreak
+            | Block::Contents(_) => {}
+        }
+    }
+}
+
 pub fn rename_images(
     blocks: &mut Vec<Block>,
     renamed: &std::collections::HashMap<String, Option<String>>,
@@ -826,7 +939,7 @@ pub fn any_marks(blocks: &[Block], test: &dyn Fn(&Marks) -> bool) -> bool {
             Inline::Footnote(text) => text
                 .iter()
                 .any(|inline| matches!(inline, Inline::Text(_, marks) if test(marks))),
-            Inline::Break => false,
+            Inline::Break | Inline::CommentStart(_) | Inline::CommentEnd(_) => false,
         })
     };
     blocks.iter().any(|block| match block {
@@ -1231,18 +1344,19 @@ pub fn normalize_inlines(inlines: Vec<Inline>) -> Vec<Inline> {
             }
             Inline::Break => out.push(Inline::Break),
             Inline::Footnote(text) => out.push(Inline::Footnote(footnote_text(text))),
+            marker @ (Inline::CommentStart(_) | Inline::CommentEnd(_)) => out.push(marker),
         }
     }
     out
 }
 
 /// A footnote's text as the editor keeps it: text and line breaks, with no
-/// footnotes or page numbers in it.
+/// footnotes, page numbers, or comments in it.
 fn footnote_text(text: Vec<Inline>) -> Vec<Inline> {
     normalize_inlines(
         text.into_iter()
             .filter_map(|inline| match inline {
-                Inline::Footnote(_) => None,
+                Inline::Footnote(_) | Inline::CommentStart(_) | Inline::CommentEnd(_) => None,
                 Inline::Text(text, marks) => Some(Inline::Text(
                     text,
                     Marks {
@@ -1304,7 +1418,7 @@ fn plain(inlines: &[Inline]) -> String {
         .map(|inline| match inline {
             Inline::Text(text, _) => text.as_str(),
             Inline::Break => " ",
-            Inline::Footnote(_) => "",
+            Inline::Footnote(_) | Inline::CommentStart(_) | Inline::CommentEnd(_) => "",
         })
         .collect()
 }

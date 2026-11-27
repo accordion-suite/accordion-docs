@@ -7,20 +7,26 @@
 //! quotes, code, lines, tables with merged cells, borders, colors, and
 //! column widths, links, pictures, footnotes, headers and footers with page
 //! numbers and counts, a table of contents, page breaks, and the paper and
-//! margins. Anything else is left out or made plainer, and the [`Report`]
-//! says what, for the warning before converting.
+//! margins. Comments come too, with their replies, as Google Docs and
+//! Word write them, each about the text it was about. Anything else is
+//! left out or made plainer, and the [`Report`] says what, for the warning
+//! before converting.
 //!
 //! A Word file Docs wrote comes back as it was: Docs' own styles, list
 //! numberings, and table style read as Docs' defaults.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufReader, Cursor, Read};
 
 use zip::ZipArchive;
 
-use super::flat::{self, Flat, ListKind, ListRef, Role, bullet_kind, format_number, group, unbold};
+use super::flat::{
+    self, Flat, ListKind, ListRef, Piece, Role, bullet_kind, format_number, group,
+    move_comment_marks, unbold,
+};
 use super::xml::{self, Element, Node, Ns};
-use super::{Converted, Lost, Report};
+use super::{Converted, FileComment, Lost, Report, file_thread};
+use crate::comments::Thread;
 use crate::model::{
     self, Align, Block, Cell, ContentsStyle, Field, Image, Inline, Kind, ListStyle, Marks,
     PageSetup, PageSize, Para, Parts, Row, Rule, Script, Twips,
@@ -92,6 +98,17 @@ pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Converted, Strin
             notes.insert((endnote, id), (note, path.clone(), note_relations.clone()));
         }
     }
+    let mut part_of = |kind: &str| match by_kind(kind) {
+        Some(path) => package.part(&path),
+        None => Ok(None),
+    };
+    let comment_parts = [
+        part_of("comments")?,
+        part_of("commentsExtended")?,
+        part_of("commentsIds")?,
+        part_of("commentsExtensible")?,
+    ];
+    let (threads, comment_threads) = comments(comment_parts);
     let even_pages = match by_kind("settings") {
         Some(path) => package
             .part(&path)?
@@ -116,6 +133,9 @@ pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Converted, Strin
         fonts: BTreeSet::new(),
         lost: BTreeSet::new(),
         in_note: false,
+        comment_threads,
+        placed: HashSet::new(),
+        between: Vec::new(),
     };
     let body = document
         .child(Ns::W, "body")
@@ -216,7 +236,169 @@ pub(crate) fn read(bytes: &[u8], report: &mut Report) -> Result<Converted, Strin
         parts,
         setup,
         pictures: reader.pictures,
+        comments: threads,
     })
+}
+
+/// The file's comments as threads, from its comments part, and the parts
+/// Word 2013 and later add: which comment answers which and which are done
+/// (`commentsExtended`), and each one's time in UTC (`commentsIds` and
+/// `commentsExtensible`), since `w:date` is the writer's local time in
+/// Word's files. Also the thread each first comment's ID starts, for the
+/// marks in the text; replies have their own marks, which Docs skips.
+fn comments(parts: [Option<Element>; 4]) -> (Vec<Thread>, HashMap<String, Option<String>>) {
+    let [comments, extended, ids, extensible] = parts;
+    let Some(comments) = comments else {
+        return (Vec::new(), HashMap::new());
+    };
+    // Each comment's ID, its last paragraph's ID, and what it says.
+    let mut read: Vec<(String, Option<String>, FileComment)> = Vec::new();
+    for comment in comments.elements().filter(|e| e.is(Ns::W, "comment")) {
+        let Some(id) = comment.attr(Ns::W, "id") else {
+            continue;
+        };
+        let paragraphs = comment.descendants(Ns::W, "p");
+        let paragraph = paragraphs
+            .last()
+            .and_then(|p| p.attr(Ns::W14, "paraId"))
+            .map(str::to_ascii_uppercase);
+        let text: Vec<String> = paragraphs.iter().map(|p| comment_text(p)).collect();
+        read.push((
+            id.to_owned(),
+            paragraph,
+            FileComment {
+                name: comment.attr(Ns::W, "author").unwrap_or_default().to_owned(),
+                text: text.join("\n"),
+                at: comment.attr(Ns::W, "date").map(str::to_owned),
+            },
+        ));
+    }
+    // Which paragraph each answers, and whether it's done, by paragraph.
+    let mut answers: HashMap<String, String> = HashMap::new();
+    let mut done: HashSet<String> = HashSet::new();
+    for entry in extended.iter().flat_map(|root| root.elements()) {
+        let Some(paragraph) = entry.attr(Ns::W15, "paraId") else {
+            continue;
+        };
+        let paragraph = paragraph.to_ascii_uppercase();
+        if let Some(parent) = entry.attr(Ns::W15, "paraIdParent") {
+            answers.insert(paragraph.clone(), parent.to_ascii_uppercase());
+        }
+        if entry.attr(Ns::W15, "done") == Some("1") {
+            done.insert(paragraph);
+        }
+    }
+    let mut durable: HashMap<String, String> = HashMap::new();
+    for entry in ids.iter().flat_map(|root| root.elements()) {
+        if let (Some(paragraph), Some(id)) = (
+            entry.attr(Ns::W16Cid, "paraId"),
+            entry.attr(Ns::W16Cid, "durableId"),
+        ) {
+            durable.insert(paragraph.to_ascii_uppercase(), id.to_ascii_uppercase());
+        }
+    }
+    let mut utc: HashMap<String, String> = HashMap::new();
+    for entry in extensible.iter().flat_map(|root| root.elements()) {
+        if let (Some(id), Some(at)) = (
+            entry.attr(Ns::W16Cex, "durableId"),
+            entry.attr(Ns::W16Cex, "dateUtc"),
+        ) {
+            utc.insert(id.to_ascii_uppercase(), at.to_owned());
+        }
+    }
+    let by_paragraph: HashMap<&str, usize> = read
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, paragraph, _))| Some((paragraph.as_deref()?, index)))
+        .collect();
+    // Each comment's first comment: itself, or the one its answers lead to.
+    let first_of = |index: usize| {
+        let mut at = index;
+        for _ in 0..read.len() {
+            let Some(parent) = read[at]
+                .1
+                .as_ref()
+                .and_then(|paragraph| answers.get(paragraph))
+                .and_then(|parent| by_paragraph.get(parent.as_str()))
+            else {
+                break;
+            };
+            if *parent == at {
+                break;
+            }
+            at = *parent;
+        }
+        at
+    };
+    let firsts: Vec<usize> = (0..read.len()).map(first_of).collect();
+    let mut grouped: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (index, first) in firsts.iter().enumerate() {
+        match grouped.iter_mut().find(|(top, _)| top == first) {
+            Some((_, members)) => members.push(index),
+            None => grouped.push((*first, vec![index])),
+        }
+    }
+    let mut by_word_id: HashMap<String, Option<String>> = HashMap::new();
+    let mut taken: Vec<Option<FileComment>> = Vec::new();
+    let mut keys = Vec::new();
+    for (id, paragraph, comment) in read {
+        keys.push((id, paragraph));
+        taken.push(Some(comment));
+    }
+    let mut threads = Vec::new();
+    for (first, mut members) in grouped {
+        // The first comment leads, whatever the order in the file.
+        members.sort_by_key(|member| (*member != first, *member));
+        let resolved = members.iter().any(|member| {
+            keys[*member]
+                .1
+                .as_ref()
+                .is_some_and(|paragraph| done.contains(paragraph))
+        });
+        let comments: Vec<FileComment> = members
+            .iter()
+            .filter_map(|member| {
+                let mut comment = taken[*member].take()?;
+                if let Some(at) = keys[*member]
+                    .1
+                    .as_ref()
+                    .and_then(|paragraph| durable.get(paragraph))
+                    .and_then(|id| utc.get(id))
+                {
+                    comment.at = Some(at.clone());
+                }
+                Some(comment)
+            })
+            .collect();
+        let thread = file_thread(comments, resolved);
+        for member in &members {
+            let thread_id = (*member == first).then(|| thread.id.clone());
+            by_word_id.insert(keys[*member].0.clone(), thread_id);
+        }
+        threads.push(thread);
+    }
+    (threads, by_word_id)
+}
+
+/// A comment paragraph's text, with tabs and line breaks.
+fn comment_text(paragraph: &Element) -> String {
+    let mut text = String::new();
+    let mut waiting: Vec<&Element> = paragraph.elements().collect();
+    waiting.reverse();
+    while let Some(element) = waiting.pop() {
+        match (element.ns, element.name.as_str()) {
+            (Some(Ns::W), "t") => text.push_str(&element.text()),
+            (Some(Ns::W), "tab") => text.push(' '),
+            (Some(Ns::W), "br" | "cr") => text.push('\n'),
+            (Some(Ns::W), "del" | "delText" | "instrText") => {}
+            _ => {
+                let start = waiting.len();
+                waiting.extend(element.elements());
+                waiting[start..].reverse();
+            }
+        }
+    }
+    text
 }
 
 /// The paper and margins of a section's `w:sectPr`.
@@ -978,11 +1160,6 @@ struct Pieces {
     shown: bool,
 }
 
-enum Piece {
-    Text(Vec<Inline>),
-    Block(Block),
-}
-
 impl Pieces {
     fn block(&mut self, block: Block) {
         let inlines = std::mem::take(&mut self.inlines);
@@ -1028,6 +1205,12 @@ struct Reader<'a> {
     lost: BTreeSet<Lost>,
     /// In a footnote, which has no pictures, footnotes, or page breaks.
     in_note: bool,
+    /// The thread each comment's ID starts, or `None` for a reply.
+    comment_threads: HashMap<String, Option<String>>,
+    /// The threads whose start has been read.
+    placed: HashSet<String>,
+    /// Comment marks between paragraphs, for the next one.
+    between: Vec<Inline>,
 }
 
 impl Reader<'_> {
@@ -1046,6 +1229,11 @@ impl Reader<'_> {
     fn block(&mut self, element: &Element, context: &Context, out: &mut Vec<Flat>) {
         match (element.ns, element.name.as_str()) {
             (Some(Ns::W), "p") => self.paragraph(element, context, out),
+            (Some(Ns::W), "commentRangeStart" | "commentRangeEnd") => {
+                let mut marks = Vec::new();
+                self.comment_mark(element, &mut marks);
+                self.between.extend(marks);
+            }
             (Some(Ns::W), "tbl") => {
                 if let Some(table) = self.table(element) {
                     out.push(Flat::plain(table));
@@ -1192,7 +1380,10 @@ impl Reader<'_> {
             role,
             link: None,
         };
-        let mut pieces = Pieces::default();
+        let mut pieces = Pieces {
+            inlines: std::mem::take(&mut self.between),
+            ..Pieces::default()
+        };
         if let Some(label) = label.filter(|label| !label.is_empty()) {
             pieces
                 .inlines
@@ -1250,6 +1441,8 @@ impl Reader<'_> {
             return;
         }
 
+        // Comment marks alone go with the text beside them.
+        move_comment_marks(&mut pieces_out);
         // Empty text around a picture or a break isn't a line of its own.
         let has_blocks = pieces_out
             .iter()
@@ -1289,6 +1482,35 @@ impl Reader<'_> {
             }
         }
         out.extend(after);
+    }
+
+    /// Where a comment's text starts or ends, or, for a comment marked
+    /// only where it is, both there. Replies' marks are their thread's.
+    fn comment_mark(&mut self, element: &Element, inlines: &mut Vec<Inline>) {
+        if self.in_note {
+            return;
+        }
+        let Some(Some(thread)) = element
+            .attr(Ns::W, "id")
+            .and_then(|id| self.comment_threads.get(id))
+            .cloned()
+        else {
+            return;
+        };
+        match element.name.as_str() {
+            "commentRangeStart" => {
+                if self.placed.insert(thread.clone()) {
+                    inlines.push(Inline::CommentStart(thread));
+                }
+            }
+            "commentRangeEnd" => inlines.push(Inline::CommentEnd(thread)),
+            _ => {
+                if self.placed.insert(thread.clone()) {
+                    inlines.push(Inline::CommentStart(thread.clone()));
+                    inlines.push(Inline::CommentEnd(thread));
+                }
+            }
+        }
     }
 
     /// A paragraph's layout in Docs' terms, leaving out what Docs gives it
@@ -1530,8 +1752,8 @@ impl Reader<'_> {
                         self.inlines(&content.children, context, pieces);
                     }
                 }
-                (Some(Ns::W), "commentRangeStart" | "commentReference") => {
-                    self.lost.insert(Lost::Comments);
+                (Some(Ns::W), "commentRangeStart" | "commentRangeEnd" | "commentReference") => {
+                    self.comment_mark(element, &mut pieces.inlines);
                 }
                 (Some(Ns::M), "oMath" | "oMathPara") => {
                     self.lost.insert(Lost::Equations);
@@ -1815,9 +2037,7 @@ impl Reader<'_> {
                     pieces.inlines.push(Inline::Footnote(text));
                 }
             }
-            "commentReference" => {
-                self.lost.insert(Lost::Comments);
-            }
+            "commentReference" => self.comment_mark(element, &mut pieces.inlines),
             "ruby" => {
                 if let Some(base) = element.child(Ns::W, "rubyBase") {
                     for run in base.elements().filter(|e| e.is(Ns::W, "r")) {
@@ -2310,12 +2530,90 @@ mod tests {
         setup: &PageSetup,
         pictures: &Pictures,
     ) -> (Converted, Report) {
-        let file = docx::write(blocks, parts, Some(setup), "Test", pictures, &[]);
+        let file = docx::write(blocks, parts, Some(setup), "Test", pictures, &[], &[]);
         let mut report = Report::default();
         let mut read = read(&file, &mut report).expect("Docs reads its own Word files");
         read.blocks = model::normalize(read.blocks);
         read.parts = read.parts.normalized();
         (read, report)
+    }
+
+    #[test]
+    fn comments_come_back_from_docs_word_files() {
+        let (blocks, threads) = super::super::comment_fixture::document();
+        let file = docx::write(
+            &blocks,
+            &Parts::default(),
+            None,
+            "Test",
+            &Pictures::new(),
+            &[],
+            &threads,
+        );
+        let mut report = Report::default();
+        let mut read = read(&file, &mut report).unwrap();
+        read.blocks = model::normalize(read.blocks);
+        super::super::comment_fixture::check(&read);
+    }
+
+    #[test]
+    fn reads_comments_as_google_docs_and_word_write_them() {
+        // Google Docs: times in UTC. Word: local times in `w:date`, with
+        // UTC ones by durable ID, and replies through commentsExtended.
+        let document = format!(
+            "<w:document {W} xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\"><w:body>\
+             <w:commentRangeStart w:id=\"5\"/>\
+             <w:p><w:r><w:t>Plan</w:t></w:r><w:commentRangeEnd w:id=\"5\"/><w:r><w:commentReference w:id=\"5\"/></w:r>\
+             <w:commentRangeStart w:id=\"6\"/><w:r><w:t xml:space=\"preserve\"> for </w:t></w:r>\
+             <w:commentRangeStart w:id=\"7\"/><w:r><w:t>today</w:t></w:r><w:commentRangeEnd w:id=\"7\"/>\
+             <w:commentRangeEnd w:id=\"6\"/><w:r><w:commentReference w:id=\"6\"/></w:r><w:r><w:commentReference w:id=\"7\"/></w:r></w:p>\
+             </w:body></w:document>"
+        );
+        let comments = "<w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+             xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\">\
+             <w:comment w:id=\"5\" w:author=\"Project Spectacles\" w:date=\"2026-11-24T07:45:18Z\">\
+             <w:p w14:paraId=\"00000022\"><w:r><w:t>On the first line &quot;Plan&quot;</w:t></w:r></w:p></w:comment>\
+             <w:comment w:id=\"6\" w:author=\"Dana Lee\" w:date=\"2026-11-24T09:00:00Z\">\
+             <w:p w14:paraId=\"1A2B3C4D\"><w:r><w:annotationRef/></w:r><w:r><w:t>Which day?</w:t></w:r></w:p></w:comment>\
+             <w:comment w:id=\"7\" w:author=\"Sam Kim\" w:date=\"2026-11-24T10:00:00Z\">\
+             <w:p><w:r><w:t>Today</w:t></w:r></w:p><w:p w14:paraId=\"5E6F7A8B\"><w:r><w:t>at noon</w:t></w:r></w:p></w:comment>\
+             </w:comments>";
+        let extended = "<w15:commentsEx xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\">\
+             <w15:commentEx w15:paraId=\"00000022\" w15:done=\"0\"/>\
+             <w15:commentEx w15:paraId=\"1A2B3C4D\" w15:done=\"1\"/>\
+             <w15:commentEx w15:paraId=\"5E6F7A8B\" w15:paraIdParent=\"1a2b3c4d\" w15:done=\"0\"/></w15:commentsEx>";
+        let ids = "<w16cid:commentsIds xmlns:w16cid=\"http://schemas.microsoft.com/office/word/2016/wordml/cid\">\
+             <w16cid:commentId w16cid:paraId=\"5E6F7A8B\" w16cid:durableId=\"0F1E2D3C\"/></w16cid:commentsIds>";
+        let extensible = "<w16cex:commentsExtensible xmlns:w16cex=\"http://schemas.microsoft.com/office/word/2018/wordml/cex\">\
+             <w16cex:commentExtensible w16cex:durableId=\"0F1E2D3C\" w16cex:dateUtc=\"2026-11-24T15:00:00Z\"/></w16cex:commentsExtensible>";
+        let file = word_file(
+            &document,
+            &[
+                ("word/comments.xml", comments),
+                ("word/commentsExtended.xml", extended),
+                ("word/commentsIds.xml", ids),
+                ("word/commentsExtensible.xml", extensible),
+            ],
+        );
+        let mut report = Report::default();
+        let read = read(&file, &mut report).unwrap();
+        assert!(report.lost.is_empty(), "{report:?}");
+        assert_eq!(read.comments.len(), 2);
+        let first = &read.comments[0];
+        assert_eq!(first.comments[0].name, "Project Spectacles");
+        assert_eq!(first.comments[0].text, "On the first line \"Plan\"");
+        assert!(first.resolved.is_none());
+        let second = &read.comments[1];
+        assert!(second.resolved.is_some());
+        assert_eq!(second.comments.len(), 2);
+        assert_eq!(second.comments[1].text, "Today\nat noon");
+        assert_eq!(second.comments[1].at, "2026-11-24T15:00:00Z");
+        let quotes = model::comment_quotes(&read.blocks);
+        assert_eq!(quotes[&first.id], "Plan");
+        // The reply's own marks are left out: the thread is about the
+        // first comment's text.
+        assert_eq!(quotes[&second.id], "for today");
+        assert_eq!(quotes.len(), 2);
     }
 
     #[test]
@@ -2508,7 +2806,8 @@ mod tests {
             let kind = match kind {
                 "theme/theme" => "theme",
                 "header" | "footer" | "styles" | "numbering" | "footnotes" | "endnotes"
-                | "settings" | "comments" => kind,
+                | "settings" | "comments" | "commentsExtended" | "commentsIds"
+                | "commentsExtensible" => kind,
                 _ => continue,
             };
             relations.push_str(&format!(
@@ -2620,7 +2919,6 @@ mod tests {
             lost,
             [
                 Lost::TrackedChanges,
-                Lost::Comments,
                 Lost::TextBoxes,
                 Lost::Equations,
                 Lost::Fields,
