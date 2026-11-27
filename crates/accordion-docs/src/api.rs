@@ -18,7 +18,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,7 @@ use crate::picture::{self, Picture, Pictures};
 use crate::{DocsState, PLACE, docx, html, markdown, odt};
 
 mod comments;
+mod versions;
 
 pub(crate) fn routes(state: DocsState) -> Router {
     Router::new()
@@ -59,6 +60,20 @@ pub(crate) fn routes(state: DocsState) -> Router {
         .route(
             "/documents/{id}/comments/{thread}/{comment}",
             patch(comments::edit).delete(comments::remove),
+        )
+        .route("/documents/{id}/versions", get(versions::list))
+        .route("/documents/{id}/versions/{version}", get(versions::show))
+        .route(
+            "/documents/{id}/versions/{version}/name",
+            put(versions::name).delete(versions::unname),
+        )
+        .route(
+            "/documents/{id}/versions/{version}/restore",
+            post(versions::restore),
+        )
+        .route(
+            "/documents/{id}/versions/{version}/copy",
+            post(versions::copy),
         )
         .route("/imports", post(import))
         .with_state(state)
@@ -338,19 +353,7 @@ async fn copy(
     Json(request): Json<CopyRequest>,
 ) -> Result<(StatusCode, Json<DocumentView>), ApiError> {
     let (item, _) = reach(&state, &me, id).await?;
-    let name = request.name.trim();
-    if name.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "Give the copy a name, then try again.",
-        ));
-    }
-    let stem = match name.len().checked_sub(".html".len()) {
-        Some(end) if name.is_char_boundary(end) && name[end..].eq_ignore_ascii_case(".html") => {
-            &name[..end]
-        }
-        _ => name,
-    };
+    let stem = copy_stem(&request.name)?;
     // The copy has what's been typed up to now.
     let (_, contents) = current_contents(&state, id, item.clone()).await?;
     // Left out, the comments go from the copy's file too.
@@ -359,6 +362,38 @@ async fn copy(
     } else {
         html::with_comments(&contents, &[])
     };
+    make_copy(&state, &me, &item, stem, without_comments).await
+}
+
+/// A copy's name without `.html`, which it gets back when it's made.
+fn copy_stem(name: &str) -> Result<&str, ApiError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Give the copy a name, then try again.",
+        ));
+    }
+    Ok(match name.len().checked_sub(".html".len()) {
+        Some(end) if name.is_char_boundary(end) && name[end..].eq_ignore_ascii_case(".html") => {
+            &name[..end]
+        }
+        _ => name,
+    })
+}
+
+/// Makes a copy of `item` named `stem`, numbered if that's taken, with
+/// `contents` as its file, or the item's own file if `None`. It goes beside
+/// the original if the person can add to that folder, and to the top of
+/// their Docs place if not.
+async fn make_copy(
+    state: &DocsState,
+    me: &SignedIn,
+    item: &Item,
+    stem: &str,
+    without_comments: Option<Vec<u8>>,
+) -> Result<(StatusCode, Json<DocumentView>), ApiError> {
+    let id = item.id;
     let here = match item.parent {
         Some(parent) => state.storage.access(me.user.id, parent).await?,
         None => None,
@@ -367,7 +402,7 @@ async fn copy(
         (Some(parent), Some(access)) if access >= Access::Editor => parent,
         _ => state.storage.place_folder(me.user.id, PLACE.id).await?,
     };
-    let storage = state.storage.acting_as(accordion_module::auth::actor(&me));
+    let storage = state.storage.acting_as(accordion_module::auth::actor(me));
     let mut copied = None;
     for number in 1..=100 {
         let name = match number {
@@ -414,7 +449,7 @@ async fn copy(
     };
     Ok((
         StatusCode::CREATED,
-        Json(DocumentView::new(&state, copy, access_name(access), owner)),
+        Json(DocumentView::new(state, copy, access_name(access), owner)),
     ))
 }
 

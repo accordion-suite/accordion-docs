@@ -104,6 +104,19 @@ impl Format for DocFormat {
         )
         .into_bytes())
     }
+
+    /// The same text, page setup, and headers and footers. The states in
+    /// two files differ whenever one was written elsewhere, such as a
+    /// restored version, and the comments are Docs' own, not the file's.
+    fn same_document(&self, written: &[u8], contents: &[u8]) -> bool {
+        if written == contents {
+            return true;
+        }
+        let (written, contents) = (html::read_document(written), html::read_document(contents));
+        written.blocks == contents.blocks
+            && written.setup == contents.setup
+            && written.parts == contents.parts
+    }
 }
 
 /// How many blocks at the start, and then at the end, are the same in both.
@@ -222,6 +235,43 @@ pub(crate) fn file_with_comments(
         &comments::checked(threads),
     )
     .into_bytes()
+}
+
+/// A version of a document's file as a co-editing state made through the
+/// schema, for the history page to show, with the pictures it shows. The
+/// file's own state isn't used: it carries every deletion ever made, and
+/// after a change from outside Docs it can differ from the file's text.
+pub(crate) fn version_state(contents: &[u8]) -> (Vec<u8>, Pictures) {
+    let html::Document {
+        blocks,
+        setup,
+        pictures,
+        parts,
+    } = html::read_document(contents);
+    let doc = Doc::with_options(Options {
+        offset_kind: OffsetKind::Bytes,
+        ..Options::default()
+    });
+    yjs::write_parts(&doc, &parts);
+    let fragment = doc.get_or_insert_xml_fragment(yjs::FRAGMENT);
+    let page = doc.get_or_insert_map(yjs::PAGE);
+    let mut txn = doc.transact_mut();
+    yjs::write_page(&mut txn, &page, setup.as_ref());
+    yjs::insert_blocks(&mut txn, &fragment, 0, &blocks);
+    let state = txn.encode_state_as_update_v1(&StateVector::default());
+    (state, pictures)
+}
+
+/// A new document's file from a version of another's, through the schema,
+/// so it has none of the version's comments or co-editing state.
+pub(crate) fn file_from_version(contents: &[u8]) -> Vec<u8> {
+    let html::Document {
+        blocks,
+        setup,
+        pictures,
+        parts,
+    } = html::read_document(contents);
+    html::page(&blocks, &parts, setup.as_ref(), None, &pictures).into_bytes()
 }
 
 /// The file for a new, empty document on `setup`'s page. It has no state
@@ -724,6 +774,43 @@ mod tests {
         // The blocks that didn't change are the same ones.
         assert_eq!(fragment.get(&doc.transact(), 0).unwrap().id(), first_id);
         assert_eq!(fragment.get(&doc.transact(), 2).unwrap().id(), last_id);
+    }
+
+    #[test]
+    fn files_with_other_states_can_hold_the_same_document() {
+        let file = html::page(
+            &[paragraph("One")],
+            &model::Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
+        let doc = doc();
+        format().absorb(&doc, file.as_bytes()).unwrap();
+        let written = format().write(&doc).unwrap();
+        // Another copy of the same text has a state of its own.
+        let other = self::doc();
+        format().absorb(&other, file.as_bytes()).unwrap();
+        let elsewhere = format().write(&other).unwrap();
+        assert_ne!(written, elsewhere);
+        assert!(format().same_document(&written, &elsewhere));
+        assert!(format().same_document(&written, file.as_bytes()));
+        let changed = html::page(
+            &[paragraph("Two")],
+            &model::Parts::default(),
+            None,
+            None,
+            &Pictures::new(),
+        );
+        assert!(!format().same_document(&written, changed.as_bytes()));
+        let sideways = html::page(
+            &[paragraph("One")],
+            &model::Parts::default(),
+            Some(&PageSetup::new(PageSize::A4)),
+            None,
+            &Pictures::new(),
+        );
+        assert!(!format().same_document(&written, sideways.as_bytes()));
     }
 
     #[test]

@@ -2023,3 +2023,268 @@ async fn word_and_opendocument_files_bring_their_comments_both_ways() {
         }
     }
 }
+
+/// The blocks of a version as the history page gets it: a co-editing state.
+fn version_blocks(state: &[u8]) -> Vec<Block> {
+    use yrs::updates::decoder::Decode;
+    use yrs::{ReadTxn, Transact};
+    let doc = yrs::Doc::new();
+    let fragment = doc.get_or_insert_xml_fragment(accordion_docs::yjs::FRAGMENT);
+    let mut txn = doc.transact_mut();
+    txn.apply_update(yrs::Update::decode_v1(state).unwrap())
+        .unwrap();
+    assert!(txn.store().pending_update().is_none());
+    accordion_docs::yjs::read(&txn, &fragment)
+}
+
+impl Server {
+    /// Saves `blocks` as a new version of `id`, as `person` would through
+    /// WebDAV.
+    async fn save_as(&self, person: &Person, id: &str, blocks: &[Block]) {
+        let item = self
+            .storage
+            .item(id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let file = html::page(
+            blocks,
+            &accordion_docs::model::Parts::default(),
+            None,
+            None,
+            &picture::Pictures::new(),
+        );
+        self.as_person(person)
+            .write_file(item.parent.unwrap(), &item.name, file.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    async fn versions(&self, person: &Person, id: &str) -> Vec<Value> {
+        let (status, list) = self
+            .api(person, "GET", &format!("/documents/{id}/versions"), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        list["versions"].as_array().unwrap().clone()
+    }
+}
+
+#[tokio::test]
+async fn keeps_versions_with_names_and_people_and_restores_them() {
+    let server = start().await;
+    let id = server.new_document(&server.alex).await;
+    server
+        .as_person(&server.alex)
+        .share(
+            id.parse().unwrap(),
+            server.sam.id,
+            ShareLevel::Editor,
+            server.alex.id,
+        )
+        .await
+        .unwrap();
+    server
+        .as_person(&server.alex)
+        .share(
+            id.parse().unwrap(),
+            server.dana.id,
+            ShareLevel::Commenter,
+            server.alex.id,
+        )
+        .await
+        .unwrap();
+    server
+        .save_as(&server.sam, &id, &[paragraph("Second")])
+        .await;
+
+    // Newest first, with who made each.
+    let versions = server.versions(&server.alex, &id).await;
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0]["number"], 2);
+    assert_eq!(versions[0]["name"], Value::Null);
+    assert_eq!(
+        versions[0]["people"],
+        json!([{ "user": server.sam.id, "display_name": "Sam Kim" }])
+    );
+    assert_eq!(versions[1]["people"][0]["display_name"], "Alex Kim");
+    let first = versions[1]["id"].as_str().unwrap().to_owned();
+    let second = versions[0]["id"].as_str().unwrap().to_owned();
+
+    // Only editors see them.
+    for path in [
+        format!("/documents/{id}/versions"),
+        format!("/documents/{id}/versions/{first}"),
+    ] {
+        let (status, _) = server.api(&server.dana, "GET", &path, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+    }
+
+    // A version comes as a co-editing state, through the schema.
+    let (status, headers, state) = server
+        .send(
+            &server.sam,
+            "GET",
+            &format!("/documents/{id}/versions/{first}"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "application/octet-stream");
+    assert_eq!(
+        version_blocks(&state),
+        [Block::Paragraph(Para::default(), Vec::new())]
+    );
+    let (_, _, state) = server
+        .send(
+            &server.sam,
+            "GET",
+            &format!("/documents/{id}/versions/{second}"),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(version_blocks(&state), [paragraph("Second")]);
+    let (status, _, _) = server
+        .send(
+            &server.sam,
+            "GET",
+            &format!("/documents/{id}/versions/{}", ItemId::generate()),
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Naming the current version names the newest, and a name can go.
+    let name = |version: &str| format!("/documents/{id}/versions/{version}/name");
+    let (status, named) = server
+        .api(
+            &server.sam,
+            "PUT",
+            &name("current"),
+            Some(json!({ "name": " Final draft " })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{named}");
+    assert_eq!(named["number"], 2);
+    assert_eq!(named["name"], "Final draft");
+    let (status, _) = server
+        .api(
+            &server.sam,
+            "PUT",
+            &name(&first),
+            Some(json!({ "name": "x".repeat(101) })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = server
+        .api(
+            &server.dana,
+            "PUT",
+            &name(&first),
+            Some(json!({ "name": "Mine" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, named) = server
+        .api(
+            &server.alex,
+            "PUT",
+            &name(&first),
+            Some(json!({ "name": "Blank" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{named}");
+    let (status, unnamed) = server
+        .api(&server.alex, "DELETE", &name(&first), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{unnamed}");
+    assert_eq!(unnamed["name"], Value::Null);
+
+    // Restoring makes a new version, and says which was current, for Undo.
+    let (status, restored) = server
+        .api(
+            &server.sam,
+            "POST",
+            &format!("/documents/{id}/versions/{first}/restore"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{restored}");
+    assert_eq!(restored["version"]["number"], 3);
+    assert_eq!(restored["previous"], second);
+    assert_eq!(
+        html::read(server.file_text(&id).await.as_bytes()),
+        [Block::Paragraph(Para::default(), Vec::new())]
+    );
+    let (status, undone) = server
+        .api(
+            &server.sam,
+            "POST",
+            &format!("/documents/{id}/versions/{second}/restore"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{undone}");
+    assert_eq!(undone["version"]["number"], 4);
+    assert_eq!(
+        html::read(server.file_text(&id).await.as_bytes()),
+        [paragraph("Second")]
+    );
+    let versions = server.versions(&server.alex, &id).await;
+    assert_eq!(versions.len(), 4);
+    assert_eq!(versions[2]["name"], "Final draft");
+    // Restoring the current version changes nothing.
+    let current = versions[0]["id"].as_str().unwrap().to_owned();
+    let (_, again) = server
+        .api(
+            &server.sam,
+            "POST",
+            &format!("/documents/{id}/versions/{current}/restore"),
+            None,
+        )
+        .await;
+    assert_eq!(again["version"]["number"], 4);
+    let (status, _) = server
+        .api(
+            &server.dana,
+            "POST",
+            &format!("/documents/{id}/versions/{first}/restore"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A copy of a version leaves out the document's comments.
+    let (status, _) = server
+        .api(
+            &server.alex,
+            "POST",
+            &format!("/documents/{id}/comments"),
+            Some(new_thread("Look")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let current = server.versions(&server.alex, &id).await[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        html::comments_in(server.file_text(&id).await.as_bytes()).len(),
+        1
+    );
+    let (status, copy) = server
+        .api(
+            &server.sam,
+            "POST",
+            &format!("/documents/{id}/versions/{current}/copy"),
+            Some(json!({ "name": "Old draft" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{copy}");
+    assert_eq!(copy["name"], "Old draft.html");
+    let copied = server.file_text(copy["id"].as_str().unwrap()).await;
+    assert!(html::is_document(copied.as_bytes()));
+    assert!(html::comments_in(copied.as_bytes()).is_empty());
+    assert_eq!(html::read(copied.as_bytes()), [paragraph("Second")]);
+    // Sam can't add to Alex's folder, so the copy is in Sam's own Docs.
+    assert_eq!(copy["access"], "owner");
+}
